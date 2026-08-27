@@ -489,6 +489,131 @@ TEST(multipart_rejects_malformed_and_excessive_parts) {
   CHECK(!excessive && excessive.error().code == chhttp::Error::multipart);
 }
 
+TEST(headers_preserve_empty_values_and_insertion_order) {
+  chhttp::Headers headers;
+  headers.add("X-First", "");
+  headers.add("X-Second", "two");
+  headers.add("x-first", "three");
+  CHECK(headers.size() == 3);
+  CHECK(headers.get("X-First").empty());
+  CHECK(headers.get_all("x-first") ==
+        std::vector<std::string>({"", "three"}));
+  auto iterator = headers.begin();
+  CHECK(iterator->first == "X-First");
+  CHECK((++iterator)->first == "X-Second");
+  CHECK(headers.get("missing", "fallback") == "fallback");
+}
+
+TEST(headers_set_replaces_every_duplicate_in_place) {
+  chhttp::Headers headers{{"X-Value", "one"},
+                          {"x-value", "two"},
+                          {"X-Other", "kept"}};
+  headers.set("X-VALUE", "replacement");
+  CHECK(headers.size() == 2);
+  CHECK(headers.get_all("x-value") ==
+        std::vector<std::string>({"replacement"}));
+  CHECK(headers.get("x-other") == "kept");
+  headers.set("X-New", "new");
+  CHECK(headers.size() == 3 && headers.get("x-new") == "new");
+}
+
+TEST(url_encoding_round_trips_every_byte_value) {
+  std::string bytes;
+  bytes.reserve(256);
+  for (int value = 0; value != 256; ++value)
+    bytes.push_back(static_cast<char>(value));
+  const auto encoded = chhttp::url_encode(bytes);
+  const auto decoded = chhttp::url_decode(encoded);
+  CHECK(decoded && *decoded == bytes);
+  CHECK(encoded.find('\0') == std::string::npos);
+  CHECK(encoded.find('%') != std::string::npos);
+}
+
+TEST(query_parser_keeps_duplicate_empty_and_flag_fields) {
+  const auto query = chhttp::parse_query("?a=1&a=&flag&=value&&plus=a+b");
+  CHECK(query == chhttp::Params({{"a", "1"},
+                                {"a", ""},
+                                {"flag", ""},
+                                {"", "value"},
+                                {"plus", "a b"}}));
+  CHECK(chhttp::make_query(query) ==
+        "a=1&a=&flag=&=value&plus=a+b");
+}
+
+TEST(url_fragments_are_never_sent_to_the_server) {
+  chhttp::Client client(fixture().base_url);
+  auto response = client.get("/hello?who=fragment#client-only");
+  CHECK(response && response->body == "hello:fragment");
+}
+
+TEST(relative_redirects_normalize_dot_segments_and_fragments) {
+  chhttp::Server server;
+  server.get("/a/b/start", [](const chhttp::Request &,
+                               chhttp::Response &response) {
+    response.set_redirect("../final?value=ok#ignored");
+  });
+  server.get("/a/final", [](const chhttp::Request &request,
+                             chhttp::Response &response) {
+    response.set_content(request.get_param("value") + "|" + request.target);
+  });
+  CHECK(server.start("127.0.0.1", 0));
+  chhttp::Client client("http://127.0.0.1:" +
+                        std::to_string(server.port()));
+  auto response = client.get("/a/b/start");
+  CHECK(response && response->body == "ok|/a/final?value=ok");
+  server.stop();
+}
+
+TEST(multipart_empty_form_round_trips) {
+  auto [content_type, body] = chhttp::make_multipart({}, "empty-boundary");
+  CHECK(body == "--empty-boundary--\r\n");
+  auto parsed = chhttp::parse_multipart(body, content_type);
+  CHECK(parsed && parsed->empty());
+}
+
+TEST(multipart_custom_headers_survive_round_trip) {
+  chhttp::MultipartPart part{.name = "file",
+                             .filename = "agent.bin",
+                             .content_type = "application/octet-stream",
+                             .content = "payload"};
+  part.headers.add("X-Checksum", "abc123");
+  part.headers.add("Content-Type", "must-not-duplicate");
+  auto [content_type, body] =
+      chhttp::make_multipart({part}, "custom-header-boundary");
+  auto parsed = chhttp::parse_multipart(body, content_type);
+  CHECK(parsed && parsed->size() == 1);
+  CHECK((*parsed)[0].headers.get("X-Checksum") == "abc123");
+  CHECK((*parsed)[0].headers.get_all("Content-Type").size() == 1);
+  CHECK((*parsed)[0].content_type == "application/octet-stream");
+}
+
+TEST(multipart_boundary_length_and_character_limits) {
+  const std::string maximum(70, 'b');
+  auto [content_type, body] = chhttp::make_multipart({}, maximum);
+  CHECK(content_type.ends_with(maximum));
+  CHECK(chhttp::parse_multipart(body, content_type));
+
+  const std::string excessive(71, 'b');
+  auto invalid = chhttp::parse_multipart(
+      "--" + excessive + "--\r\n",
+      "multipart/form-data; boundary=" + excessive);
+  CHECK(!invalid && invalid.error().code == chhttp::Error::multipart);
+  CHECK(!chhttp::parse_multipart(
+      "--bad@boundary--\r\n",
+      "multipart/form-data; boundary=bad@boundary"));
+}
+
+TEST(multipart_accepts_preamble_and_epilogue) {
+  const std::string body =
+      "preamble ignored\r\n--b\r\n"
+      "Content-Disposition: form-data; name=\"field\"\r\n\r\n"
+      "value\r\n--b--\r\nepilogue ignored";
+  auto parsed = chhttp::parse_multipart(
+      body, "multipart/form-data; boundary=b");
+  CHECK(parsed && parsed->size() == 1);
+  CHECK((*parsed)[0].name == "field" && (*parsed)[0].content == "value");
+}
+
 TEST(authentication_helpers_and_digest_retry) {
   CHECK(chhttp::basic_auth("Aladdin", "open sesame") ==
         "Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ==");
@@ -527,6 +652,199 @@ TEST(authentication_helpers_and_digest_retry) {
   CHECK(digest->body.starts_with("Digest username=\"agent\""));
   CHECK(digest->body.find("algorithm=SHA-256") != std::string::npos);
   CHECK(digest->body.find("uri=\"/digest\"") != std::string::npos);
+}
+
+TEST(digest_helpers_reject_malformed_and_unsupported_challenges) {
+  CHECK(!chhttp::parse_digest_challenge("Basic realm=\"x\""));
+  CHECK(!chhttp::parse_digest_challenge("Digest realm=\"x\""));
+  CHECK(!chhttp::parse_digest_challenge(
+      "Digest realm=\"x\", nonce=\"unterminated"));
+  chhttp::DigestChallenge unsupported{.realm = "r",
+                                      .nonce = "n",
+                                      .algorithm = "SHA-1",
+                                      .qop = "auth"};
+  CHECK(!chhttp::digest_auth("GET", "/", "u", "p", unsupported));
+  unsupported.algorithm = "MD5";
+  unsupported.qop = "auth-int";
+  CHECK(!chhttp::digest_auth("GET", "/", "u", "p", unsupported));
+}
+
+TEST(digest_helpers_support_session_and_sha512_256_variants) {
+  for (const auto *algorithm : {"MD5-sess", "SHA-256-sess", "SHA-512-256"}) {
+    chhttp::DigestChallenge challenge{.realm = "agents",
+                                      .nonce = "nonce",
+                                      .opaque = "opaque",
+                                      .algorithm = algorithm,
+                                      .qop = "auth"};
+    auto result = chhttp::digest_auth("POST", "/v1/run", "agent", "secret",
+                                      challenge, 42, "fixed-cnonce");
+    CHECK(result);
+    CHECK(result->find("algorithm=" + std::string(algorithm)) !=
+          std::string::npos);
+    CHECK(result->find("nc=0000002a") != std::string::npos);
+  }
+  chhttp::DigestChallenge legacy{.realm = "r", .nonce = "n"};
+  auto without_qop =
+      chhttp::digest_auth("GET", "/", "u", "p", legacy, 1, "c");
+  CHECK(without_qop && without_qop->find("qop=") == std::string::npos);
+}
+
+TEST(status_reason_and_mime_type_cover_known_and_unknown_values) {
+  CHECK(chhttp::status_reason(100) == "Continue");
+  CHECK(chhttp::status_reason(418) == "I'm a teapot");
+  CHECK(chhttp::status_reason(511) == "Network Authentication Required");
+  CHECK(chhttp::status_reason(799) == "Unknown");
+  CHECK(chhttp::mime_type("index.HTML") == "text/html; charset=utf-8");
+  CHECK(chhttp::mime_type("module.wasm") == "application/wasm");
+  CHECK(chhttp::mime_type("artifact.unknown") ==
+        "application/octet-stream");
+}
+
+TEST(sse_formatter_handles_multiline_empty_and_metadata_fields) {
+  const auto formatted = chhttp::format_sse(
+      {.data = "one\ntwo\n",
+       .event = "token",
+       .id = "42",
+       .retry = std::chrono::milliseconds(1500)});
+  CHECK(formatted ==
+        "event: token\nid: 42\nretry: 1500\ndata: one\ndata: two\n"
+        "data: \n\n");
+  CHECK(chhttp::format_sse({.data = ""}) == "data: \n\n");
+}
+
+TEST(route_patterns_support_colon_wildcard_and_regular_expressions) {
+  chhttp::Server server;
+  server.get("/items/:id", [](const chhttp::Request &request,
+                               chhttp::Response &response) {
+    response.set_content("colon:" + request.path_params.at("id"));
+  });
+  server.get("/files/*", [](const chhttp::Request &request,
+                             chhttp::Response &response) {
+    response.set_content("wild:" + request.path_params.at("wildcard"));
+  });
+  server.get("regex:^/v[0-9]+$", [](const chhttp::Request &,
+                                     chhttp::Response &response) {
+    response.set_content("regex");
+  });
+  CHECK(server.start("127.0.0.1", 0));
+  chhttp::Client client("http://127.0.0.1:" +
+                        std::to_string(server.port()));
+  CHECK(client.get("/items/a%20b")->body == "colon:a b");
+  CHECK(client.get("/files/a/b/c")->body == "wild:a/b/c");
+  CHECK(client.get("/v123")->body == "regex");
+  CHECK(client.get("/vabc")->status == 404);
+  server.stop();
+}
+
+TEST(server_accepts_options_and_arbitrary_extension_methods) {
+  chhttp::Server server;
+  server.options("/resource", [](const chhttp::Request &,
+                                  chhttp::Response &response) {
+    response.status = 204;
+    response.headers.set("Allow", "OPTIONS, PROPFIND");
+  });
+  server.route("PROPFIND", "/resource",
+               [](const chhttp::Request &request,
+                  chhttp::Response &response) {
+                 response.set_content(request.method);
+               });
+  CHECK(server.start("127.0.0.1", 0));
+  chhttp::Client client("http://127.0.0.1:" +
+                        std::to_string(server.port()));
+  chhttp::Request options;
+  options.method = "OPTIONS";
+  options.target = "/resource";
+  auto options_response = client.request(std::move(options));
+  CHECK(options_response && options_response->status == 204);
+  CHECK(options_response->headers.get("Allow") == "OPTIONS, PROPFIND");
+  chhttp::Request propfind;
+  propfind.method = "PROPFIND";
+  propfind.target = "/resource";
+  auto propfind_response = client.request(std::move(propfind));
+  CHECK(propfind_response && propfind_response->body == "PROPFIND");
+  server.stop();
+}
+
+TEST(head_requests_fall_back_to_get_routes_without_a_body) {
+  chhttp::Server server;
+  server.get("/head", [](const chhttp::Request &request,
+                          chhttp::Response &response) {
+    response.set_content("generated-for-" + request.method);
+  });
+  CHECK(server.start("127.0.0.1", 0));
+  chhttp::Client client("http://127.0.0.1:" +
+                        std::to_string(server.port()));
+  auto response = client.head("/head");
+  CHECK(response && response->status == 200 && response->body.empty());
+  CHECK(response->headers.get("Content-Length") ==
+        std::to_string(std::string("generated-for-HEAD").size()));
+  server.stop();
+}
+
+TEST(custom_exception_handler_and_logger_are_isolated) {
+  chhttp::Server server;
+  std::atomic_int logged{0};
+  server.set_exception_handler(
+      [](const chhttp::Request &, chhttp::Response &response,
+         std::exception_ptr exception) {
+        try {
+          std::rethrow_exception(exception);
+        } catch (const std::runtime_error &error) {
+          response.status = 599;
+          response.set_content(std::string("caught:") + error.what());
+        }
+      });
+  server.set_logger([&](const chhttp::Request &, const chhttp::Response &) {
+    ++logged;
+    throw std::runtime_error("logger exceptions are ignored");
+  });
+  server.get("/throw", [](const chhttp::Request &, chhttp::Response &) {
+    throw std::runtime_error("handler");
+  });
+  CHECK(server.start("127.0.0.1", 0));
+  chhttp::Client client("http://127.0.0.1:" +
+                        std::to_string(server.port()));
+  auto response = client.get("/throw");
+  CHECK(response && response->status == 599 &&
+        response->body == "caught:handler");
+  CHECK(logged == 1);
+  server.stop();
+}
+
+TEST(request_helpers_expose_duplicate_query_and_decoded_path_parameters) {
+  chhttp::Server server;
+  server.get("/query/{id}", [](const chhttp::Request &request,
+                                chhttp::Response &response) {
+    std::string body = request.path_params.at("id") + "|";
+    for (const auto &[key, value] : request.query)
+      body += key + "=" + value + ";";
+    body += request.has_param("missing") ? "bad" : "fallback";
+    response.set_content(body);
+  });
+  CHECK(server.start("127.0.0.1", 0));
+  chhttp::Client client("http://127.0.0.1:" +
+                        std::to_string(server.port()));
+  auto response = client.get("/query/a%20b?x=1&x=2&empty=");
+  CHECK(response && response->body ==
+                        "a b|x=1;x=2;empty=;fallback");
+  server.stop();
+}
+
+TEST(server_accepts_absolute_form_request_targets) {
+  chhttp::Server server;
+  server.get("/absolute", [](const chhttp::Request &request,
+                              chhttp::Response &response) {
+    response.set_content(request.path + "|" + request.get_param("x"));
+  });
+  CHECK(server.start("127.0.0.1", 0));
+  const auto authority = "127.0.0.1:" + std::to_string(server.port());
+  const auto response = raw_http_exchange(
+      server.port(), "GET http://" + authority +
+                         "/absolute?x=1 HTTP/1.1\r\nHost: " + authority +
+                         "\r\nConnection: close\r\n\r\n");
+  CHECK(response.starts_with("HTTP/1.1 200 OK\r\n"));
+  CHECK(response.ends_with("/absolute|1"));
+  server.stop();
 }
 
 TEST(sync_client_routes_methods_and_headers) {
@@ -762,6 +1080,189 @@ TEST(native_http_protocol_framing_pipeline_and_expect) {
   server.stop();
 }
 
+TEST(http10_keep_alive_can_process_multiple_pipelined_requests) {
+  chhttp::Server server;
+  server.get("/one", [](const chhttp::Request &,
+                         chhttp::Response &response) {
+    response.set_content("one");
+  });
+  server.get("/two", [](const chhttp::Request &,
+                         chhttp::Response &response) {
+    response.set_content("two");
+  });
+  CHECK(server.start("127.0.0.1", 0));
+  const auto response = raw_http_exchange(
+      server.port(),
+      "GET /one HTTP/1.0\r\nConnection: keep-alive\r\n\r\n"
+      "GET /two HTTP/1.0\r\nConnection: close\r\n\r\n");
+  const auto first = response.find("HTTP/1.0 200 OK");
+  CHECK(first != std::string::npos);
+  CHECK(response.find("HTTP/1.0 200 OK", first + 1) != std::string::npos);
+  CHECK(response.find("one") != std::string::npos);
+  CHECK(response.ends_with("two"));
+  server.stop();
+}
+
+TEST(server_keep_alive_request_cap_closes_after_exact_limit) {
+  chhttp::ServerOptions options;
+  options.keep_alive_max_requests = 2;
+  chhttp::Server server(std::move(options));
+  std::atomic_int handled{0};
+  server.get("/", [&](const chhttp::Request &, chhttp::Response &response) {
+    response.set_content(std::to_string(++handled));
+  });
+  CHECK(server.start("127.0.0.1", 0));
+  const std::string request =
+      "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n"
+      "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n"
+      "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+  const auto response = raw_http_exchange(server.port(), request);
+  std::size_t count = 0;
+  for (std::size_t cursor = 0;
+       (cursor = response.find("HTTP/1.1 200 OK", cursor)) !=
+       std::string::npos;
+       cursor += 15)
+    ++count;
+  CHECK(count == 2 && handled == 2);
+  CHECK(response.find("Connection: close") != std::string::npos);
+  server.stop();
+}
+
+TEST(content_length_zero_is_a_valid_empty_request_body) {
+  chhttp::Server server;
+  server.post("/", [](const chhttp::Request &request,
+                       chhttp::Response &response) {
+    response.set_content(request.body.empty() ? "empty" : "unexpected");
+  });
+  CHECK(server.start("127.0.0.1", 0));
+  const auto response = raw_http_exchange(
+      server.port(),
+      "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n"
+      "Connection: close\r\n\r\n");
+  CHECK(response.starts_with("HTTP/1.1 200 OK\r\n"));
+  CHECK(response.ends_with("empty"));
+  server.stop();
+}
+
+TEST(chunked_zero_chunk_is_a_valid_empty_request_body) {
+  chhttp::Server server;
+  server.post("/", [](const chhttp::Request &request,
+                       chhttp::Response &response) {
+    response.set_content(request.body.empty() ? "empty" : "unexpected");
+  });
+  CHECK(server.start("127.0.0.1", 0));
+  const auto response = raw_http_exchange(
+      server.port(),
+      "POST / HTTP/1.1\r\nHost: localhost\r\n"
+      "Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+      "0\r\n\r\n");
+  CHECK(response.starts_with("HTTP/1.1 200 OK\r\n"));
+  CHECK(response.ends_with("empty"));
+  server.stop();
+}
+
+TEST(chunk_extensions_accept_valid_quoted_and_token_values) {
+  chhttp::Server server;
+  server.post("/", [](const chhttp::Request &request,
+                       chhttp::Response &response) {
+    response.set_content(request.body);
+  });
+  CHECK(server.start("127.0.0.1", 0));
+  const auto response = raw_http_exchange(
+      server.port(),
+      "POST / HTTP/1.1\r\nHost: localhost\r\n"
+      "Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+      "3;name=token;quoted=\"yes\"\r\nabc\r\n0\r\n\r\n");
+  CHECK(response.starts_with("HTTP/1.1 200 OK\r\n"));
+  CHECK(response.ends_with("abc"));
+  server.stop();
+}
+
+TEST(chunked_trailers_preserve_duplicate_field_values) {
+  chhttp::Server server;
+  server.post("/", [](const chhttp::Request &request,
+                       chhttp::Response &response) {
+    const auto values = request.headers.get_all("X-Trailer");
+    response.set_content(std::to_string(values.size()) + "|" + values[0] +
+                         "|" + values[1]);
+  });
+  CHECK(server.start("127.0.0.1", 0));
+  const auto response = raw_http_exchange(
+      server.port(),
+      "POST / HTTP/1.1\r\nHost: localhost\r\n"
+      "Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+      "1\r\nx\r\n0\r\nX-Trailer: one\r\nX-Trailer: two\r\n\r\n");
+  CHECK(response.starts_with("HTTP/1.1 200 OK\r\n"));
+  CHECK(response.ends_with("2|one|two"));
+  server.stop();
+}
+
+TEST(inbound_header_optional_whitespace_is_trimmed) {
+  chhttp::Server server;
+  server.get("/", [](const chhttp::Request &request,
+                      chhttp::Response &response) {
+    response.set_content("[" + request.get_header("X-OWS") + "]");
+  });
+  CHECK(server.start("127.0.0.1", 0));
+  const auto response = raw_http_exchange(
+      server.port(),
+      "GET / HTTP/1.1\r\nHost: localhost\r\nX-OWS:\t  value \t\r\n"
+      "Connection: close\r\n\r\n");
+  CHECK(response.ends_with("[value]"));
+  server.stop();
+}
+
+TEST(inbound_header_control_characters_are_rejected) {
+  chhttp::Server server;
+  server.get("/", [](const chhttp::Request &, chhttp::Response &response) {
+    response.set_content("must-not-run");
+  });
+  CHECK(server.start("127.0.0.1", 0));
+  std::string request =
+      "GET / HTTP/1.1\r\nHost: localhost\r\nX-Bad: value";
+  request.push_back('\x01');
+  request += "control\r\nConnection: close\r\n\r\n";
+  const auto response = raw_http_exchange(server.port(), request);
+  CHECK(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+  CHECK(response.find("must-not-run") == std::string::npos);
+  server.stop();
+}
+
+TEST(inbound_header_names_with_whitespace_are_rejected) {
+  chhttp::Server server;
+  server.get("/", [](const chhttp::Request &, chhttp::Response &response) {
+    response.set_content("must-not-run");
+  });
+  CHECK(server.start("127.0.0.1", 0));
+  for (const auto *header : {"Bad Name: value", "Bad\tName: value",
+                             "Bad@: value"}) {
+    const auto response = raw_http_exchange(
+        server.port(), "GET / HTTP/1.1\r\nHost: localhost\r\n" +
+                           std::string(header) +
+                           "\r\nConnection: close\r\n\r\n");
+    CHECK(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+  }
+  server.stop();
+}
+
+TEST(content_length_rejects_signs_suffixes_conflicts_and_overflow) {
+  chhttp::Server server;
+  server.post("/", [](const chhttp::Request &, chhttp::Response &response) {
+    response.set_content("must-not-run");
+  });
+  CHECK(server.start("127.0.0.1", 0));
+  for (const auto *length : {"+1", "-1", "1x", "1, 2",
+                             "18446744073709551616"}) {
+    const auto response = raw_http_exchange(
+        server.port(), "POST / HTTP/1.1\r\nHost: localhost\r\n"
+                       "Content-Length: " +
+                           std::string(length) +
+                           "\r\nConnection: close\r\n\r\nx");
+    CHECK(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+  }
+  server.stop();
+}
+
 TEST(native_http_protocol_rejects_request_smuggling) {
   chhttp::Server server;
   server.post("/", [](const chhttp::Request &,
@@ -874,6 +1375,149 @@ TEST(native_http_server_incremental_syntax_and_size_boundaries) {
   CHECK(chunked_body_response.starts_with(
       "HTTP/1.1 413 Payload Too Large\r\n"));
   server.stop();
+}
+
+TEST(transfer_encoding_rejects_parameters_and_multiple_codings) {
+  chhttp::Server server;
+  server.post("/", [](const chhttp::Request &, chhttp::Response &response) {
+    response.set_content("must-not-run");
+  });
+  CHECK(server.start("127.0.0.1", 0));
+  for (const auto *encoding : {"chunked;foo=bar", "gzip, chunked",
+                               "chunked, chunked", "identity"}) {
+    const auto response = raw_http_exchange(
+        server.port(), "POST / HTTP/1.1\r\nHost: localhost\r\n"
+                       "Transfer-Encoding: " +
+                           std::string(encoding) +
+                           "\r\nConnection: close\r\n\r\n0\r\n\r\n");
+    CHECK(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+  }
+  server.stop();
+}
+
+TEST(chunk_size_lines_over_16kib_are_rejected) {
+  chhttp::Server server;
+  server.post("/", [](const chhttp::Request &, chhttp::Response &response) {
+    response.set_content("must-not-run");
+  });
+  CHECK(server.start("127.0.0.1", 0));
+  const auto request =
+      "POST / HTTP/1.1\r\nHost: localhost\r\n"
+      "Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n" +
+      std::string(17 * 1024, '1') + "\r\n";
+  const auto response = raw_http_exchange(server.port(), request);
+  CHECK(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+  server.stop();
+}
+
+TEST(chunked_trailers_obey_the_header_size_limit) {
+  chhttp::ServerOptions options;
+  options.max_header_size = 128;
+  chhttp::Server server(std::move(options));
+  server.post("/", [](const chhttp::Request &, chhttp::Response &response) {
+    response.set_content("must-not-run");
+  });
+  CHECK(server.start("127.0.0.1", 0));
+  const auto request =
+      "POST / HTTP/1.1\r\nHost: localhost\r\n"
+      "Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+      "0\r\nX-Large: " +
+      std::string(160, 'x') + "\r\n\r\n";
+  const auto response = raw_http_exchange(server.port(), request);
+  CHECK(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+  server.stop();
+}
+
+TEST(head_clients_ignore_illegal_wire_bodies) {
+  RawResponseServer server(
+      "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n"
+      "Connection: close\r\n\r\nbody",
+      true);
+  chhttp::Client client("http://127.0.0.1:" +
+                        std::to_string(server.port()));
+  auto response = client.head("/");
+  CHECK(response && response->status == 200 && response->body.empty());
+  CHECK(response->headers.get("Content-Length") == "4");
+}
+
+TEST(no_body_statuses_ignore_illegal_wire_bodies) {
+  for (const int status : {205, 304}) {
+    auto response = fetch_raw_response(
+        "HTTP/1.1 " + std::to_string(status) + " " +
+        chhttp::status_reason(status) +
+        "\r\nContent-Length: 4\r\nConnection: close\r\n\r\nbody",
+        true);
+    CHECK(response && response->status == status && response->body.empty());
+  }
+}
+
+TEST(zero_length_and_empty_chunked_responses_are_valid) {
+  auto fixed = fetch_raw_response(
+      "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n"
+      "Connection: close\r\n\r\n");
+  CHECK(fixed && fixed->body.empty());
+  auto chunked = fetch_raw_response(
+      "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n"
+      "Connection: close\r\n\r\n0\r\n\r\n",
+      true);
+  CHECK(chunked && chunked->body.empty());
+}
+
+TEST(client_rejects_response_header_control_characters) {
+  std::string response = "HTTP/1.1 200 OK\r\nX-Bad: value";
+  response.push_back('\x01');
+  response += "control\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+  auto result = fetch_raw_response(std::move(response), true);
+  CHECK(!result && result.error().code == chhttp::Error::protocol);
+}
+
+TEST(client_rejects_empty_and_invalid_chunk_extensions) {
+  for (const auto &line : {std::string("1;\r\na\r\n0\r\n\r\n"),
+                           std::string("1;") + std::string(1, '\x01') +
+                               "\r\na\r\n0\r\n\r\n"}) {
+    auto response = fetch_raw_response(
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n"
+        "Connection: close\r\n\r\n" +
+            line,
+        true);
+    CHECK(!response && response.error().code == chhttp::Error::protocol);
+  }
+}
+
+TEST(client_body_limit_applies_before_reading_large_chunks) {
+  chhttp::ClientOptions options;
+  options.max_response_body_size = 4;
+  auto response = fetch_raw_response(
+      "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n"
+      "Connection: close\r\n\r\n5\r\nabcde\r\n0\r\n\r\n",
+      false, std::move(options));
+  CHECK(!response && response.error().code == chhttp::Error::body_too_large);
+}
+
+TEST(stream_callbacks_preserve_byte_order_and_monotonic_progress) {
+  const std::string body = "abcdefghijklmnopqrstuvwxyz";
+  RawResponseServer server(
+      "HTTP/1.1 200 OK\r\nContent-Length: " +
+          std::to_string(body.size()) + "\r\nConnection: close\r\n\r\n" + body,
+      true);
+  chhttp::Client client("http://127.0.0.1:" +
+                        std::to_string(server.port()));
+  std::string received;
+  std::vector<std::uint64_t> progress;
+  auto response = client.get(
+      "/", {},
+      {.on_data = [&](std::string_view chunk) {
+         received += chunk;
+         return true;
+       },
+       .on_progress = [&](std::uint64_t current, std::uint64_t total) {
+         CHECK(total == body.size());
+         progress.push_back(current);
+         return true;
+       }});
+  CHECK(response && response->body.empty() && received == body);
+  CHECK(!progress.empty() && progress.back() == body.size());
+  CHECK(std::ranges::is_sorted(progress));
 }
 
 TEST(native_http_client_incremental_chunked_and_malformed_response) {
@@ -993,6 +1637,229 @@ TEST(response_callbacks_can_cancel_body_and_progress) {
       "Connection: close\r\n\r\njunk");
   CHECK(!corrupt && corrupt.error().code == chhttp::Error::compression);
 #endif
+}
+
+TEST(pre_cancelled_request_tokens_avoid_network_work) {
+  auto cancellation = std::make_shared<std::atomic_bool>(true);
+  chhttp::AsyncClient client(fixture().base_url);
+  auto response = client.get(
+      "/hello", {}, {.cancellation = std::move(cancellation)}).get();
+  CHECK(!response && response.error().code == chhttp::Error::cancelled);
+}
+
+TEST(request_tokens_cancel_a_response_while_it_is_inflight) {
+  auto cancellation = std::make_shared<std::atomic_bool>(false);
+  chhttp::AsyncClient client(fixture().base_url);
+  auto response_task =
+      client.get("/slow", {}, {.cancellation = cancellation});
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  cancellation->store(true);
+  auto response = response_task.get();
+  CHECK(!response && response.error().code == chhttp::Error::cancelled);
+}
+
+TEST(disabled_redirect_following_returns_the_original_response) {
+  chhttp::ClientOptions options;
+  options.follow_redirects = false;
+  chhttp::Client client(fixture().base_url, std::move(options));
+  auto response = client.get("/redirect");
+  CHECK(response && response->status == 302 && response->body.empty());
+  CHECK(response->headers.get("Location") == "/hello?who=redirected");
+}
+
+TEST(post_redirects_rewrite_302_and_preserve_307_requests) {
+  chhttp::Server server;
+  server.post("/start302", [](const chhttp::Request &,
+                               chhttp::Response &response) {
+    response.set_redirect("/sink302", 302);
+  });
+  server.get("/sink302", [](const chhttp::Request &request,
+                             chhttp::Response &response) {
+    response.set_content(request.method + "|" + request.body);
+  });
+  server.post("/start307", [](const chhttp::Request &,
+                               chhttp::Response &response) {
+    response.set_redirect("/sink307", 307);
+  });
+  server.post("/sink307", [](const chhttp::Request &request,
+                              chhttp::Response &response) {
+    response.set_content(request.method + "|" + request.body);
+  });
+  CHECK(server.start("127.0.0.1", 0));
+  chhttp::Client client("http://127.0.0.1:" +
+                        std::to_string(server.port()));
+  auto rewritten = client.post("/start302", "body", "text/plain");
+  CHECK(rewritten && rewritten->body == "GET|");
+  auto preserved = client.post("/start307", "body", "text/plain");
+  CHECK(preserved && preserved->body == "POST|body");
+  server.stop();
+}
+
+TEST(compression_negotiation_honors_quality_and_request_errors) {
+#ifdef CHHTTP_HAS_COMPRESSION
+  chhttp::ServerOptions server_options;
+  server_options.compression_threshold = 32;
+  chhttp::Server server(std::move(server_options));
+  server.get("/data", [](const chhttp::Request &,
+                          chhttp::Response &response) {
+    response.set_content(std::string(4096, 'c'));
+  });
+  server.post("/upload", [](const chhttp::Request &request,
+                             chhttp::Response &response) {
+    response.set_content(request.body);
+  });
+  CHECK(server.start("127.0.0.1", 0));
+  chhttp::ClientOptions options;
+  options.auto_decompress = false;
+  chhttp::Client client("http://127.0.0.1:" +
+                            std::to_string(server.port()),
+                        std::move(options));
+  auto preferred =
+      client.get("/data", {{"Accept-Encoding", "gzip;q=0.2, br;q=0.9"}});
+  CHECK(preferred && preferred->headers.get("Content-Encoding") == "br");
+  auto disabled = client.get(
+      "/data", {{"Accept-Encoding", "gzip;q=0, br;q=0, zstd;q=0"}});
+  CHECK(disabled && !disabled->headers.contains("Content-Encoding") &&
+        disabled->body == std::string(4096, 'c'));
+  auto corrupt = client.post("/upload", "junk", "application/octet-stream",
+                             {{"Content-Encoding", "gzip"}});
+  CHECK(corrupt && corrupt->status == 400);
+  server.stop();
+#else
+  CHECK(true);
+#endif
+}
+
+TEST(static_index_unknown_mime_head_and_range_boundaries) {
+  std::ofstream(fixture().root / "index.html", std::ios::binary) << "index";
+  std::ofstream(fixture().root / "blob.agentdata", std::ios::binary) << "blob";
+  chhttp::Client client(fixture().base_url);
+  auto index = client.get("/static/");
+  CHECK(index && index->body == "index" &&
+        index->headers.get("Content-Type") == "text/html; charset=utf-8");
+  auto unknown = client.get("/static/blob.agentdata");
+  CHECK(unknown && unknown->body == "blob" &&
+        unknown->headers.get("Content-Type") == "application/octet-stream");
+  auto head = client.head("/static/asset.txt", {{"Range", "bytes=2-4"}});
+  CHECK(head && head->status == 206 && head->body.empty());
+  CHECK(head->headers.get("Content-Length") == "3");
+  CHECK(head->headers.get("Content-Range") == "bytes 2-4/10");
+}
+
+TEST(sse_clients_reject_non_event_stream_and_non_200_endpoints) {
+  {
+    RawResponseServer server(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n"
+        "Content-Length: 4\r\nConnection: close\r\n\r\ndata");
+    chhttp::AsyncClient client("http://127.0.0.1:" +
+                               std::to_string(server.port()));
+    chhttp::SseClient events(client, "/", {}, {.reconnect = false});
+    auto error = events.connect().get();
+    CHECK(error.code == chhttp::Error::protocol);
+  }
+  {
+    RawResponseServer server(
+        "HTTP/1.1 503 Service Unavailable\r\n"
+        "Content-Type: text/event-stream\r\nContent-Length: 0\r\n"
+        "Connection: close\r\n\r\n");
+    chhttp::AsyncClient client("http://127.0.0.1:" +
+                               std::to_string(server.port()));
+    chhttp::SseClient events(client, "/", {}, {.reconnect = false});
+    auto error = events.connect().get();
+    CHECK(error.code == chhttp::Error::protocol);
+    CHECK(error.message.find("503") != std::string::npos);
+  }
+}
+
+TEST(sse_rejects_duplicate_connect_and_stops_an_active_stream) {
+  chhttp::Server server;
+  std::atomic_bool entered{false};
+  std::atomic_bool release{false};
+  server.get_async(
+      "/events", [&](const chhttp::Request &,
+                      chhttp::Response &response) -> chhttp::Task<void> {
+        response.set_sse([&](chhttp::SseWriter &writer)
+                             -> chhttp::Task<void> {
+          entered = true;
+          while (!release)
+            co_await chhttp::sleep_for(std::chrono::milliseconds(1));
+          co_await writer.data("done");
+        });
+        co_return;
+      });
+  CHECK(server.start("127.0.0.1", 0));
+  chhttp::AsyncClient client("http://127.0.0.1:" +
+                             std::to_string(server.port()));
+  chhttp::SseClient events(client, "/events", {}, {.reconnect = false});
+  auto first = events.connect();
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (!entered && std::chrono::steady_clock::now() < deadline)
+    std::this_thread::yield();
+  CHECK(entered && events.running());
+  auto duplicate = events.connect().get();
+  CHECK(duplicate.code == chhttp::Error::protocol);
+  release = true;
+  events.stop();
+  auto stopped = first.get();
+  CHECK(!stopped);
+  CHECK(!events.running());
+  server.stop();
+}
+
+TEST(websocket_clients_reject_invalid_urls_and_subprotocol_tokens) {
+  auto wrong_scheme =
+      chhttp::AsyncWebSocketClient::connect(fixture().base_url + "/ws").get();
+  CHECK(!wrong_scheme && wrong_scheme.error().code == chhttp::Error::invalid_url);
+  auto bad_protocol = chhttp::AsyncWebSocketClient::connect(
+      "ws://127.0.0.1:" + std::to_string(fixture().server.port()) + "/ws",
+      {{"Sec-WebSocket-Protocol", "bad protocol"}}).get();
+  CHECK(!bad_protocol &&
+        bad_protocol.error().code == chhttp::Error::websocket_handshake);
+
+  const auto bad_version = raw_http_exchange(
+      fixture().server.port(),
+      "GET /ws HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\n"
+      "Connection: Upgrade\r\nSec-WebSocket-Version: 12\r\n"
+      "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n");
+  CHECK(bad_version.starts_with("HTTP/1.1 404 Not Found\r\n"));
+}
+
+TEST(websocket_binary_and_ping_pong_frames_round_trip) {
+  chhttp::Server server;
+  server.websocket(
+      "/ws", [](const chhttp::Request &, chhttp::WebSocket &socket)
+                  -> chhttp::Task<void> {
+        auto ping = co_await socket.read();
+        if (!ping || ping->type != chhttp::WebSocket::MessageType::ping)
+          co_return;
+        auto message = co_await socket.read();
+        if (message &&
+            message->type == chhttp::WebSocket::MessageType::binary) {
+          const auto *data = reinterpret_cast<const std::byte *>(
+              message->data.data());
+          co_await socket.send_binary(
+              std::span<const std::byte>(data, message->data.size()));
+        }
+      });
+  CHECK(server.start("127.0.0.1", 0));
+  auto connected = chhttp::AsyncWebSocketClient::connect(
+      "ws://127.0.0.1:" + std::to_string(server.port()) + "/ws").get();
+  CHECK(connected);
+  (*connected)->ping("probe").get();
+  auto pong = (*connected)->read().get();
+  CHECK(pong && pong->type == chhttp::WebSocket::MessageType::pong &&
+        pong->data == "probe");
+  const std::array<std::byte, 5> payload{
+      std::byte{0x00}, std::byte{0x7f}, std::byte{0x80}, std::byte{0xff},
+      std::byte{0x42}};
+  CHECK((*connected)->send_binary(payload).get());
+  auto echoed = (*connected)->read().get();
+  CHECK(echoed && echoed->type == chhttp::WebSocket::MessageType::binary);
+  CHECK(echoed->data == std::string(reinterpret_cast<const char *>(payload.data()),
+                                   payload.size()));
+  (*connected)->close().get();
+  server.stop();
 }
 
 TEST(stress_async_high_concurrency) {
@@ -1368,6 +2235,300 @@ TEST(sse_callback_failures_are_reported_without_escape) {
   CHECK(!events.running());
 }
 
+TEST(stress_thousands_of_requests_reuse_one_keep_alive_connection) {
+  chhttp::ServerOptions options;
+  options.keep_alive_max_requests = 5000;
+  chhttp::Server server(std::move(options));
+  server.get("/port", [](const chhttp::Request &request,
+                          chhttp::Response &response) {
+    response.set_content(std::to_string(request.remote_port));
+  });
+  CHECK(server.start("127.0.0.1", 0));
+  chhttp::Client client("http://127.0.0.1:" +
+                        std::to_string(server.port()));
+  std::string first_port;
+  for (int index = 0; index != 3000; ++index) {
+    auto response = client.get("/port");
+    CHECK(response && response->status == 200);
+    if (index == 0) first_port = response->body;
+    CHECK(response->body == first_port);
+  }
+  server.stop();
+}
+
+TEST(stress_mixed_methods_share_one_async_client) {
+  chhttp::ClientOptions options;
+  options.connection_pool_size = 64;
+  chhttp::AsyncClient client(fixture().base_url, std::move(options));
+  constexpr int count = 256;
+  std::vector<chhttp::Task<chhttp::ResponseResult>> requests;
+  requests.reserve(count);
+  for (int index = 0; index != count; ++index) {
+    if (index % 2 == 0)
+      requests.push_back(client.get("/hello?who=" + std::to_string(index)));
+    else
+      requests.push_back(client.post("/echo", std::to_string(index),
+                                     "text/plain"));
+  }
+  for (int index = 0; index != count; ++index) {
+    auto response = requests[index].get();
+    CHECK(response);
+    const auto expected = index % 2 == 0
+                              ? "hello:" + std::to_string(index)
+                              : "POST:" + std::to_string(index);
+    CHECK(response->body == expected);
+  }
+}
+
+TEST(stress_concurrent_large_uploads_preserve_body_integrity) {
+  chhttp::Server server;
+  server.post("/upload", [](const chhttp::Request &request,
+                             chhttp::Response &response) {
+    response.set_content(std::to_string(request.body.size()) + "|" +
+                         std::string(1, request.body.front()) +
+                         std::string(1, request.body.back()));
+  });
+  CHECK(server.start("127.0.0.1", 0));
+  chhttp::ClientOptions options;
+  options.connection_pool_size = 32;
+  chhttp::AsyncClient client(
+      "http://127.0.0.1:" + std::to_string(server.port()),
+      std::move(options));
+  constexpr int count = 32;
+  constexpr std::size_t payload_size = 256 * 1024;
+  std::vector<chhttp::Task<chhttp::ResponseResult>> uploads;
+  uploads.reserve(count);
+  for (int index = 0; index != count; ++index) {
+    const char marker = static_cast<char>('a' + index % 26);
+    uploads.push_back(client.post("/upload", std::string(payload_size, marker),
+                                  "application/octet-stream"));
+  }
+  for (int index = 0; index != count; ++index) {
+    auto response = uploads[index].get();
+    const char marker = static_cast<char>('a' + index % 26);
+    CHECK(response && response->body == std::to_string(payload_size) + "|" +
+                                          marker + marker);
+  }
+  server.stop();
+}
+
+TEST(stress_concurrent_stream_callbacks_do_not_cross_contaminate) {
+  chhttp::AsyncClient client(fixture().base_url);
+  constexpr int count = 128;
+  std::array<std::string, count> bodies;
+  std::vector<chhttp::Task<chhttp::ResponseResult>> requests;
+  requests.reserve(count);
+  for (int index = 0; index != count; ++index) {
+    requests.push_back(client.get(
+        "/stream", {},
+        {.on_data = [&, index](std::string_view chunk) {
+           bodies[index].append(chunk);
+           return true;
+         }}));
+  }
+  for (int index = 0; index != count; ++index) {
+    auto response = requests[index].get();
+    CHECK(response && response->body.empty());
+    CHECK(bodies[index] == "onetwo");
+  }
+}
+
+TEST(stress_individual_cancellation_tokens_isolate_requests) {
+  chhttp::AsyncClient client(fixture().base_url);
+  constexpr int count = 96;
+  std::array<std::shared_ptr<std::atomic_bool>, count> cancellations;
+  std::vector<chhttp::Task<chhttp::ResponseResult>> requests;
+  requests.reserve(count);
+  for (int index = 0; index != count; ++index) {
+    cancellations[index] = std::make_shared<std::atomic_bool>(false);
+    requests.push_back(client.get(
+        "/slow", {}, {.cancellation = cancellations[index]}));
+  }
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  for (int index = 0; index != count; index += 2)
+    cancellations[index]->store(true);
+  for (int index = 0; index != count; ++index) {
+    auto response = requests[index].get();
+    if (index % 2 == 0)
+      CHECK(!response && response.error().code == chhttp::Error::cancelled);
+    else
+      CHECK(response && response->body == "late");
+  }
+}
+
+TEST(stress_async_client_construction_and_destruction_cancels_safely) {
+  for (int iteration = 0; iteration != 80; ++iteration) {
+    chhttp::Task<chhttp::ResponseResult> pending;
+    {
+      chhttp::AsyncClient client(fixture().base_url);
+      pending = client.get("/slow");
+    }
+    auto response = pending.get();
+    CHECK(!response && response.error().code == chhttp::Error::cancelled);
+  }
+}
+
+TEST(stress_multiple_servers_and_clients_run_in_parallel) {
+  constexpr int server_count = 12;
+  constexpr int requests_per_server = 50;
+  std::vector<std::unique_ptr<chhttp::Server>> servers;
+  servers.reserve(server_count);
+  for (int index = 0; index != server_count; ++index) {
+    chhttp::ServerOptions options;
+    options.worker_threads = 1;
+    auto server = std::make_unique<chhttp::Server>(std::move(options));
+    server->get("/", [index](const chhttp::Request &,
+                              chhttp::Response &response) {
+      response.set_content(std::to_string(index));
+    });
+    CHECK(server->start("127.0.0.1", 0));
+    servers.push_back(std::move(server));
+  }
+  std::atomic_int failures{0};
+  std::vector<std::thread> clients;
+  clients.reserve(server_count);
+  for (int index = 0; index != server_count; ++index) {
+    clients.emplace_back([&, index] {
+      chhttp::Client client("http://127.0.0.1:" +
+                            std::to_string(servers[index]->port()));
+      for (int request = 0; request != requests_per_server; ++request) {
+        auto response = client.get("/");
+        if (!response || response->body != std::to_string(index)) ++failures;
+      }
+    });
+  }
+  for (auto &client : clients) client.join();
+  CHECK(failures == 0);
+  for (auto &server : servers) server->stop();
+}
+
+TEST(stress_many_sse_clients_receive_complete_independent_streams) {
+  constexpr int count = 24;
+  std::array<int, count> received{};
+  std::vector<std::unique_ptr<chhttp::AsyncClient>> clients;
+  std::vector<std::unique_ptr<chhttp::SseClient>> streams;
+  std::vector<chhttp::Task<chhttp::ErrorInfo>> tasks;
+  clients.reserve(count);
+  streams.reserve(count);
+  tasks.reserve(count);
+  for (int index = 0; index != count; ++index) {
+    clients.push_back(std::make_unique<chhttp::AsyncClient>(fixture().base_url));
+    streams.push_back(std::make_unique<chhttp::SseClient>(
+        *clients.back(), "/sse", chhttp::Headers{},
+        chhttp::SseClientOptions{.reconnect = false}));
+    streams.back()->on_event("tick", [&, index](const chhttp::SseEvent &) {
+      ++received[index];
+    });
+    tasks.push_back(streams.back()->connect());
+  }
+  for (int index = 0; index != count; ++index) {
+    auto error = tasks[index].get();
+    CHECK(error.code == chhttp::Error::read);
+    CHECK(received[index] == 3);
+  }
+}
+
+TEST(stress_websocket_connection_churn) {
+  chhttp::Server server;
+  server.websocket(
+      "/ws", [](const chhttp::Request &, chhttp::WebSocket &socket)
+                  -> chhttp::Task<void> {
+        auto message = co_await socket.read();
+        if (message) co_await socket.send_text(message->data);
+      });
+  CHECK(server.start("127.0.0.1", 0));
+  const auto url =
+      "ws://127.0.0.1:" + std::to_string(server.port()) + "/ws";
+  constexpr int count = 48;
+  std::vector<chhttp::Task<chhttp::Result<std::shared_ptr<chhttp::WebSocket>>>>
+      connections;
+  connections.reserve(count);
+  for (int index = 0; index != count; ++index)
+    connections.push_back(chhttp::AsyncWebSocketClient::connect(url));
+  std::vector<std::shared_ptr<chhttp::WebSocket>> sockets;
+  sockets.reserve(count);
+  for (auto &connection : connections) {
+    auto result = connection.get();
+    CHECK(result);
+    sockets.push_back(std::move(*result));
+  }
+  std::vector<chhttp::Task<bool>> writes;
+  for (int index = 0; index != count; ++index)
+    writes.push_back(sockets[index]->send_text(std::to_string(index)));
+  for (auto &write : writes) CHECK(write.get());
+  for (int index = 0; index != count; ++index) {
+    auto message = sockets[index]->read().get();
+    CHECK(message && message->data == std::to_string(index));
+    sockets[index]->close().get();
+  }
+  server.stop();
+}
+
+TEST(stress_websocket_many_messages_on_one_connection) {
+  constexpr int count = 200;
+  chhttp::Server server;
+  server.websocket(
+      "/ws", [](const chhttp::Request &, chhttp::WebSocket &socket)
+                  -> chhttp::Task<void> {
+        for (int index = 0; index != count; ++index) {
+          auto message = co_await socket.read();
+          if (!message) co_return;
+          co_await socket.send_text(message->data);
+        }
+      });
+  CHECK(server.start("127.0.0.1", 0));
+  auto connected = chhttp::AsyncWebSocketClient::connect(
+      "ws://127.0.0.1:" + std::to_string(server.port()) + "/ws").get();
+  CHECK(connected);
+  for (int index = 0; index != count; ++index) {
+    const auto payload = index == count - 1
+                             ? std::string(70 * 1024, 'z')
+                             : "message-" + std::to_string(index);
+    CHECK((*connected)->send_text(payload).get());
+    auto echoed = (*connected)->read().get();
+    CHECK(echoed && echoed->data == payload);
+  }
+  (*connected)->close().get();
+  server.stop();
+}
+
+TEST(stress_malformed_request_flood_remains_available) {
+  chhttp::Server server;
+  server.get("/health", [](const chhttp::Request &,
+                            chhttp::Response &response) {
+    response.set_content("healthy");
+  });
+  CHECK(server.start("127.0.0.1", 0));
+  constexpr int thread_count = 8;
+  constexpr int requests_per_thread = 25;
+  std::atomic_int failures{0};
+  std::vector<std::thread> workers;
+  for (int thread = 0; thread != thread_count; ++thread) {
+    workers.emplace_back([&] {
+      for (int index = 0; index != requests_per_thread; ++index) {
+        try {
+          const auto response = raw_http_exchange(
+              server.port(),
+              "POST / HTTP/1.1\r\nHost: localhost\r\n"
+              "Content-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\n"
+              "0\r\n\r\n");
+          if (!response.starts_with("HTTP/1.1 400 Bad Request\r\n"))
+            ++failures;
+        } catch (...) {
+          ++failures;
+        }
+      }
+    });
+  }
+  for (auto &worker : workers) worker.join();
+  CHECK(failures == 0);
+  chhttp::Client client("http://127.0.0.1:" +
+                        std::to_string(server.port()));
+  auto health = client.get("/health");
+  CHECK(health && health->body == "healthy");
+  server.stop();
+}
+
 #ifdef CHHTTP_HAS_TLS
 struct CertificateFiles {
   std::filesystem::path directory;
@@ -1539,6 +2700,41 @@ TEST(stress_https_async_concurrency_and_large_payloads) {
     CHECK(response->body.size() ==
           std::to_string(index).size() + 1 + 32 * 1024);
   }
+  server.stop();
+}
+
+TEST(stress_tls_client_context_and_handshake_churn) {
+  auto certificate = make_certificate();
+  chhttp::ServerOptions server_options;
+  server_options.tls = chhttp::TlsServerOptions{
+      .certificate_file = certificate.certificate,
+      .private_key_file = certificate.key};
+  chhttp::Server server(std::move(server_options));
+  server.get("/secure", [](const chhttp::Request &,
+                            chhttp::Response &response) {
+    response.set_content("secure");
+  });
+  CHECK(server.start("127.0.0.1", 0));
+  const auto url =
+      "https://127.0.0.1:" + std::to_string(server.port());
+  constexpr int thread_count = 8;
+  constexpr int clients_per_thread = 8;
+  std::atomic_int failures{0};
+  std::vector<std::thread> workers;
+  workers.reserve(thread_count);
+  for (int thread = 0; thread != thread_count; ++thread) {
+    workers.emplace_back([&] {
+      for (int index = 0; index != clients_per_thread; ++index) {
+        chhttp::ClientOptions options;
+        options.tls.verify_peer = false;
+        chhttp::Client client(url, std::move(options));
+        auto response = client.get("/secure");
+        if (!response || response->body != "secure") ++failures;
+      }
+    });
+  }
+  for (auto &worker : workers) worker.join();
+  CHECK(failures == 0);
   server.stop();
 }
 

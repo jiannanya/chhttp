@@ -84,10 +84,13 @@ ctest --test-dir build -L stress --output-on-failure
 ctest --test-dir build -L stress --repeat until-fail:30 --output-on-failure
 ```
 
-Running `chhttp_tests` without an argument executes both groups. The stress
-group covers concurrent sync/async HTTP, connection recycling, cancellation
-storms, repeated server startup/shutdown, graceful draining, large concurrent
-WebSocket frames and HTTPS concurrency.
+Running `chhttp_tests` without an argument executes all 100 registered groups:
+80 focused functional/boundary groups and 20 load/lifecycle groups. The stress
+group covers concurrent sync/async HTTP, thousands of keep-alive requests,
+large uploads, streamed callbacks, connection recycling, independent and
+global cancellation, client/server churn, parallel servers, graceful draining,
+SSE fan-out, WebSocket connection/message load, malformed-request floods and
+HTTPS/TLS handshake concurrency.
 
 Consumers link the installed package as follows:
 
