@@ -405,7 +405,7 @@ public:
           connection, buffer,
           {.max_header_size = options.max_header_size,
            .max_body_size = options.max_body_size,
-           .timeout = timeout});
+           .read_timeout = timeout});
       if (!parsed) {
         if (parsed.error().code == Error::body_too_large ||
             parsed.error().code == Error::protocol) {

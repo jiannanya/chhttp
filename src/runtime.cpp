@@ -124,6 +124,23 @@ void stop_runtime(std::shared_ptr<Runtime> runtime) noexcept {
   }
 }
 
+namespace {
+
+struct ResumeOnAwaiter {
+  std::shared_ptr<Runtime> runtime;
+  bool await_ready() const noexcept { return runtime->on_loop_thread(); }
+  void await_suspend(std::coroutine_handle<> continuation) {
+    runtime->post([continuation] { continuation.resume(); });
+  }
+  void await_resume() const noexcept {}
+};
+
+} // namespace
+
+Task<void> resume_on(std::shared_ptr<Runtime> runtime) {
+  co_await ResumeOnAwaiter{std::move(runtime)};
+}
+
 struct Connection::PendingRead {
   std::coroutine_handle<> continuation;
   Result<ReadChunk> result{ErrorInfo{Error::internal, "Read not completed"}};
@@ -169,14 +186,17 @@ struct ConnectAwaiter {
   std::shared_ptr<Connection> connection;
   std::shared_ptr<Connection::PendingConnect> pending;
   std::chrono::milliseconds timeout;
+  std::function<void(const std::shared_ptr<Connection> &)> on_created;
 
   bool await_ready() const noexcept { return false; }
   void await_suspend(std::coroutine_handle<> continuation) {
     pending->continuation = continuation;
     auto connection_copy = connection;
     auto pending_copy = pending;
+    auto observer = on_created;
     connection->runtime()->post([connection_copy, pending_copy,
-                                 timeout = timeout] {
+                                 timeout = timeout,
+                                 observer = std::move(observer)] {
       auto *connection = connection_copy.get();
       connection->self_keep_ = connection_copy;
       int status = uv_tcp_init(connection->runtime_->loop(), &connection->tcp_);
@@ -208,6 +228,11 @@ struct ConnectAwaiter {
       pending_copy->self_keep = pending_copy;
       pending_copy->resolver.data = pending_copy.get();
       pending_copy->connector.data = pending_copy.get();
+      if (observer) observer(connection_copy);
+      if (pending_copy->completed) {
+        pending_copy->self_keep.reset();
+        return;
+      }
       uv_timer_start(&connection->read_timer_, &Connection::read_timeout,
                      timeout_ms(timeout), 0);
 
@@ -285,13 +310,16 @@ struct ConnectAwaiter {
 Task<Result<std::shared_ptr<Connection>>>
 Connection::connect(std::shared_ptr<Runtime> runtime, std::string host,
                     std::uint16_t port,
-                    std::chrono::milliseconds timeout) {
+                    std::chrono::milliseconds timeout,
+                    std::function<void(const std::shared_ptr<Connection> &)>
+                        on_created) {
   auto connection = std::shared_ptr<Connection>(new Connection(std::move(runtime)));
   auto pending = std::make_shared<PendingConnect>();
   pending->connection = connection;
   pending->host = std::move(host);
   pending->service = std::to_string(port);
-  co_return co_await ConnectAwaiter{connection, pending, timeout};
+  co_return co_await ConnectAwaiter{connection, pending, timeout,
+                                    std::move(on_created)};
 }
 
 void Connection::finish_connect(Result<std::shared_ptr<Connection>> result) {

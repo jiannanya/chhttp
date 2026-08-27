@@ -25,19 +25,23 @@ no third-party HTTP, WebSocket or URL library is used.
 - Synchronous client and non-blocking coroutine client/server APIs
 - Concurrent server sessions, configurable handler worker pool, timeouts, payload
   and header limits, keep-alive, TCP_NODELAY, cancellation and graceful stop
-- Per-origin HTTP/HTTPS/CONNECT idle connection pools with exclusive checkout,
-  bounded retention and safe stale-connection retry for idempotent requests
+- Per-origin HTTP/HTTPS/CONNECT connection pools with independent active and
+  idle limits, asynchronous queueing, exclusive checkout and safe stale retry
 - HTTPS/WSS through OpenSSL 3, SNI, hostname verification, custom CAs, Windows
   root-store import, client certificates and optional server-side mTLS
 - Ordered duplicate headers, ordered duplicate query/form fields, URL encoding,
   path parameters, regex routes, wildcard routes and routing middleware
-- Buffered and callback-streamed downloads with progress and cancellation
-- Chunked response writers, WHATWG-format SSE server/client, event IDs, named
-  events, retry delays, reconnect and `Last-Event-ID`
+- Buffered and callback-streamed downloads, response-head callbacks, awaited
+  consumers with backpressure, progress and exact per-request cancellation
+- Fixed-length and HTTP/1.1 chunked request-body producers with awaited
+  transport backpressure, avoiding complete upload buffers in the client
+- Public incremental WHATWG SSE parser plus GET/POST/arbitrary-method SSE
+  client, event IDs, named events, retry delays, reconnect and `Last-Event-ID`
 - RFC 6455 WebSocket client/server, text/binary messages, ping, close and
   subprotocol negotiation; connections remain asynchronous at scale
 - `multipart/form-data` encoding/parsing including binary file data
-- gzip, deflate, Brotli and Zstandard response negotiation and client decode
+- Incremental gzip, deflate, Brotli and Zstandard response decoding, including
+  genuinely streamed compressed responses
 - Static file mounts, index files, MIME types, byte ranges, HEAD, traversal
   prevention and custom mount headers
 - Redirects with method rewriting and cross-origin credential stripping
@@ -84,10 +88,10 @@ ctest --test-dir build -L stress --output-on-failure
 ctest --test-dir build -L stress --repeat until-fail:30 --output-on-failure
 ```
 
-Running `chhttp_tests` without an argument executes all 100 registered groups:
-80 focused functional/boundary groups and 20 load/lifecycle groups. The stress
+Running `chhttp_tests` without an argument executes all 128 registered groups:
+105 focused functional/boundary groups and 23 load/lifecycle groups. The stress
 group covers concurrent sync/async HTTP, thousands of keep-alive requests,
-large uploads, streamed callbacks, connection recycling, independent and
+large buffered and streamed uploads, streamed callbacks, connection recycling, independent and
 global cancellation, client/server churn, parallel servers, graceful draining,
 SSE fan-out, WebSocket connection/message load, malformed-request floods and
 HTTPS/TLS handshake concurrency.
@@ -149,6 +153,12 @@ long-running agent processes.
 | `chhttp_proxy` | `examples/proxy.cpp` | Forward-proxy absolute targets and Basic proxy auth |
 | `chhttp_https` | `examples/https.cpp` | HTTPS server/client trust configuration |
 | `chhttp_cancellation` | `examples/cancellation.cpp` | Active cancellation and safe client reuse |
+| `chhttp_post_json_sse` | `examples/post_json_sse.cpp` | OpenAI-compatible POST JSON to validated SSE streaming |
+| `chhttp_agent_tool_loop` | `examples/agent_tool_loop.cpp` | Streamed tool request, local execution, and follow-up turn |
+| `chhttp_agent_parallel_fanout` | `examples/agent_parallel_fanout.cpp` | Many agent streams through a bounded per-origin pool |
+| `chhttp_agent_stream_recovery` | `examples/agent_stream_recovery.cpp` | Retry before visible output and explicit interruption afterward |
+| `chhttp_agent_backpressure` | `examples/agent_backpressure.cpp` | Public SSE parser with awaited durable-consumer backpressure |
+| `chhttp_agent_stream_upload` | `examples/agent_stream_upload.cpp` | Memory-bounded agent attachment upload with chunked backpressure |
 
 For example:
 
@@ -182,11 +192,17 @@ chhttp::Task<void> invoke(chhttp::AsyncClient& client) {
 }
 ```
 
-For a streamed model response, set `RequestOptions::on_data`. Returning `false`
-from the callback cancels the request without buffering the rest of the body.
+For a streamed model response, validate status and content type in
+`on_response_head`, then consume bytes with `on_data` or the awaited
+`on_data_async`. Returning `false` cancels only that request. Synchronous
+callbacks execute on the client's libuv thread; use the asynchronous form when
+the consumer must wait for queue capacity or durable storage.
 
 ```cpp
 auto response = co_await client.get("/stream", {}, {
+  .on_response_head = [](const chhttp::ResponseHead& head) {
+    return head.status == 200;
+  },
   .on_data = [](std::string_view bytes) {
     consume(bytes);
     return true;
@@ -196,6 +212,12 @@ auto response = co_await client.get("/stream", {}, {
   }
 });
 ```
+
+`RequestOptions` also provides an active `std::stop_token`, an absolute
+deadline or relative total timeout, independent connect/read/write/header/first-body
+byte/idle timeouts, a per-request response limit and a decompression override.
+The legacy shared atomic cancellation flag remains source-compatible but cannot
+wake a blocked socket; new code should use `stop_token`.
 
 ## Async handlers and streaming responses
 
@@ -224,6 +246,22 @@ server.get_async("/events",
 The writer applies backpressure: each `co_await write` completes only after the
 transport accepted that chunk.
 
+Client request bodies use the same writer. Supply a content length for fixed
+framing or omit it to use HTTP/1.1 chunked transfer coding:
+
+```cpp
+chhttp::Request upload;
+upload.method = "POST";
+upload.target = "/v1/files";
+upload.set_stream_body([](chhttp::StreamWriter& writer)
+    -> chhttp::Task<void> {
+  while (auto block = co_await next_block()) {
+    if (!co_await writer.write(*block)) co_return;
+  }
+});
+auto response = co_await client.request(std::move(upload));
+```
+
 ## SSE client
 
 ```cpp
@@ -235,7 +273,27 @@ auto final_error = co_await stream.connect();
 ```
 
 The parser handles CRLF, split input chunks, multi-line `data`, comments, BOM,
-event IDs and server-provided retry delays. Reconnect is enabled by default.
+event IDs and server-provided retry delays. Reconnect is enabled by default for
+the GET convenience constructor.
+
+POST-based model streams use the method-agnostic `Request` constructor and
+normally disable replay:
+
+```cpp
+chhttp::Request request;
+request.method = "POST";
+request.target = "/v1/chat/completions";
+request.headers.set("Content-Type", "application/json");
+request.body = payload;
+
+chhttp::SseClient model_stream(client, std::move(request),
+                               {.reconnect = false});
+model_stream.on_event("delta", consume_delta);
+auto final_error = co_await model_stream.connect();
+```
+
+`SseParser` is separately reusable with `feed()` and `finish()` for MCP
+Streamable HTTP, recorded fixtures and provider-specific POST transports.
 
 ## WebSocket
 
@@ -280,10 +338,11 @@ is intended only for controlled tests.
 ## Resource and safety defaults
 
 The defaults cap request bodies at 64 MiB, response bodies at 128 MiB, headers
-at 64 KiB and keep-alive sessions at 1000 requests. Streaming callbacks avoid a
-second body allocation. Compression output is bounded by the configured body
-limit, route matching is performed before file access, percent-decoded static
-paths are canonicalized, and credentials are removed on cross-origin redirects.
+at 64 KiB, each client origin at 64 total connections and keep-alive sessions
+at 1000 requests. Streaming callbacks avoid a second body allocation.
+Incremental compression output is bounded by the configured body limit, route
+matching is performed before file access, percent-decoded static paths are
+canonicalized, and credentials are removed on cross-origin redirects.
 
 Tune `ServerOptions` and `ClientOptions` for model payload sizes and expected
 connection counts. The async server does not create a thread per connection;

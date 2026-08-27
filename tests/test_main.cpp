@@ -1690,7 +1690,13 @@ TEST(response_callbacks_can_cancel_body_and_progress) {
        }});
   CHECK(!progress_cancelled &&
         progress_cancelled.error().code == chhttp::Error::cancelled);
-  CHECK(last_current > 0 && last_total == 128 * 1024);
+  CHECK(last_current > 0);
+#ifdef CHHTTP_HAS_COMPRESSION
+  // A decoded streaming total is unknowable until the compressed stream ends.
+  CHECK(last_total == 0);
+#else
+  CHECK(last_total == 128 * 1024);
+#endif
 
 #ifdef CHHTTP_HAS_COMPRESSION
   auto corrupt = fetch_raw_response(
@@ -1836,6 +1842,16 @@ TEST(sse_clients_reject_non_event_stream_and_non_200_endpoints) {
     auto error = events.connect().get();
     CHECK(error.code == chhttp::Error::protocol);
     CHECK(error.message.find("503") != std::string::npos);
+  }
+  {
+    RawResponseServer server(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream-bad\r\n"
+        "Content-Length: 0\r\nConnection: close\r\n\r\n");
+    chhttp::AsyncClient client("http://127.0.0.1:" +
+                               std::to_string(server.port()));
+    chhttp::SseClient events(client, "/", {}, {.reconnect = false});
+    auto error = events.connect().get();
+    CHECK(error.code == chhttp::Error::protocol);
   }
 }
 
@@ -2278,13 +2294,13 @@ TEST(sse_parser_and_stream) {
   CHECK(received[2].id == "2");
 }
 
-// Verifies bytewise SSE parsing with BOM, CRLF, comments, empty IDs, and EOF dispatch.
+// Verifies bytewise SSE parsing with BOM, CRLF, comments, empty IDs, and EOF discard.
 TEST(sse_parser_handles_bytewise_bom_crlf_and_final_event) {
   const std::string body =
       std::string("\xEF\xBB\xBF") +
       "data: first\r\n: ignored comment\r\ndata: second line\r\n"
       "event: custom\r\nid: 7\r\nretry: 25\r\n\r\n"
-      "id:\r\ndata: tail";
+      "id:\r\ndata: tail\r\n\r\ndata: incomplete";
   RawResponseServer server(
       "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
       "Content-Length: " +
@@ -2396,6 +2412,50 @@ TEST(stress_concurrent_large_uploads_preserve_body_integrity) {
     const char marker = static_cast<char>('a' + index % 26);
     CHECK(response && response->body == std::to_string(payload_size) + "|" +
                                           marker + marker);
+  }
+  server.stop();
+}
+
+// Exercises 48 concurrent chunked producers without buffering complete 256 KiB uploads client-side.
+TEST(stress_concurrent_streamed_uploads_obey_connection_limits) {
+  chhttp::Server server;
+  server.post("/stream-upload", [](const chhttp::Request &request,
+                                    chhttp::Response &response) {
+    response.set_content(std::to_string(request.body.size()) + "|" +
+                         std::string(1, request.body.front()) +
+                         std::string(1, request.body.back()));
+  });
+  CHECK(server.start("127.0.0.1", 0));
+  chhttp::ClientOptions options;
+  options.connection_pool_size = 8;
+  options.max_connections_per_origin = 8;
+  chhttp::AsyncClient client(
+      "http://127.0.0.1:" + std::to_string(server.port()),
+      std::move(options));
+  constexpr int count = 48;
+  constexpr std::size_t chunk_size = 8 * 1024;
+  constexpr std::size_t chunks = 32;
+  std::vector<chhttp::Task<chhttp::ResponseResult>> uploads;
+  uploads.reserve(count);
+  for (int index = 0; index != count; ++index) {
+    const char marker = static_cast<char>('a' + index % 26);
+    chhttp::Request request;
+    request.method = "POST";
+    request.target = "/stream-upload";
+    request.set_stream_body(
+        [marker](chhttp::StreamWriter &writer) -> chhttp::Task<void> {
+          const std::string chunk(chunk_size, marker);
+          for (std::size_t part = 0; part != chunks; ++part)
+            if (!co_await writer.write(chunk)) co_return;
+        });
+    uploads.push_back(client.request(std::move(request)));
+  }
+  for (int index = 0; index != count; ++index) {
+    auto response = uploads[index].get();
+    const char marker = static_cast<char>('a' + index % 26);
+    CHECK(response &&
+          response->body == std::to_string(chunk_size * chunks) + "|" +
+                                marker + marker);
   }
   server.stop();
 }
@@ -2623,6 +2683,764 @@ TEST(stress_malformed_request_flood_remains_available) {
   auto health = client.get("/health");
   CHECK(health && health->body == "healthy");
   server.stop();
+}
+
+// Verifies streamed request bodies support chunked/fixed framing, limits, and active cancellation.
+TEST(streamed_request_bodies_are_framed_and_validated) {
+  chhttp::Server server;
+  server.post("/upload", [](const chhttp::Request &request,
+                             chhttp::Response &response) {
+    response.set_content(request.get_header("Transfer-Encoding") + "|" +
+                         request.get_header("Content-Length") + "|" +
+                         request.body);
+  });
+  CHECK(server.start("127.0.0.1", 0));
+  chhttp::AsyncClient client("http://127.0.0.1:" +
+                             std::to_string(server.port()));
+
+  chhttp::Request chunked;
+  chunked.method = "POST";
+  chunked.target = "/upload";
+  chunked.set_stream_body([](chhttp::StreamWriter &writer)
+                              -> chhttp::Task<void> {
+    CHECK(co_await writer.write("abc"));
+    co_await chhttp::sleep_for(std::chrono::milliseconds(2));
+    CHECK(co_await writer.write("def"));
+  });
+  auto chunked_result = client.request(std::move(chunked)).get();
+  CHECK(chunked_result && chunked_result->body == "chunked||abcdef");
+
+  chhttp::Request fixed;
+  fixed.method = "POST";
+  fixed.target = "/upload";
+  fixed.set_stream_body(
+      [](chhttp::StreamWriter &writer) -> chhttp::Task<void> {
+        CHECK(co_await writer.write("123"));
+        CHECK(co_await writer.write("456"));
+      },
+      6);
+  auto fixed_result = client.request(std::move(fixed)).get();
+  CHECK(fixed_result && fixed_result->body == "|6|123456");
+
+  chhttp::Request short_body;
+  short_body.method = "POST";
+  short_body.target = "/upload";
+  short_body.set_stream_body(
+      [](chhttp::StreamWriter &writer) -> chhttp::Task<void> {
+        co_await writer.write("abc");
+      },
+      4);
+  auto short_result = client.request(std::move(short_body)).get();
+  CHECK(!short_result && short_result.error().code == chhttp::Error::protocol);
+
+  chhttp::Request long_body;
+  long_body.method = "POST";
+  long_body.target = "/upload";
+  long_body.set_stream_body(
+      [](chhttp::StreamWriter &writer) -> chhttp::Task<void> {
+        CHECK(co_await writer.write(""));
+        CHECK(!co_await writer.write("toolong"));
+      },
+      3);
+  auto long_result = client.request(std::move(long_body)).get();
+  CHECK(!long_result && long_result.error().code == chhttp::Error::protocol);
+
+  chhttp::Request http10;
+  http10.method = "POST";
+  http10.target = "/upload";
+  http10.version = 10;
+  http10.set_stream_body([](chhttp::StreamWriter &) -> chhttp::Task<void> {
+    co_return;
+  });
+  auto http10_result = client.request(std::move(http10)).get();
+  CHECK(!http10_result &&
+        http10_result.error().code == chhttp::Error::invalid_argument);
+
+  chhttp::Request ambiguous;
+  ambiguous.method = "POST";
+  ambiguous.target = "/upload";
+  ambiguous.set_stream_body([](chhttp::StreamWriter &) -> chhttp::Task<void> {
+    co_return;
+  });
+  ambiguous.body = "buffered-too";
+  auto ambiguous_result = client.request(std::move(ambiguous)).get();
+  CHECK(!ambiguous_result &&
+        ambiguous_result.error().code == chhttp::Error::invalid_argument);
+
+  std::stop_source source;
+  chhttp::Request cancellable;
+  cancellable.method = "POST";
+  cancellable.target = "/upload";
+  cancellable.set_stream_body(
+      [](chhttp::StreamWriter &writer) -> chhttp::Task<void> {
+        for (int index = 0; index != 100; ++index) {
+          co_await chhttp::sleep_for(std::chrono::milliseconds(2));
+          if (!co_await writer.write("data")) co_return;
+        }
+      });
+  auto cancelled = client.request(
+      std::move(cancellable), {.stop_token = source.get_token()});
+  std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  source.request_stop();
+  auto cancelled_result = cancelled.get();
+  CHECK(!cancelled_result &&
+        cancelled_result.error().code == chhttp::Error::cancelled);
+  server.stop();
+}
+
+// Verifies response metadata is exposed before the first streamed body byte.
+TEST(response_head_callback_precedes_stream_data) {
+  chhttp::Client client(fixture().base_url);
+  std::string order;
+  chhttp::ResponseHead observed;
+  auto response = client.get(
+      "/stream", {},
+      {.on_response_head = [&](const chhttp::ResponseHead &head) {
+         order.push_back('H');
+         observed = head;
+         return true;
+       },
+       .on_data = [&](std::string_view) {
+         order.push_back('D');
+         return true;
+       }});
+  CHECK(response && response->status == 200);
+  CHECK(order == "HDD");
+  CHECK(observed.status == 200);
+  CHECK(observed.headers.get("Content-Type") == "text/plain");
+}
+
+// Verifies rejecting a response head prevents every body callback and closes the exchange.
+TEST(response_head_rejection_prevents_body_delivery) {
+  chhttp::Client client(fixture().base_url);
+  std::size_t body_calls = 0;
+  auto response = client.get(
+      "/large", {},
+      {.on_response_head = [](const chhttp::ResponseHead &head) {
+         return head.status != 200;
+       },
+       .on_data = [&](std::string_view) {
+         ++body_calls;
+         return true;
+       }});
+  CHECK(!response && response.error().code == chhttp::Error::cancelled);
+  CHECK(body_calls == 0);
+}
+
+// Verifies exceptions from response-head callbacks become structured client errors.
+TEST(response_head_callback_exceptions_are_contained) {
+  chhttp::Client client(fixture().base_url);
+  auto response = client.get(
+      "/hello", {},
+      {.on_response_head = [](const chhttp::ResponseHead &) -> bool {
+         throw std::runtime_error("head failure");
+       }});
+  CHECK(!response && response.error().code == chhttp::Error::internal);
+  CHECK(response.error().message.find("head failure") != std::string::npos);
+}
+
+// Verifies a per-request total timeout bounds the entire exchange independently of client defaults.
+TEST(per_request_total_timeout_bounds_the_exchange) {
+  chhttp::ClientOptions client_options;
+  client_options.read_timeout = std::chrono::seconds(2);
+  chhttp::Client client(fixture().base_url, std::move(client_options));
+  const auto started = std::chrono::steady_clock::now();
+  auto response = client.get(
+      "/slow", {}, {.total_timeout = std::chrono::milliseconds(25)});
+  const auto elapsed = std::chrono::steady_clock::now() - started;
+  CHECK(!response && response.error().code == chhttp::Error::timeout);
+  CHECK(elapsed < std::chrono::milliseconds(175));
+}
+
+// Verifies a per-request socket-read timeout can be shorter than the shared client default.
+TEST(per_request_socket_read_timeout_overrides_the_client) {
+  chhttp::ClientOptions client_options;
+  client_options.read_timeout = std::chrono::seconds(2);
+  chhttp::Client client(fixture().base_url, std::move(client_options));
+  auto response = client.get(
+      "/slow", {}, {.read_timeout = std::chrono::milliseconds(20)});
+  CHECK(!response && response.error().code == chhttp::Error::timeout);
+  CHECK(response.error().message.find("Socket read") != std::string::npos);
+}
+
+// Verifies the response-header timeout expires despite a longer socket read timeout.
+TEST(per_request_response_header_timeout_is_independent) {
+  chhttp::Server server;
+  server.get_async(
+      "/late-head", [](const chhttp::Request &,
+                         chhttp::Response &response) -> chhttp::Task<void> {
+        co_await chhttp::sleep_for(std::chrono::milliseconds(100));
+        response.set_content("late");
+      });
+  CHECK(server.start("127.0.0.1", 0));
+  chhttp::ClientOptions client_options;
+  client_options.read_timeout = std::chrono::seconds(2);
+  chhttp::Client client("http://127.0.0.1:" +
+                            std::to_string(server.port()),
+                        std::move(client_options));
+  auto response = client.get(
+      "/late-head", {},
+      {.header_timeout = std::chrono::milliseconds(20)});
+  CHECK(!response && response.error().code == chhttp::Error::timeout);
+  CHECK(response.error().message.find("header") != std::string::npos);
+  server.stop();
+}
+
+// Verifies the first-body-byte timer starts after a valid response head is parsed.
+TEST(per_request_first_body_byte_timeout_is_independent) {
+  chhttp::Server server;
+  server.get_async(
+      "/late-body", [](const chhttp::Request &,
+                         chhttp::Response &response) -> chhttp::Task<void> {
+        response.set_stream(
+            "text/plain", [](chhttp::StreamWriter &writer)
+                              -> chhttp::Task<void> {
+              co_await chhttp::sleep_for(std::chrono::milliseconds(100));
+              co_await writer.write("late");
+            });
+        co_return;
+      });
+  CHECK(server.start("127.0.0.1", 0));
+  chhttp::Client client("http://127.0.0.1:" +
+                        std::to_string(server.port()));
+  bool saw_head = false;
+  auto response = client.get(
+      "/late-body", {},
+      {.on_response_head = [&](const chhttp::ResponseHead &) {
+         saw_head = true;
+         return true;
+       },
+       .first_body_byte_timeout = std::chrono::milliseconds(20)});
+  CHECK(saw_head);
+  CHECK(!response && response.error().code == chhttp::Error::timeout);
+  CHECK(response.error().message.find("First response body byte") !=
+        std::string::npos);
+  server.stop();
+}
+
+// Verifies the idle-between-body-chunks timer resets after each delivered payload.
+TEST(per_request_stream_idle_timeout_detects_a_stall) {
+  chhttp::Server server;
+  server.get_async(
+      "/stalled", [](const chhttp::Request &,
+                       chhttp::Response &response) -> chhttp::Task<void> {
+        response.set_stream(
+            "text/plain", [](chhttp::StreamWriter &writer)
+                              -> chhttp::Task<void> {
+              if (!co_await writer.write("first")) co_return;
+              co_await chhttp::sleep_for(std::chrono::milliseconds(100));
+              co_await writer.write("second");
+            });
+        co_return;
+      });
+  CHECK(server.start("127.0.0.1", 0));
+  chhttp::Client client("http://127.0.0.1:" +
+                        std::to_string(server.port()));
+  std::string received;
+  auto response = client.get(
+      "/stalled", {},
+      {.on_data = [&](std::string_view bytes) {
+         received.append(bytes);
+         return true;
+       },
+       .idle_timeout = std::chrono::milliseconds(20)});
+  CHECK(received == "first");
+  CHECK(!response && response.error().code == chhttp::Error::timeout);
+  CHECK(response.error().message.find("idle") != std::string::npos);
+  server.stop();
+}
+
+// Verifies a response-size limit can be tightened for one request without rebuilding a client.
+TEST(per_request_response_size_limit_overrides_the_client) {
+  chhttp::Client client(fixture().base_url);
+  auto limited = client.get(
+      "/large", {}, {.max_response_body_size = std::size_t{1024}});
+  CHECK(!limited && limited.error().code == chhttp::Error::body_too_large);
+  auto normal = client.get("/hello");
+  CHECK(normal && normal->body == "hello:world");
+}
+
+// Verifies a request-level decompression override also controls automatic wire negotiation.
+TEST(per_request_decompression_override_controls_accept_encoding) {
+#ifdef CHHTTP_HAS_COMPRESSION
+  chhttp::Server server;
+  server.get("/accepted", [](const chhttp::Request &request,
+                              chhttp::Response &response) {
+    response.set_content(request.get_header("Accept-Encoding"));
+  });
+  CHECK(server.start("127.0.0.1", 0));
+  const auto origin = "http://127.0.0.1:" + std::to_string(server.port());
+
+  chhttp::ClientOptions disabled_options;
+  disabled_options.auto_decompress = false;
+  chhttp::Client disabled(origin, std::move(disabled_options));
+  auto enabled_once = disabled.get(
+      "/accepted", {}, {.auto_decompress = true});
+  CHECK(enabled_once && enabled_once->body.find("gzip") != std::string::npos);
+
+  chhttp::Client enabled(origin);
+  auto disabled_once = enabled.get(
+      "/accepted", {}, {.auto_decompress = false});
+  CHECK(disabled_once && disabled_once->body.empty());
+  server.stop();
+#else
+  CHECK(true);
+#endif
+}
+
+// Verifies stop_token actively interrupts one blocked read without cancelling a neighboring request.
+TEST(stop_token_cancels_exactly_one_active_request) {
+  chhttp::AsyncClient client(fixture().base_url);
+  std::stop_source source;
+  auto cancelled = client.get(
+      "/slow", {}, {.stop_token = source.get_token()});
+  auto neighbor = client.get("/slow");
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  const auto started = std::chrono::steady_clock::now();
+  source.request_stop();
+  auto cancelled_result = cancelled.get();
+  const auto elapsed = std::chrono::steady_clock::now() - started;
+  CHECK(!cancelled_result &&
+        cancelled_result.error().code == chhttp::Error::cancelled);
+  CHECK(elapsed < std::chrono::milliseconds(150));
+  auto neighbor_result = neighbor.get();
+  CHECK(neighbor_result && neighbor_result->body == "late");
+}
+
+// Verifies an awaited data consumer preserves order and applies coroutine backpressure.
+TEST(async_data_callbacks_apply_backpressure_without_blocking_contracts) {
+  chhttp::Client client(fixture().base_url);
+  std::string assembled;
+  std::size_t calls = 0;
+  const auto started = std::chrono::steady_clock::now();
+  auto response = client.get(
+      "/stream", {},
+      {.on_data_async = [&](std::string_view bytes) -> chhttp::Task<bool> {
+         assembled.append(bytes);
+         ++calls;
+         co_await chhttp::sleep_for(std::chrono::milliseconds(8));
+         co_return true;
+       }});
+  const auto elapsed = std::chrono::steady_clock::now() - started;
+  CHECK(response && response->body.empty());
+  CHECK(assembled == "onetwo" && calls == 2);
+  CHECK(elapsed >= std::chrono::milliseconds(16));
+}
+
+// Verifies network-idle time excludes time intentionally spent awaiting consumer backpressure.
+TEST(stream_idle_timeout_excludes_async_consumer_backpressure) {
+  chhttp::Server server;
+  server.get_async(
+      "/fast-producer", [](const chhttp::Request &,
+                             chhttp::Response &response) -> chhttp::Task<void> {
+        response.set_stream(
+            "text/plain", [](chhttp::StreamWriter &writer)
+                              -> chhttp::Task<void> {
+              CHECK(co_await writer.write("one"));
+              CHECK(co_await writer.write("two"));
+            });
+        co_return;
+      });
+  CHECK(server.start("127.0.0.1", 0));
+  chhttp::Client client("http://127.0.0.1:" +
+                        std::to_string(server.port()));
+  std::string body;
+  auto response = client.get(
+      "/fast-producer", {},
+      {.on_data_async = [&](std::string_view bytes) -> chhttp::Task<bool> {
+         body.append(bytes);
+         co_await chhttp::sleep_for(std::chrono::milliseconds(30));
+         co_return true;
+       },
+       .idle_timeout = std::chrono::milliseconds(10)});
+  CHECK(response && body == "onetwo");
+  server.stop();
+}
+
+// Verifies ambiguous simultaneous synchronous and asynchronous body handlers are rejected.
+TEST(client_rejects_two_body_consumers_for_one_request) {
+  chhttp::Client client(fixture().base_url);
+  auto response = client.get(
+      "/hello", {},
+      {.on_data = [](std::string_view) { return true; },
+       .on_data_async = [](std::string_view) -> chhttp::Task<bool> {
+         co_return true;
+       }});
+  CHECK(!response && response.error().code == chhttp::Error::invalid_argument);
+}
+
+// Verifies the public SSE parser handles byte splits, BOM, CR-only lines, and inherited IDs.
+TEST(public_sse_parser_handles_arbitrary_boundaries_and_cr_lines) {
+  chhttp::SseParser parser;
+  std::vector<chhttp::SseEvent> events;
+  parser.on_event("delta", [&](const chhttp::SseEvent &event) {
+    events.push_back(event);
+  });
+  const std::string stream = std::string("\xEF\xBB\xBF") +
+      "id: 41\rretry: 17\r\rdata: first\rdata: second\revent: delta\r\r";
+  for (const char byte : stream)
+    CHECK(!parser.feed(std::string_view(&byte, 1)));
+  CHECK(!parser.finish());
+  CHECK(events.size() == 1);
+  CHECK(events[0].data == "first\nsecond");
+  CHECK(events[0].id == "41");
+  CHECK(parser.last_event_id() == "41");
+  CHECK(parser.retry() == std::chrono::milliseconds(17));
+}
+
+// Verifies independent line/event limits reject oversized SSE input deterministically.
+TEST(public_sse_parser_enforces_line_and_event_limits) {
+  chhttp::SseParser short_line({.max_line_size = 4,
+                                .max_event_size = 100});
+  auto line_error = short_line.feed("data: too-long\n\n");
+  CHECK(line_error.code == chhttp::Error::body_too_large);
+
+  chhttp::SseParser small_event({.max_line_size = 100,
+                                 .max_event_size = 5});
+  auto event_error = small_event.feed("data: 123456\n\n");
+  CHECK(event_error.code == chhttp::Error::body_too_large);
+}
+
+// Verifies parser callback failures are contained and reset restores incremental parsing.
+TEST(public_sse_parser_contains_callback_failures_and_resets) {
+  chhttp::SseParser parser;
+  parser.on_message([](const chhttp::SseEvent &) {
+    throw std::runtime_error("parser consumer failed");
+  });
+  auto failed = parser.feed("data: first\n\n");
+  CHECK(failed.code == chhttp::Error::internal);
+  parser.reset();
+  std::string value;
+  parser.on_message(
+      [&](const chhttp::SseEvent &event) { value = event.data; });
+  CHECK(!parser.feed("data: incomplete"));
+  CHECK(!parser.finish());
+  CHECK(value.empty());
+  parser.reset();
+  CHECK(!parser.feed("data: recovered\n\n"));
+  CHECK(!parser.finish());
+  CHECK(value == "recovered");
+}
+
+// Verifies SseClient can POST JSON and parse events only after validating the response head.
+TEST(post_json_sse_client_streams_model_events) {
+  chhttp::Server server;
+  server.post_async(
+      "/v1/chat/completions",
+      [](const chhttp::Request &request,
+         chhttp::Response &response) -> chhttp::Task<void> {
+        CHECK(request.get_header("Content-Type") == "application/json");
+        CHECK(request.get_header("Authorization") == "Bearer test-key");
+        CHECK(request.body.find("\"stream\":true") != std::string::npos);
+        response.set_sse([](chhttp::SseWriter &writer)
+                             -> chhttp::Task<void> {
+          CHECK(co_await writer.send({.data = R"({"delta":"Hello"})",
+                                      .event = "delta",
+                                      .id = "1"}));
+          CHECK(co_await writer.send({.data = "[DONE]", .id = "2"}));
+        });
+        co_return;
+      });
+  CHECK(server.start("127.0.0.1", 0));
+  chhttp::AsyncClient client("http://127.0.0.1:" +
+                             std::to_string(server.port()));
+  chhttp::Request request;
+  request.method = "POST";
+  request.target = "/v1/chat/completions";
+  request.headers.set("Content-Type", "application/json");
+  request.headers.set("Authorization", "Bearer test-key");
+  request.body = R"({"model":"agent","stream":true})";
+  chhttp::SseClient stream(client, std::move(request), {.reconnect = false});
+  bool opened = false;
+  std::vector<std::string> events;
+  stream.on_open([&](const chhttp::ResponseHead &head) {
+    opened = head.status == 200;
+  });
+  stream.on_message(
+      [&](const chhttp::SseEvent &event) { events.push_back(event.data); });
+  auto ended = stream.connect().get();
+  CHECK(ended.code == chhttp::Error::read);
+  CHECK(opened);
+  CHECK(events == std::vector<std::string>({R"({"delta":"Hello"})",
+                                            "[DONE]"}));
+  server.stop();
+}
+
+// Verifies POST SSE rejects a non-success head before malicious event-looking bytes are parsed.
+TEST(post_sse_rejects_error_heads_before_event_dispatch) {
+  chhttp::Server server;
+  server.post_async(
+      "/denied", [](const chhttp::Request &,
+                      chhttp::Response &response) -> chhttp::Task<void> {
+        response.status = 401;
+        response.set_sse([](chhttp::SseWriter &writer)
+                             -> chhttp::Task<void> {
+          co_await writer.data("must-not-dispatch");
+        });
+        co_return;
+      });
+  CHECK(server.start("127.0.0.1", 0));
+  chhttp::AsyncClient client("http://127.0.0.1:" +
+                             std::to_string(server.port()));
+  chhttp::Request request;
+  request.method = "POST";
+  request.target = "/denied";
+  chhttp::SseClient stream(client, std::move(request), {.reconnect = false});
+  std::size_t events = 0;
+  stream.on_message([&](const chhttp::SseEvent &) { ++events; });
+  auto error = stream.connect().get();
+  CHECK(error.code == chhttp::Error::protocol);
+  CHECK(events == 0);
+  server.stop();
+}
+
+// Verifies a 307 redirect preserves a POST SSE request and opens only the final event stream.
+TEST(post_sse_follows_307_redirect_without_parsing_intermediate_bodies) {
+  chhttp::Server server;
+  server.post("/redirect", [](const chhttp::Request &request,
+                              chhttp::Response &response) {
+    CHECK(request.body == R"({"stream":true})");
+    response.set_redirect("/events", 307);
+  });
+  server.post_async(
+      "/events", [](const chhttp::Request &request,
+                      chhttp::Response &response) -> chhttp::Task<void> {
+        CHECK(request.body == R"({"stream":true})");
+        CHECK(request.get_header("Authorization") == "Bearer redirect-key");
+        response.set_sse([](chhttp::SseWriter &writer)
+                             -> chhttp::Task<void> {
+          CHECK(co_await writer.data("redirected"));
+        });
+        co_return;
+      });
+  CHECK(server.start("127.0.0.1", 0));
+  chhttp::AsyncClient client("http://127.0.0.1:" +
+                             std::to_string(server.port()));
+  chhttp::Request request;
+  request.method = "POST";
+  request.target = "/redirect";
+  request.headers.set("Authorization", "Bearer redirect-key");
+  request.headers.set("Content-Type", "application/json");
+  request.body = R"({"stream":true})";
+  chhttp::SseClient stream(client, std::move(request), {.reconnect = false});
+  std::size_t opened = 0;
+  std::vector<std::string> events;
+  stream.on_open([&](const chhttp::ResponseHead &head) {
+    CHECK(head.status == 200);
+    ++opened;
+  });
+  stream.on_message(
+      [&](const chhttp::SseEvent &event) { events.push_back(event.data); });
+  auto ended = stream.connect().get();
+  CHECK(ended.code == chhttp::Error::read);
+  CHECK(opened == 1);
+  CHECK(events == std::vector<std::string>({"redirected"}));
+  server.stop();
+}
+
+#ifdef CHHTTP_HAS_COMPRESSION
+// Verifies gzip data is decompressed incrementally instead of buffered until stream completion.
+TEST(compressed_response_streams_decompressed_chunks_incrementally) {
+  const std::array<unsigned char, 38> encoded{
+      0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff,
+      0x4b, 0xcb, 0x2c, 0x2a, 0x2e, 0xd1, 0x2d, 0x4e, 0x4d, 0xce,
+      0xcf, 0x4b, 0xd1, 0x2d, 0xc9, 0xc8, 0x2c, 0x4a, 0x01, 0x00,
+      0xa7, 0xda, 0x6e, 0xfc, 0x12, 0x00, 0x00, 0x00};
+  chhttp::Server server;
+  server.get_async(
+      "/gzip-stream", [encoded](const chhttp::Request &,
+                                  chhttp::Response &response)
+          -> chhttp::Task<void> {
+        response.headers.set("Content-Encoding", "gzip");
+        response.set_stream(
+            "text/plain", [encoded](chhttp::StreamWriter &writer)
+                              -> chhttp::Task<void> {
+              for (const auto byte : encoded) {
+                const char value = static_cast<char>(byte);
+                if (!co_await writer.write(std::string_view(&value, 1)))
+                  co_return;
+                co_await chhttp::sleep_for(std::chrono::milliseconds(2));
+              }
+            });
+        co_return;
+      });
+  CHECK(server.start("127.0.0.1", 0));
+  chhttp::Client client("http://127.0.0.1:" +
+                        std::to_string(server.port()));
+  std::string decoded;
+  std::size_t calls = 0;
+  auto response = client.get(
+      "/gzip-stream", {},
+      {.on_data = [&](std::string_view bytes) {
+         decoded.append(bytes);
+         ++calls;
+         return true;
+       }});
+  CHECK(response && response->body.empty());
+  CHECK(decoded == "first-second-third");
+  CHECK(calls > 1);
+  CHECK(!response->headers.contains("Content-Encoding"));
+  server.stop();
+}
+#endif
+
+// Verifies the active-connection cap queues excess requests instead of opening unbounded sockets.
+TEST(per_origin_connection_limit_bounds_server_concurrency) {
+  chhttp::Server server;
+  std::atomic_int active{0};
+  std::atomic_int maximum{0};
+  server.get_async(
+      "/bounded", [&](const chhttp::Request &,
+                       chhttp::Response &response) -> chhttp::Task<void> {
+        const int current = active.fetch_add(1) + 1;
+        int observed = maximum.load();
+        while (current > observed &&
+               !maximum.compare_exchange_weak(observed, current)) {
+        }
+        co_await chhttp::sleep_for(std::chrono::milliseconds(15));
+        active.fetch_sub(1);
+        response.set_content("ok");
+      });
+  CHECK(server.start("127.0.0.1", 0));
+  chhttp::ClientOptions options;
+  options.connection_pool_size = 2;
+  options.max_connections_per_origin = 2;
+  chhttp::AsyncClient client("http://127.0.0.1:" +
+                                 std::to_string(server.port()),
+                             std::move(options));
+  std::vector<chhttp::Task<chhttp::ResponseResult>> requests;
+  for (int index = 0; index != 16; ++index)
+    requests.push_back(client.get("/bounded"));
+  for (auto &request : requests) {
+    auto response = request.get();
+    CHECK(response && response->body == "ok");
+  }
+  CHECK(maximum <= 2);
+  server.stop();
+}
+
+// Verifies a request deadline also expires while waiting for an origin connection slot.
+TEST(request_deadline_cancels_connection_pool_wait) {
+  chhttp::ClientOptions options;
+  options.connection_pool_size = 1;
+  options.max_connections_per_origin = 1;
+  chhttp::AsyncClient client(fixture().base_url, std::move(options));
+  auto occupying = client.get("/slow");
+  std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  auto queued = client.get(
+      "/hello", {}, {.total_timeout = std::chrono::milliseconds(20)});
+  auto queued_result = queued.get();
+  CHECK(!queued_result && queued_result.error().code == chhttp::Error::timeout);
+  auto occupying_result = occupying.get();
+  CHECK(occupying_result && occupying_result->body == "late");
+}
+
+// Verifies stopping one SseClient does not cancel another request sharing its AsyncClient.
+TEST(stopping_sse_is_isolated_from_shared_client_requests) {
+  chhttp::Server server;
+  std::atomic_bool entered{false};
+  server.get_async(
+      "/events", [&](const chhttp::Request &,
+                       chhttp::Response &response) -> chhttp::Task<void> {
+        response.set_sse([&](chhttp::SseWriter &writer)
+                             -> chhttp::Task<void> {
+          entered = true;
+          while (writer.open()) {
+            if (!co_await writer.data("tick")) co_return;
+            co_await chhttp::sleep_for(std::chrono::milliseconds(5));
+          }
+        });
+        co_return;
+      });
+  server.get_async(
+      "/neighbor", [](const chhttp::Request &,
+                        chhttp::Response &response) -> chhttp::Task<void> {
+        co_await chhttp::sleep_for(std::chrono::milliseconds(40));
+        response.set_content("neighbor-ok");
+      });
+  CHECK(server.start("127.0.0.1", 0));
+  chhttp::AsyncClient client("http://127.0.0.1:" +
+                             std::to_string(server.port()));
+  chhttp::SseClient events(client, "/events", {}, {.reconnect = false});
+  auto stream = events.connect();
+  const auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::seconds(1);
+  while (!entered && std::chrono::steady_clock::now() < deadline)
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  CHECK(entered);
+  auto neighbor = client.get("/neighbor");
+  events.stop();
+  CHECK(!stream.get());
+  auto response = neighbor.get();
+  CHECK(response && response->body == "neighbor-ok");
+  server.stop();
+}
+
+// Exercises many concurrent POST JSON SSE streams through one bounded client.
+TEST(stress_concurrent_post_json_sse_streams) {
+  chhttp::Server server;
+  server.post_async(
+      "/agent", [](const chhttp::Request &request,
+                     chhttp::Response &response) -> chhttp::Task<void> {
+        response.set_sse([body = request.body](chhttp::SseWriter &writer)
+                             -> chhttp::Task<void> {
+          co_await writer.send({.data = body, .event = "delta"});
+        });
+        co_return;
+      });
+  CHECK(server.start("127.0.0.1", 0));
+  chhttp::ClientOptions options;
+  options.max_connections_per_origin = 16;
+  options.connection_pool_size = 16;
+  chhttp::AsyncClient client("http://127.0.0.1:" +
+                                 std::to_string(server.port()),
+                             std::move(options));
+  constexpr int count = 96;
+  std::vector<std::unique_ptr<chhttp::SseClient>> streams;
+  std::array<std::string, count> received;
+  std::vector<chhttp::Task<chhttp::ErrorInfo>> tasks;
+  for (int index = 0; index != count; ++index) {
+    chhttp::Request request;
+    request.method = "POST";
+    request.target = "/agent";
+    request.body = "agent-" + std::to_string(index);
+    streams.push_back(std::make_unique<chhttp::SseClient>(
+        client, std::move(request), chhttp::SseClientOptions{.reconnect = false}));
+    streams.back()->on_event("delta", [&, index](const chhttp::SseEvent &event) {
+      received[index] = event.data;
+    });
+    tasks.push_back(streams.back()->connect());
+  }
+  for (int index = 0; index != count; ++index) {
+    CHECK(tasks[index].get().code == chhttp::Error::read);
+    CHECK(received[index] == "agent-" + std::to_string(index));
+  }
+  server.stop();
+}
+
+// Exercises a cancellation storm using independent stop tokens and verifies client recovery.
+TEST(stress_stop_token_cancellation_isolation_and_recovery) {
+  chhttp::ClientOptions options;
+  options.max_connections_per_origin = 32;
+  chhttp::AsyncClient client(fixture().base_url, std::move(options));
+  constexpr int count = 128;
+  std::array<std::stop_source, count> sources;
+  std::vector<chhttp::Task<chhttp::ResponseResult>> requests;
+  for (int index = 0; index != count; ++index)
+    requests.push_back(client.get(
+        "/slow", {}, {.stop_token = sources[index].get_token()}));
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  for (int index = 0; index != count; index += 2)
+    sources[index].request_stop();
+  for (int index = 0; index != count; ++index) {
+    auto response = requests[index].get();
+    if (index % 2 == 0)
+      CHECK(!response && response.error().code == chhttp::Error::cancelled);
+    else
+      CHECK(response && response->body == "late");
+  }
+  auto recovered = client.get("/hello?who=stop-token").get();
+  CHECK(recovered && recovered->body == "hello:stop-token");
 }
 
 #ifdef CHHTTP_HAS_TLS

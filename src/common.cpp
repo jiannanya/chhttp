@@ -86,6 +86,18 @@ std::string Request::get_param(std::string_view name,
   return found == query.end() ? std::string(fallback) : found->second;
 }
 
+void Request::set_stream_body(
+    StreamHandler handler,
+    std::optional<std::uint64_t> content_length) {
+  body.clear();
+  body_stream = std::move(handler);
+  body_stream_length = content_length;
+}
+
+bool Request::is_streaming_body() const noexcept {
+  return static_cast<bool>(body_stream);
+}
+
 Task<bool> StreamWriter::write(std::string_view data) {
   if (!sink_) {
     co_return false;

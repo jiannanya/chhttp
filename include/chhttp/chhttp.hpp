@@ -14,6 +14,7 @@
 #include <mutex>
 #include <optional>
 #include <span>
+#include <stop_token>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -263,6 +264,7 @@ using MultipartForm = std::vector<MultipartPart>;
 
 enum class Error {
   none,
+  invalid_argument,
   cancelled,
   invalid_url,
   resolve,
@@ -319,6 +321,9 @@ private:
   ErrorInfo error_;
 };
 
+class StreamWriter;
+using StreamHandler = std::function<Task<void>(StreamWriter &)>;
+
 struct Request {
   std::string method{"GET"};
   std::string target{"/"};
@@ -328,6 +333,11 @@ struct Request {
   Params query;
   PathParams path_params;
   std::string body;
+  // A streamed client request body. Without a declared length, HTTP/1.1 uses
+  // chunked transfer coding. StreamWriter::write() provides transport
+  // backpressure without buffering the complete upload.
+  StreamHandler body_stream;
+  std::optional<std::uint64_t> body_stream_length;
   MultipartForm files;
   std::string remote_address;
   std::uint16_t remote_port{0};
@@ -339,6 +349,9 @@ struct Request {
   [[nodiscard]] bool has_param(std::string_view name) const;
   [[nodiscard]] std::string get_param(std::string_view name,
                                       std::string_view fallback = {}) const;
+  void set_stream_body(StreamHandler handler,
+                       std::optional<std::uint64_t> content_length = std::nullopt);
+  [[nodiscard]] bool is_streaming_body() const noexcept;
 };
 
 struct SseEvent {
@@ -380,7 +393,6 @@ private:
   StreamWriter writer_;
 };
 
-using StreamHandler = std::function<Task<void>(StreamWriter &)>;
 using SseHandler = std::function<Task<void>(SseWriter &)>;
 
 struct Response {
@@ -408,6 +420,16 @@ private:
 };
 
 using ResponseResult = Result<Response>;
+
+// Immutable response metadata delivered before any response body bytes. The
+// callback receives the original wire headers, including Content-Encoding.
+struct ResponseHead {
+  int status{0};
+  unsigned version{11};
+  Headers headers;
+  bool keep_alive{true};
+};
+
 using Handler = std::function<void(const Request &, Response &)>;
 using AsyncHandler = std::function<Task<void>(const Request &, Response &)>;
 using Middleware = std::function<bool(const Request &, Response &)>;
@@ -557,7 +579,11 @@ struct ClientOptions {
   std::chrono::milliseconds write_timeout{60s};
   std::size_t max_response_body_size{128 * 1024 * 1024};
   std::size_t max_redirects{10};
+  // Maximum number of retained idle connections for each origin/proxy pair.
   std::size_t connection_pool_size{8};
+  // Maximum active plus idle connections for each origin/proxy pair. Requests
+  // wait asynchronously when the limit is reached; zero disables the limit.
+  std::size_t max_connections_per_origin{64};
   bool follow_redirects{true};
   bool keep_alive{true};
   bool tcp_no_delay{true};
@@ -569,9 +595,32 @@ struct ClientOptions {
 };
 
 struct RequestOptions {
+  // Runs before any body callback. Returning false rejects the response and
+  // closes its connection. Synchronous callbacks run on the client's libuv
+  // I/O thread and therefore must return quickly.
+  std::function<bool(const ResponseHead &)> on_response_head;
   std::function<bool(std::string_view)> on_data;
+  // An awaited consumer provides real backpressure without blocking the I/O
+  // thread. Configure either on_data or on_data_async, never both.
+  std::function<Task<bool>(std::string_view)> on_data_async;
   std::function<bool(std::uint64_t current, std::uint64_t total)> on_progress;
+  // Kept for source compatibility. It is observed at protocol boundaries but
+  // cannot wake a blocked socket read; prefer stop_token for active cancel.
   std::shared_ptr<std::atomic_bool> cancellation;
+  std::stop_token stop_token;
+
+  // Per-request overrides. Unset phase timeouts inherit ClientOptions. A
+  // deadline and total_timeout may both be supplied; the earlier limit wins.
+  std::optional<std::chrono::steady_clock::time_point> deadline;
+  std::optional<std::chrono::milliseconds> total_timeout;
+  std::optional<std::chrono::milliseconds> connect_timeout;
+  std::optional<std::chrono::milliseconds> read_timeout;
+  std::optional<std::chrono::milliseconds> write_timeout;
+  std::optional<std::chrono::milliseconds> header_timeout;
+  std::optional<std::chrono::milliseconds> first_body_byte_timeout;
+  std::optional<std::chrono::milliseconds> idle_timeout;
+  std::optional<std::size_t> max_response_body_size;
+  std::optional<bool> auto_decompress;
 };
 
 class AsyncClient {
@@ -586,7 +635,8 @@ public:
   Task<ResponseResult> request(Request request, RequestOptions options = {});
   Task<ResponseResult> get(std::string target, Headers headers = {},
                            RequestOptions options = {});
-  Task<ResponseResult> head(std::string target, Headers headers = {});
+  Task<ResponseResult> head(std::string target, Headers headers = {},
+                            RequestOptions options = {});
   Task<ResponseResult> post(std::string target, std::string body,
                             std::string content_type, Headers headers = {},
                             RequestOptions options = {});
@@ -617,7 +667,8 @@ public:
   ResponseResult request(Request request, RequestOptions options = {});
   ResponseResult get(std::string target, Headers headers = {},
                      RequestOptions options = {});
-  ResponseResult head(std::string target, Headers headers = {});
+  ResponseResult head(std::string target, Headers headers = {},
+                      RequestOptions options = {});
   ResponseResult post(std::string target, std::string body,
                       std::string content_type,
                       Headers headers = {}, RequestOptions options = {});
@@ -643,13 +694,49 @@ struct SseClientOptions {
   std::string last_event_id;
 };
 
+struct SseParserOptions {
+  std::size_t max_line_size{1024 * 1024};
+  std::size_t max_event_size{8 * 1024 * 1024};
+  std::string last_event_id;
+};
+
+// A request-method-agnostic incremental WHATWG event-stream parser. feed()
+// accepts arbitrarily split transport chunks; finish() discards an incomplete
+// final event, as required when the stream reaches EOF without a blank line.
+class SseParser {
+public:
+  using MessageHandler = std::function<void(const SseEvent &)>;
+
+  explicit SseParser(SseParserOptions options = {});
+  ~SseParser();
+  SseParser(SseParser &&) noexcept;
+  SseParser &operator=(SseParser &&) noexcept;
+  SseParser(const SseParser &) = delete;
+  SseParser &operator=(const SseParser &) = delete;
+
+  SseParser &on_message(MessageHandler handler);
+  SseParser &on_event(std::string event, MessageHandler handler);
+  ErrorInfo feed(std::string_view bytes);
+  ErrorInfo finish();
+  void reset();
+  [[nodiscard]] std::string last_event_id() const;
+  [[nodiscard]] std::optional<std::chrono::milliseconds> retry() const;
+
+private:
+  class Impl;
+  std::unique_ptr<Impl> impl_;
+};
+
 class SseClient {
 public:
   using MessageHandler = std::function<void(const SseEvent &)>;
   using ErrorCallback = std::function<void(const ErrorInfo &)>;
+  using OpenHandler = std::function<void(const ResponseHead &)>;
 
   SseClient(AsyncClient &client, std::string target,
             Headers headers = {}, SseClientOptions options = {});
+  SseClient(AsyncClient &client, Request request,
+            SseClientOptions options = {});
   ~SseClient();
   SseClient(SseClient &&) noexcept;
   SseClient &operator=(SseClient &&) noexcept;
@@ -658,6 +745,7 @@ public:
 
   SseClient &on_message(MessageHandler handler);
   SseClient &on_event(std::string event, MessageHandler handler);
+  SseClient &on_open(OpenHandler handler);
   SseClient &on_error(ErrorCallback handler);
   Task<ErrorInfo> connect();
   void stop();

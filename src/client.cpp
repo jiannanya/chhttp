@@ -199,6 +199,66 @@ bool redirect_status(int status) {
          status == 308;
 }
 
+class RequestControl {
+public:
+  void bind(const std::shared_ptr<detail::Connection> &connection) {
+    bool close = false;
+    {
+      std::lock_guard lock(mutex_);
+      connection_ = connection;
+      close = cancelled_.load(std::memory_order_acquire);
+    }
+    if (close) connection->close();
+  }
+
+  void unbind(const std::shared_ptr<detail::Connection> &connection) {
+    std::lock_guard lock(mutex_);
+    if (connection_.lock() == connection) connection_.reset();
+  }
+
+  void cancel() {
+    cancelled_.store(true, std::memory_order_release);
+    std::shared_ptr<detail::Connection> connection;
+    {
+      std::lock_guard lock(mutex_);
+      connection = connection_.lock();
+    }
+    if (connection) connection->close();
+  }
+
+  [[nodiscard]] bool cancelled() const noexcept {
+    return cancelled_.load(std::memory_order_acquire);
+  }
+
+private:
+  mutable std::mutex mutex_;
+  std::weak_ptr<detail::Connection> connection_;
+  std::atomic_bool cancelled_{false};
+};
+
+std::optional<std::chrono::steady_clock::time_point>
+effective_deadline(const RequestOptions &options) {
+  auto result = options.deadline;
+  if (options.total_timeout) {
+    const auto relative = std::chrono::steady_clock::now() +
+                          *options.total_timeout;
+    if (!result || relative < *result) result = relative;
+  }
+  return result;
+}
+
+Result<std::chrono::milliseconds> limited_timeout(
+    std::chrono::milliseconds timeout,
+    const std::optional<std::chrono::steady_clock::time_point> &deadline) {
+  if (!deadline) return std::max(timeout, 1ms);
+  const auto now = std::chrono::steady_clock::now();
+  if (*deadline <= now)
+    return ErrorInfo{Error::timeout, "Request deadline exceeded"};
+  const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+      *deadline - now);
+  return std::max(std::min(timeout, remaining), 1ms);
+}
+
 } // namespace
 
 class AsyncClient::Impl {
@@ -234,40 +294,90 @@ public:
     detail::stop_runtime(std::move(runtime));
   }
 
-  Task<Result<Lease>> acquire(const detail::ParsedUrl &url) {
+  Task<Result<Lease>> acquire(
+      const detail::ParsedUrl &url,
+      const std::shared_ptr<RequestControl> &control,
+      const RequestOptions &request_options) {
+    co_await detail::resume_on(runtime);
     const std::string key = url.origin() + "|" + options.proxy.url;
-    {
-      std::lock_guard lock(mutex);
-      auto &entries = pool[key];
-      while (!entries.empty()) {
-        auto lease = std::move(entries.back());
-        entries.pop_back();
-        if (lease.connection && lease.connection->open()) {
-          lease.reused = true;
-          active.push_back(lease.connection);
-          co_return lease;
+    const auto cancelled = [&] {
+      if (request_options.cancellation && *request_options.cancellation)
+        control->cancel();
+      return control->cancelled();
+    };
+    for (;;) {
+      {
+        std::lock_guard lock(mutex);
+        auto &entries = pool[key];
+        while (!entries.empty()) {
+          auto lease = std::move(entries.back());
+          entries.pop_back();
+          if (lease.connection && lease.connection->open()) {
+            lease.reused = true;
+            active.push_back(lease.connection);
+            control->bind(lease.connection);
+            co_return lease;
+          }
+          auto &count = connection_counts[key];
+          if (count != 0) --count;
+        }
+        auto &count = connection_counts[key];
+        if (options.max_connections_per_origin == 0 ||
+            count < options.max_connections_per_origin) {
+          ++count;
+          break;
         }
       }
+      if (cancelled())
+        co_return ErrorInfo{Error::cancelled, "Request cancelled while queued"};
+      if (request_options.deadline &&
+          std::chrono::steady_clock::now() >= *request_options.deadline)
+        co_return ErrorInfo{Error::timeout, "Request deadline exceeded in connection queue"};
+      co_await sleep_for(1ms);
     }
+
+    const auto release_slot = [&] {
+      std::lock_guard lock(mutex);
+      auto &count = connection_counts[key];
+      if (count != 0) --count;
+    };
+    const auto fail = [&](ErrorInfo error) -> Result<Lease> {
+      release_slot();
+      return error;
+    };
 
     detail::ParsedUrl endpoint = url;
     std::optional<detail::ParsedUrl> proxy;
     if (!options.proxy.url.empty()) {
       auto parsed_proxy = detail::parse_url(options.proxy.url);
-      if (!parsed_proxy) co_return parsed_proxy.error();
+      if (!parsed_proxy) co_return fail(parsed_proxy.error());
       if (parsed_proxy->secure)
-        co_return ErrorInfo{Error::proxy, "TLS proxies are not supported"};
+        co_return fail(
+            ErrorInfo{Error::proxy, "TLS proxies are not supported"});
       proxy = *parsed_proxy;
       endpoint = *parsed_proxy;
     }
+    auto connect_timeout = limited_timeout(
+        request_options.connect_timeout.value_or(options.connect_timeout),
+        request_options.deadline);
+    if (!connect_timeout) co_return fail(connect_timeout.error());
     auto connected = co_await detail::Connection::connect(
-        runtime, endpoint.host, endpoint.port, options.connect_timeout);
-    if (!connected) co_return connected.error();
+        runtime, endpoint.host, endpoint.port, *connect_timeout,
+        [control](const auto &connection) { control->bind(connection); });
+    if (!connected) co_return fail(connected.error());
     auto connection = *connected;
+    const auto fail_connection = [&](ErrorInfo error) -> Result<Lease> {
+      control->unbind(connection);
+      connection->close();
+      release_slot();
+      return error;
+    };
+    if (cancelled())
+      co_return fail_connection(
+          ErrorInfo{Error::cancelled, "Request cancelled"});
     auto socket_option_error = connection->set_no_delay(options.tcp_no_delay);
     if (socket_option_error) {
-      connection->close();
-      co_return socket_option_error;
+      co_return fail_connection(std::move(socket_option_error));
     }
 
     if (proxy && url.secure) {
@@ -279,21 +389,29 @@ public:
         tunnel.headers.set("Proxy-Authorization",
                            basic_auth(options.proxy.username,
                                       options.proxy.password));
+      auto write_timeout = limited_timeout(
+          request_options.write_timeout.value_or(options.write_timeout),
+          request_options.deadline);
+      if (!write_timeout) co_return fail_connection(write_timeout.error());
       auto write_error = co_await detail::write_request(
-          connection, tunnel, tunnel.target, options.write_timeout);
+          connection, tunnel, tunnel.target, *write_timeout);
       if (write_error) {
-        connection->close();
-        co_return write_error;
+        co_return fail_connection(std::move(write_error));
       }
       std::string tunnel_buffer;
       auto response = co_await detail::read_response(
           connection, tunnel_buffer, "CONNECT",
-          {.max_body_size = 1024 * 1024, .timeout = options.read_timeout});
+          {.max_body_size = 1024 * 1024,
+           .read_timeout = request_options.read_timeout.value_or(
+               options.read_timeout),
+           .header_timeout = request_options.header_timeout,
+           .deadline = request_options.deadline,
+           .cancelled = cancelled});
       if (!response || response->status != 200) {
-        connection->close();
-        co_return response
-                      ? ErrorInfo{Error::proxy, "HTTPS CONNECT proxy rejected tunnel"}
-                      : response.error();
+        co_return fail_connection(
+            response ? ErrorInfo{Error::proxy,
+                                 "HTTPS CONNECT proxy rejected tunnel"}
+                     : response.error());
       }
     }
 
@@ -303,22 +421,25 @@ public:
       if (!tls_context)
         tls_context = detail::create_client_tls_context(options.tls, context_error);
       if (!tls_context) {
-        connection->close();
-        co_return context_error;
+        co_return fail_connection(std::move(context_error));
       }
       const std::string server_name = options.tls.server_name.empty()
                                           ? url.host
                                           : options.tls.server_name;
       auto tls_error = connection->enable_tls(tls_context, false, server_name);
+      auto handshake_timeout = limited_timeout(
+          request_options.connect_timeout.value_or(options.connect_timeout),
+          request_options.deadline);
+      if (!handshake_timeout)
+        co_return fail_connection(handshake_timeout.error());
       if (!tls_error)
-        tls_error = co_await connection->handshake(options.connect_timeout);
+        tls_error = co_await connection->handshake(*handshake_timeout);
       if (tls_error) {
-        connection->close();
-        co_return tls_error;
+        co_return fail_connection(std::move(tls_error));
       }
 #else
-      connection->close();
-      co_return ErrorInfo{Error::tls_unavailable, "TLS support is disabled"};
+      co_return fail_connection(
+          ErrorInfo{Error::tls_unavailable, "TLS support is disabled"});
 #endif
     }
     {
@@ -333,16 +454,29 @@ public:
     std::erase(active, connection);
   }
 
+  void discard(Lease lease) {
+    remove_active(lease.connection);
+    lease.connection->close();
+    std::lock_guard lock(mutex);
+    auto &count = connection_counts[lease.key];
+    if (count != 0) --count;
+  }
+
   void release(Lease lease, bool reusable) {
     remove_active(lease.connection);
     if (!reusable || !options.keep_alive || !lease.connection->open()) {
       lease.connection->close();
+      std::lock_guard lock(mutex);
+      auto &count = connection_counts[lease.key];
+      if (count != 0) --count;
       return;
     }
     std::lock_guard lock(mutex);
     auto &entries = pool[lease.key];
     if (entries.size() >= options.connection_pool_size) {
       lease.connection->close();
+      auto &count = connection_counts[lease.key];
+      if (count != 0) --count;
       return;
     }
     lease.reused = false;
@@ -351,19 +485,30 @@ public:
 
   Task<ResponseResult> exchange(detail::ParsedUrl url, Request request,
                                 RequestOptions request_options,
+                                const std::shared_ptr<RequestControl> &control,
                                 std::size_t redirects, bool digest_attempted,
                                 bool allow_automatic_auth) {
-    const auto generation = cancel_generation.load();
-    if ((request_options.cancellation && *request_options.cancellation) ||
-        generation != cancel_generation.load())
+    const auto cancelled = [&] {
+      if (request_options.cancellation && *request_options.cancellation)
+        control->cancel();
+      return control->cancelled();
+    };
+    if (cancelled())
       co_return ErrorInfo{Error::cancelled, "Request cancelled"};
+    if (request_options.deadline &&
+        std::chrono::steady_clock::now() >= *request_options.deadline)
+      co_return ErrorInfo{Error::timeout, "Request deadline exceeded"};
 
     for (const auto &[name, value] : options.default_headers)
       if (!request.headers.contains(name)) request.headers.add(name, value);
     request.headers.set("Host", url.authority());
     request.keep_alive = options.keep_alive;
-    if (options.auto_decompress && !request.headers.contains("Accept-Encoding"))
+    const bool auto_decompress = request_options.auto_decompress.value_or(
+        options.auto_decompress);
+#ifdef CHHTTP_HAS_COMPRESSION
+    if (auto_decompress && !request.headers.contains("Accept-Encoding"))
       request.headers.set("Accept-Encoding", "gzip, deflate, br, zstd");
+#endif
     if (allow_automatic_auth && !request.headers.contains("Authorization")) {
       switch (options.authentication.type) {
       case AuthenticationType::basic:
@@ -386,59 +531,82 @@ public:
 
     const Request original_request = request;
     for (int attempt = 0; attempt != 2; ++attempt) {
-      auto lease_result = co_await acquire(url);
+      auto lease_result = co_await acquire(url, control, request_options);
       if (!lease_result) co_return lease_result.error();
       auto lease = std::move(*lease_result);
-      if (generation != cancel_generation.load() ||
-          (request_options.cancellation && *request_options.cancellation)) {
-        remove_active(lease.connection);
-        lease.connection->close();
+      if (cancelled()) {
+        control->unbind(lease.connection);
+        discard(std::move(lease));
         co_return ErrorInfo{Error::cancelled, "Request cancelled"};
       }
       const std::string wire_target =
           !options.proxy.url.empty() && !url.secure
               ? url.origin() + url.target
               : url.target;
+      auto write_timeout = limited_timeout(
+          request_options.write_timeout.value_or(options.write_timeout),
+          request_options.deadline);
+      if (!write_timeout) {
+        control->unbind(lease.connection);
+        discard(std::move(lease));
+        co_return write_timeout.error();
+      }
       auto write_error = co_await detail::write_request(
-          lease.connection, request, wire_target, options.write_timeout);
+          lease.connection, request, wire_target, *write_timeout);
       if (write_error) {
         const bool retry = lease.reused && attempt == 0 &&
-                           idempotent_method(request.method);
-        remove_active(lease.connection);
-        lease.connection->close();
-        if (generation != cancel_generation.load())
+                           idempotent_method(request.method) &&
+                           !request.body_stream;
+        control->unbind(lease.connection);
+        discard(std::move(lease));
+        if (cancelled())
           co_return ErrorInfo{Error::cancelled, "Request cancelled"};
         if (retry) continue;
         co_return write_error;
       }
 
+      bool response_started = false;
       detail::HttpReadOptions read_options{
           .max_header_size = 64 * 1024,
-          .max_body_size = options.max_response_body_size,
-          .timeout = options.read_timeout,
-          .auto_decompress = options.auto_decompress,
+          .max_body_size = request_options.max_response_body_size.value_or(
+              options.max_response_body_size),
+          .read_timeout = request_options.read_timeout.value_or(
+              options.read_timeout),
+          .header_timeout = request_options.header_timeout,
+          .first_body_byte_timeout = request_options.first_body_byte_timeout,
+          .idle_timeout = request_options.idle_timeout,
+          .deadline = request_options.deadline,
+          .auto_decompress = auto_decompress,
+          .cancelled = cancelled,
+          .on_response_head = [&](const ResponseHead &head) {
+            response_started = true;
+            return !request_options.on_response_head ||
+                   request_options.on_response_head(head);
+          },
           .on_data = request_options.on_data,
+          .on_data_async = request_options.on_data_async,
           .on_progress = request_options.on_progress};
       auto response = co_await detail::read_response(
           lease.connection, lease.buffer, request.method, read_options);
       if (!response) {
-        const bool retry = lease.reused && attempt == 0 &&
-                           idempotent_method(request.method);
-        remove_active(lease.connection);
-        lease.connection->close();
-        if (generation != cancel_generation.load())
+        const bool retry = !response_started && lease.reused && attempt == 0 &&
+                           idempotent_method(request.method) &&
+                           !request.body_stream;
+        control->unbind(lease.connection);
+        discard(std::move(lease));
+        if (cancelled())
           co_return ErrorInfo{Error::cancelled, "Request cancelled"};
         if (retry) continue;
         co_return response.error();
       }
-      if (generation != cancel_generation.load() ||
-          (request_options.cancellation && *request_options.cancellation)) {
-        remove_active(lease.connection);
-        lease.connection->close();
+      if (cancelled()) {
+        control->unbind(lease.connection);
+        discard(std::move(lease));
         co_return ErrorInfo{Error::cancelled, "Request cancelled"};
       }
 
       const bool reusable = request.keep_alive && response->keep_alive;
+      control->unbind(lease.connection);
       release(std::move(lease), reusable);
 
       if (response->status == 401 && !digest_attempted &&
@@ -454,8 +622,8 @@ public:
           request = original_request;
           request.headers.set("Authorization", std::move(*authorization));
           co_return co_await exchange(url, std::move(request),
-                                      std::move(request_options), redirects, true,
-                                      allow_automatic_auth);
+                                      std::move(request_options), control,
+                                      redirects, true, allow_automatic_auth);
         }
       }
 
@@ -476,12 +644,15 @@ public:
              detail::iequals(request.method, "POST"))) {
           request.method = "GET";
           request.body.clear();
+          request.body_stream = {};
+          request.body_stream_length.reset();
           request.headers.erase("Content-Type");
         }
         request.target = next_url->target;
         co_return co_await exchange(*next_url, std::move(request),
-                                    std::move(request_options), redirects + 1,
-                                    false, same_origin && allow_automatic_auth);
+                                    std::move(request_options), control,
+                                    redirects + 1, false,
+                                    same_origin && allow_automatic_auth);
       }
       co_return response;
     }
@@ -491,20 +662,44 @@ public:
   Task<ResponseResult> request(Request request,
                                RequestOptions request_options) {
     if (!base) co_return base.error();
+    if (request_options.on_data && request_options.on_data_async)
+      co_return ErrorInfo{Error::invalid_argument,
+                          "Configure either on_data or on_data_async"};
+    if (request.body_stream && !request.body.empty())
+      co_return ErrorInfo{Error::invalid_argument,
+                          "Configure either a buffered or streamed request body"};
+    if (!request.body_stream && request.body_stream_length)
+      co_return ErrorInfo{Error::invalid_argument,
+                          "A streamed body length requires a body producer"};
+    request_options.deadline = effective_deadline(request_options);
+    auto control = std::make_shared<RequestControl>();
+    {
+      std::lock_guard lock(mutex);
+      std::erase_if(controls, [](const auto &item) { return item.expired(); });
+      controls.push_back(control);
+    }
+    std::stop_callback stop_callback(
+        request_options.stop_token, [control] { control->cancel(); });
+    if (request_options.cancellation && *request_options.cancellation)
+      control->cancel();
     auto url = detail::parse_url(request.target, base->origin() + base->target);
     if (!url) co_return url.error();
     request.target = url->target;
     co_return co_await exchange(*url, std::move(request),
-                                std::move(request_options), 0, false, true);
+                                std::move(request_options), control, 0, false,
+                                true);
   }
 
   void cancel() {
-    cancel_generation.fetch_add(1);
     std::vector<std::shared_ptr<detail::Connection>> connections;
+    std::vector<std::shared_ptr<RequestControl>> request_controls;
     {
       std::lock_guard lock(mutex);
       connections = active;
+      for (const auto &item : controls)
+        if (auto control = item.lock()) request_controls.push_back(control);
     }
+    for (auto &control : request_controls) control->cancel();
     for (auto &connection : connections)
       if (connection) connection->close();
   }
@@ -515,8 +710,9 @@ public:
   Result<detail::ParsedUrl> base;
   std::mutex mutex;
   std::unordered_map<std::string, std::vector<Lease>> pool;
+  std::unordered_map<std::string, std::size_t> connection_counts;
   std::vector<std::shared_ptr<detail::Connection>> active;
-  std::atomic_uint64_t cancel_generation{0};
+  std::vector<std::weak_ptr<RequestControl>> controls;
 #ifdef CHHTTP_HAS_TLS
   SSL_CTX *tls_context{nullptr};
 #endif
@@ -554,14 +750,15 @@ Task<ResponseResult> AsyncClient::get(std::string target, Headers headers,
   co_return co_await impl->request(std::move(request), std::move(options));
 }
 
-Task<ResponseResult> AsyncClient::head(std::string target, Headers headers) {
+Task<ResponseResult> AsyncClient::head(std::string target, Headers headers,
+                                      RequestOptions options) {
   Request request;
   request.method = "HEAD";
   request.target = std::move(target);
   request.headers = std::move(headers);
   if (!impl_) co_return ErrorInfo{Error::internal, "Empty async client"};
   auto impl = impl_;
-  co_return co_await impl->request(std::move(request), {});
+  co_return co_await impl->request(std::move(request), std::move(options));
 }
 
 Task<ResponseResult> AsyncClient::post(std::string target, std::string body,
@@ -645,8 +842,11 @@ ResponseResult Client::get(std::string target, Headers headers,
   return impl_->client.get(std::move(target), std::move(headers),
                            std::move(options)).get();
 }
-ResponseResult Client::head(std::string target, Headers headers) {
-  return impl_->client.head(std::move(target), std::move(headers)).get();
+ResponseResult Client::head(std::string target, Headers headers,
+                            RequestOptions options) {
+  return impl_->client
+      .head(std::move(target), std::move(headers), std::move(options))
+      .get();
 }
 ResponseResult Client::post(std::string target, std::string body,
                             std::string content_type, Headers headers,

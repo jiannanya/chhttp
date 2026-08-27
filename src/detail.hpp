@@ -103,6 +103,7 @@ private:
 
 Runtime *current_runtime() noexcept;
 void stop_runtime(std::shared_ptr<Runtime> runtime) noexcept;
+Task<void> resume_on(std::shared_ptr<Runtime> runtime);
 
 #ifdef CHHTTP_HAS_TLS
 SSL_CTX *create_client_tls_context(const TlsClientOptions &options,
@@ -120,7 +121,8 @@ public:
 
   static Task<Result<std::shared_ptr<Connection>>>
   connect(std::shared_ptr<Runtime> runtime, std::string host,
-          std::uint16_t port, std::chrono::milliseconds timeout);
+          std::uint16_t port, std::chrono::milliseconds timeout,
+          std::function<void(const std::shared_ptr<Connection> &)> on_created = {});
   static std::shared_ptr<Connection>
   accept(std::shared_ptr<Runtime> runtime, uv_stream_t *listener);
 
@@ -218,9 +220,16 @@ private:
 struct HttpReadOptions {
   std::size_t max_header_size{64 * 1024};
   std::size_t max_body_size{128 * 1024 * 1024};
-  std::chrono::milliseconds timeout{60s};
+  std::chrono::milliseconds read_timeout{60s};
+  std::optional<std::chrono::milliseconds> header_timeout;
+  std::optional<std::chrono::milliseconds> first_body_byte_timeout;
+  std::optional<std::chrono::milliseconds> idle_timeout;
+  std::optional<std::chrono::steady_clock::time_point> deadline;
   bool auto_decompress{false};
+  std::function<bool()> cancelled;
+  std::function<bool(const ResponseHead &)> on_response_head;
   std::function<bool(std::string_view)> on_data;
+  std::function<Task<bool>(std::string_view)> on_data_async;
   std::function<bool(std::uint64_t, std::uint64_t)> on_progress;
 };
 
