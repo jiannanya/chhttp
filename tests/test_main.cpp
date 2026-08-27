@@ -1,10 +1,15 @@
 #include <chhttp/chhttp.hpp>
 
-#include <boost/asio/co_spawn.hpp>
-#include <boost/asio/detached.hpp>
-#include <boost/asio/executor_work_guard.hpp>
-#include <boost/asio/steady_timer.hpp>
-#include <boost/asio/use_future.hpp>
+#ifdef _WIN32
+#include <process.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#endif
 
 #ifdef CHHTTP_HAS_TLS
 #include <openssl/bn.h>
@@ -16,7 +21,9 @@
 #endif
 
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -28,6 +35,153 @@
 #include <vector>
 
 namespace {
+
+std::filesystem::path unique_test_directory(std::string_view prefix) {
+  static std::atomic_uint64_t sequence{0};
+#ifdef _WIN32
+  const auto process_id = static_cast<unsigned long long>(_getpid());
+#else
+  const auto process_id = static_cast<unsigned long long>(getpid());
+#endif
+  const auto timestamp = static_cast<unsigned long long>(
+      std::chrono::steady_clock::now().time_since_epoch().count());
+  for (unsigned attempt = 0; attempt < 100; ++attempt) {
+    auto path = std::filesystem::temp_directory_path() /
+                (std::string(prefix) + "-" + std::to_string(process_id) + "-" +
+                 std::to_string(timestamp) + "-" +
+                 std::to_string(sequence.fetch_add(1)));
+    std::error_code error;
+    if (std::filesystem::create_directory(path, error)) return path;
+  }
+  throw std::runtime_error("Unable to allocate a unique test directory");
+}
+
+#ifdef _WIN32
+using raw_socket_t = SOCKET;
+constexpr raw_socket_t invalid_raw_socket = INVALID_SOCKET;
+void close_raw_socket(raw_socket_t socket) { closesocket(socket); }
+#else
+using raw_socket_t = int;
+constexpr raw_socket_t invalid_raw_socket = -1;
+void close_raw_socket(raw_socket_t socket) { close(socket); }
+#endif
+
+std::string masked_websocket_frame(unsigned char first_byte,
+                                   std::string payload) {
+  if (payload.size() > 125)
+    throw std::runtime_error("Raw WebSocket test payload is too large");
+  constexpr std::array<unsigned char, 4> mask{0x13, 0x37, 0x42, 0x99};
+  std::string frame;
+  frame.push_back(static_cast<char>(first_byte));
+  frame.push_back(static_cast<char>(0x80 | payload.size()));
+  frame.append(reinterpret_cast<const char *>(mask.data()), mask.size());
+  for (std::size_t index = 0; index < payload.size(); ++index)
+    frame.push_back(payload[index] ^ static_cast<char>(mask[index % mask.size()]));
+  return frame;
+}
+
+std::string raw_http_exchange(std::uint16_t port, std::string_view request) {
+#ifdef _WIN32
+  static const bool winsock_ready = [] {
+    WSADATA data{};
+    return WSAStartup(MAKEWORD(2, 2), &data) == 0;
+  }();
+  if (!winsock_ready) throw std::runtime_error("WSAStartup failed");
+#endif
+  raw_socket_t socket = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+  if (socket == invalid_raw_socket)
+    throw std::runtime_error("Unable to allocate raw test socket");
+  sockaddr_in address{};
+  address.sin_family = AF_INET;
+  address.sin_port = htons(port);
+  inet_pton(AF_INET, "127.0.0.1", &address.sin_addr);
+  if (::connect(socket, reinterpret_cast<const sockaddr *>(&address),
+                sizeof(address)) != 0) {
+    close_raw_socket(socket);
+    throw std::runtime_error("Unable to connect raw test socket");
+  }
+  std::size_t offset = 0;
+  while (offset < request.size()) {
+    const int sent = ::send(socket, request.data() + offset,
+                            static_cast<int>(request.size() - offset), 0);
+    if (sent <= 0) {
+      close_raw_socket(socket);
+      throw std::runtime_error("Raw test socket send failed");
+    }
+    offset += static_cast<std::size_t>(sent);
+  }
+#ifdef _WIN32
+  shutdown(socket, SD_SEND);
+#else
+  shutdown(socket, SHUT_WR);
+#endif
+  std::string response;
+  std::array<char, 4096> buffer{};
+  for (;;) {
+    const int received =
+        ::recv(socket, buffer.data(), static_cast<int>(buffer.size()), 0);
+    if (received <= 0) break;
+    response.append(buffer.data(), static_cast<std::size_t>(received));
+  }
+  close_raw_socket(socket);
+  return response;
+}
+
+class RawResponseServer {
+public:
+  explicit RawResponseServer(std::string response, bool bytewise = false) {
+    listener_ = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (listener_ == invalid_raw_socket)
+      throw std::runtime_error("Unable to allocate raw response socket");
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = 0;
+    if (::bind(listener_, reinterpret_cast<const sockaddr *>(&address),
+               sizeof(address)) != 0 ||
+        ::listen(listener_, 1) != 0) {
+      close_raw_socket(listener_);
+      throw std::runtime_error("Unable to bind raw response socket");
+    }
+#ifdef _WIN32
+    int size = sizeof(address);
+#else
+    socklen_t size = sizeof(address);
+#endif
+    getsockname(listener_, reinterpret_cast<sockaddr *>(&address), &size);
+    port_ = ntohs(address.sin_port);
+    thread_ = std::thread([this, response = std::move(response), bytewise] {
+      raw_socket_t client = ::accept(listener_, nullptr, nullptr);
+      if (client == invalid_raw_socket) return;
+      std::array<char, 2048> request{};
+      ::recv(client, request.data(), static_cast<int>(request.size()), 0);
+      std::size_t offset = 0;
+      while (offset < response.size()) {
+        const auto count = bytewise ? std::size_t{1} : response.size() - offset;
+        const int sent = ::send(client, response.data() + offset,
+                                static_cast<int>(count), 0);
+        if (sent <= 0) break;
+        offset += static_cast<std::size_t>(sent);
+      }
+#ifdef _WIN32
+      shutdown(client, SD_BOTH);
+#else
+      shutdown(client, SHUT_RDWR);
+#endif
+      close_raw_socket(client);
+    });
+  }
+  ~RawResponseServer() {
+    close_raw_socket(listener_);
+    if (thread_.joinable()) thread_.join();
+  }
+  std::uint16_t port() const noexcept { return port_; }
+
+private:
+  raw_socket_t listener_{invalid_raw_socket};
+  std::uint16_t port_{0};
+  std::thread thread_;
+};
 
 struct Failure : std::runtime_error {
   using std::runtime_error::runtime_error;
@@ -64,8 +218,7 @@ struct Registration {
 class Fixture {
 public:
   Fixture() {
-    root = std::filesystem::temp_directory_path() / "chhttp-tests-static";
-    std::filesystem::create_directories(root);
+    root = unique_test_directory("chhttp-tests-static");
     std::ofstream(root / "asset.txt", std::ios::binary) << "0123456789";
     server.set_pre_routing_handler(
         [](const chhttp::Request &request, chhttp::Response &response) {
@@ -146,11 +299,8 @@ public:
     });
     server.get_async(
         "/slow", [](const chhttp::Request &,
-                     chhttp::Response &response) -> chhttp::asio::awaitable<void> {
-          chhttp::asio::steady_timer timer(
-              co_await chhttp::asio::this_coro::executor);
-          timer.expires_after(std::chrono::milliseconds(250));
-          co_await timer.async_wait(chhttp::asio::use_awaitable);
+                     chhttp::Response &response) -> chhttp::Task<void> {
+          co_await chhttp::sleep_for(std::chrono::milliseconds(250));
           response.set_content("late");
         });
     server.get("/fail", [](const chhttp::Request &, chhttp::Response &) {
@@ -158,18 +308,16 @@ public:
     });
     server.get_async(
         "/async", [](const chhttp::Request &,
-                      chhttp::Response &response) -> chhttp::asio::awaitable<void> {
-          chhttp::asio::steady_timer timer(co_await chhttp::asio::this_coro::executor);
-          timer.expires_after(std::chrono::milliseconds(2));
-          co_await timer.async_wait(chhttp::asio::use_awaitable);
+                      chhttp::Response &response) -> chhttp::Task<void> {
+          co_await chhttp::sleep_for(std::chrono::milliseconds(2));
           response.set_content("async");
         });
     server.get_async(
         "/stream", [](const chhttp::Request &,
-                       chhttp::Response &response) -> chhttp::asio::awaitable<void> {
+                       chhttp::Response &response) -> chhttp::Task<void> {
           response.set_stream(
               "text/plain", [](chhttp::StreamWriter &writer)
-                                -> chhttp::asio::awaitable<void> {
+                                -> chhttp::Task<void> {
                 CHECK(co_await writer.write("one"));
                 CHECK(co_await writer.write("two"));
               });
@@ -177,9 +325,9 @@ public:
         });
     server.get_async(
         "/sse", [](const chhttp::Request &,
-                    chhttp::Response &response) -> chhttp::asio::awaitable<void> {
+                    chhttp::Response &response) -> chhttp::Task<void> {
           response.set_sse([](chhttp::SseWriter &writer)
-                               -> chhttp::asio::awaitable<void> {
+                               -> chhttp::Task<void> {
             CHECK(co_await writer.comment());
             for (int index = 0; index != 3; ++index) {
               CHECK(co_await writer.send({.data = "line1\nline2",
@@ -193,8 +341,11 @@ public:
     server.websocket(
         "/ws",
         [](const chhttp::Request &, chhttp::WebSocket &socket)
-            -> chhttp::asio::awaitable<void> {
+            -> chhttp::Task<void> {
           auto message = co_await socket.read();
+          if (message &&
+              message->type == chhttp::WebSocket::MessageType::ping)
+            message = co_await socket.read();
           if (message) co_await socket.send_text("echo:" + message->data);
         },
         [](const std::vector<std::string> &protocols) {
@@ -243,17 +394,24 @@ TEST(url_and_query_round_trip) {
   const auto parsed = chhttp::parse_query(chhttp::make_query(params));
   CHECK(parsed == params);
   CHECK(!chhttp::url_decode("%XX"));
+  CHECK(!chhttp::url_decode("trailing%"));
 }
 
 TEST(multipart_round_trip) {
   chhttp::MultipartForm input{
       {.name = "prompt", .content = "hello"},
-      {.name = "file", .filename = "a.txt", .content_type = "text/plain",
+      {.name = "fi\"le", .filename = "a;b\\c.txt",
+       .content_type = "text/plain",
        .content = std::string("a\0b", 3)}};
   auto [content_type, body] = chhttp::make_multipart(input, "boundary42");
   auto parsed = chhttp::parse_multipart(body, content_type);
   CHECK(parsed && parsed->size() == 2);
+  CHECK((*parsed)[1].name == "fi\"le");
+  CHECK((*parsed)[1].filename == "a;b\\c.txt");
   CHECK((*parsed)[1].content == std::string("a\0b", 3));
+  auto quoted_boundary = chhttp::parse_multipart(
+      body, "multipart/form-data; charset=utf-8; boundary=\"boundary42\"");
+  CHECK(quoted_boundary && quoted_boundary->size() == 2);
 }
 
 TEST(authentication_helpers_and_digest_retry) {
@@ -439,24 +597,159 @@ TEST(multipart_server_parsing) {
   CHECK(response && response->body == "a=one;b=two;");
 }
 
-TEST(async_high_concurrency) {
-  chhttp::asio::io_context io;
-  chhttp::AsyncClient client(io.get_executor(), fixture().base_url);
-  constexpr int count = 200;
-  std::vector<std::future<chhttp::ResponseResult>> futures;
-  futures.reserve(count);
-  for (int index = 0; index != count; ++index) {
-    futures.push_back(chhttp::asio::co_spawn(
-        io, client.get("/async"), chhttp::asio::use_future));
+TEST(native_http_protocol_framing_pipeline_and_expect) {
+  chhttp::Server server;
+  server.post("/raw", [](const chhttp::Request &request,
+                          chhttp::Response &response) {
+    response.set_content(request.body + "|" +
+                         request.headers.get("X-Checksum"));
+  });
+  server.get("/next", [](const chhttp::Request &,
+                          chhttp::Response &response) {
+    response.set_content("next");
+  });
+  server.get_async(
+      "/stream", [](const chhttp::Request &,
+                     chhttp::Response &response) -> chhttp::Task<void> {
+        response.set_stream(
+            "text/plain", [](chhttp::StreamWriter &writer)
+                              -> chhttp::Task<void> {
+              CHECK(co_await writer.write("alpha"));
+              CHECK(co_await writer.write("beta"));
+            });
+        co_return;
+      });
+  server.get("/empty", [](const chhttp::Request &,
+                           chhttp::Response &response) {
+    response.status = 204;
+    response.set_content("must-not-be-framed");
+  });
+  CHECK(server.start("127.0.0.1", 0));
+
+  const auto pipelined = raw_http_exchange(
+      server.port(),
+      "POST /raw HTTP/1.1\r\n"
+      "Host: localhost\r\n"
+      "Transfer-Encoding: chunked\r\n"
+      "Connection: keep-alive\r\n\r\n"
+      "4;extension=yes\r\nWiki\r\n"
+      "5\r\npedia\r\n"
+      "0\r\nX-Checksum: ok\r\n\r\n"
+      "GET /next HTTP/1.1\r\n"
+      "Host: localhost\r\n"
+      "Connection: close\r\n\r\n");
+  CHECK(pipelined.find("Wikipedia|ok") != std::string::npos);
+  CHECK(pipelined.find("next") != std::string::npos);
+  const auto first_status = pipelined.find("HTTP/1.1 200 OK");
+  CHECK(first_status != std::string::npos);
+  CHECK(pipelined.find("HTTP/1.1 200 OK", first_status + 1) !=
+        std::string::npos);
+
+  const auto expected = raw_http_exchange(
+      server.port(),
+      "POST /raw HTTP/1.1\r\n"
+      "Host: localhost\r\n"
+      "Content-Length: 4\r\n"
+      "Expect: 100-continue\r\n"
+      "Connection: close\r\n\r\nbody");
+  CHECK(expected.starts_with("HTTP/1.1 100 Continue\r\n\r\n"));
+  CHECK(expected.find("body|") != std::string::npos);
+
+  const auto http10 = raw_http_exchange(
+      server.port(),
+      "GET /next HTTP/1.0\r\nConnection: close\r\n\r\n");
+  CHECK(http10.starts_with("HTTP/1.0 200 OK\r\n"));
+  const auto http10_stream = raw_http_exchange(
+      server.port(),
+      "GET /stream HTTP/1.0\r\nConnection: close\r\n\r\n");
+  CHECK(http10_stream.starts_with("HTTP/1.0 200 OK\r\n"));
+  CHECK(http10_stream.find("Transfer-Encoding") == std::string::npos);
+  CHECK(http10_stream.find("Content-Length") == std::string::npos);
+  CHECK(http10_stream.ends_with("\r\n\r\nalphabeta"));
+  const auto no_content = raw_http_exchange(
+      server.port(),
+      "GET /empty HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+  CHECK(no_content.starts_with("HTTP/1.1 204 No Content\r\n"));
+  CHECK(no_content.find("Content-Length") == std::string::npos);
+  CHECK(no_content.find("must-not-be-framed") == std::string::npos);
+  server.stop();
+}
+
+TEST(native_http_protocol_rejects_request_smuggling) {
+  chhttp::Server server;
+  server.post("/", [](const chhttp::Request &,
+                       chhttp::Response &response) {
+    response.set_content("must-not-run");
+  });
+  CHECK(server.start("127.0.0.1", 0));
+  for (const auto &request : {
+           std::string("POST / HTTP/1.1\r\nHost: localhost\r\n"
+                       "Content-Length: 4\r\nContent-Length: 5\r\n"
+                       "Connection: close\r\n\r\nabcde"),
+           std::string("POST / HTTP/1.1\r\nHost: localhost\r\n"
+                       "Content-Length: 4\r\nTransfer-Encoding: chunked\r\n"
+                       "Connection: close\r\n\r\n0\r\n\r\n"),
+           std::string("POST / HTTP/1.1\r\nHost: one\r\nHost: two\r\n"
+                       "Content-Length: 0\r\nConnection: close\r\n\r\n"),
+           std::string("POST / HTTP/1.1\r\nHost: localhost\r\n"
+                       "Content-Length:\r\nConnection: close\r\n\r\n"),
+           std::string("POST / HTTP/1.1\r\nHost: localhost\r\n"
+                       "Transfer-Encoding:\r\nConnection: close\r\n\r\n"),
+           std::string("POST / HTTP/1.1\r\nHost: localhost\r\n"
+                       "Content-Length: 4,\r\nConnection: close\r\n\r\ntest"),
+           std::string("POST / HTTP/1.1\r\nHost: localhost\r\n"
+                       "Transfer-Encoding: ,chunked\r\n"
+                       "Connection: close\r\n\r\n0\r\n\r\n"),
+           std::string("POST / HTTP/1.1\r\nHost:\r\n"
+                       "Content-Length: 0\r\nConnection: close\r\n\r\n")}) {
+    const auto response = raw_http_exchange(server.port(), request);
+    CHECK(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+    CHECK(response.find("must-not-run") == std::string::npos);
   }
-  std::vector<std::thread> workers;
-  for (int index = 0; index != 4; ++index)
-    workers.emplace_back([&] { io.run(); });
-  for (auto &future : futures) {
-    auto response = future.get();
+  server.stop();
+}
+
+TEST(native_http_client_incremental_chunked_and_malformed_response) {
+  {
+    RawResponseServer server(
+        "HTTP/1.1 200 OK\r\n"
+        "Transfer-Encoding: chunked\r\n"
+        "Connection: close\r\n\r\n"
+        "3;source=test\r\nabc\r\n"
+        "2\r\nde\r\n"
+        "0\r\nX-End: yes\r\n\r\n",
+        true);
+    chhttp::Client client("http://127.0.0.1:" +
+                          std::to_string(server.port()));
+    auto response = client.get("/");
+    CHECK(response && response->body == "abcde");
+    CHECK(response->headers.get("X-End") == "yes");
+  }
+  {
+    RawResponseServer server(
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Length: 4\r\n"
+        "Transfer-Encoding: chunked\r\n"
+        "Connection: close\r\n\r\n"
+        "0\r\n\r\n");
+    chhttp::Client client("http://127.0.0.1:" +
+                          std::to_string(server.port()));
+    auto response = client.get("/");
+    CHECK(!response && response.error().code == chhttp::Error::protocol);
+  }
+}
+
+TEST(async_high_concurrency) {
+  chhttp::AsyncClient client(fixture().base_url);
+  constexpr int count = 200;
+  std::vector<chhttp::Task<chhttp::ResponseResult>> requests;
+  requests.reserve(count);
+  for (int index = 0; index != count; ++index)
+    requests.push_back(client.get("/async"));
+  for (auto &request : requests) {
+    auto response = request.get();
     CHECK(response && response->body == "async");
   }
-  for (auto &worker : workers) worker.join();
 }
 
 TEST(connection_pool_and_active_cancellation) {
@@ -467,16 +760,21 @@ TEST(connection_pool_and_active_cancellation) {
   CHECK(first && second && third);
   CHECK(first->body == second->body && second->body == third->body);
 
-  chhttp::asio::io_context io;
-  chhttp::AsyncClient async_client(io.get_executor(), fixture().base_url);
-  auto future = chhttp::asio::co_spawn(io, async_client.get("/slow"),
-                                       chhttp::asio::use_future);
-  std::thread worker([&] { io.run(); });
+  chhttp::AsyncClient async_client(fixture().base_url);
+  auto pending = async_client.get("/slow");
   std::this_thread::sleep_for(std::chrono::milliseconds(20));
   async_client.cancel();
-  auto cancelled = future.get();
+  auto cancelled = pending.get();
   CHECK(!cancelled && cancelled.error().code == chhttp::Error::cancelled);
-  worker.join();
+
+  chhttp::Task<chhttp::ResponseResult> abandoned;
+  {
+    chhttp::AsyncClient short_lived(fixture().base_url);
+    abandoned = short_lived.get("/slow");
+  }
+  auto safely_cancelled = abandoned.get();
+  CHECK(!safely_cancelled &&
+        safely_cancelled.error().code == chhttp::Error::cancelled);
 }
 
 TEST(graceful_shutdown_drains_inflight_response) {
@@ -487,31 +785,23 @@ TEST(graceful_shutdown_drains_inflight_response) {
   auto entered = entered_promise.get_future();
   server.get_async(
       "/drain", [&](const chhttp::Request &,
-                     chhttp::Response &response) -> chhttp::asio::awaitable<void> {
+                     chhttp::Response &response) -> chhttp::Task<void> {
         entered_promise.set_value();
-        chhttp::asio::steady_timer timer(
-            co_await chhttp::asio::this_coro::executor);
-        timer.expires_after(std::chrono::milliseconds(100));
-        co_await timer.async_wait(chhttp::asio::use_awaitable);
+        co_await chhttp::sleep_for(std::chrono::milliseconds(100));
         response.set_content("drained");
       });
   CHECK(server.start("127.0.0.1", 0));
 
-  chhttp::asio::io_context io;
   chhttp::AsyncClient client(
-      io.get_executor(),
       "http://127.0.0.1:" + std::to_string(server.port()));
-  auto response_future = chhttp::asio::co_spawn(
-      io, client.get("/drain"), chhttp::asio::use_future);
-  std::thread worker([&] { io.run(); });
+  auto response_task = client.get("/drain");
   CHECK(entered.wait_for(std::chrono::seconds(1)) == std::future_status::ready);
   const auto before = std::chrono::steady_clock::now();
   server.stop();
   const auto elapsed = std::chrono::steady_clock::now() - before;
-  auto response = response_future.get();
+  auto response = response_task.get();
   CHECK(response && response->body == "drained");
   CHECK(elapsed >= std::chrono::milliseconds(50));
-  worker.join();
 }
 
 TEST(http_proxy_request_format_and_authentication) {
@@ -536,38 +826,46 @@ TEST(http_proxy_request_format_and_authentication) {
 }
 
 TEST(websocket_echo_and_subprotocol) {
-  chhttp::asio::io_context io;
-  auto result = chhttp::asio::co_spawn(
-      io,
-      [&]() -> chhttp::asio::awaitable<void> {
-        auto connected = co_await chhttp::AsyncWebSocketClient::connect(
-            co_await chhttp::asio::this_coro::executor,
-            "ws://127.0.0.1:" + std::to_string(fixture().server.port()) + "/ws",
-            {{"Sec-WebSocket-Protocol", "other, agent.v1"}});
-        CHECK(connected);
-        CHECK((*connected)->subprotocol() == "agent.v1");
-        CHECK(co_await (*connected)->send_text("hi"));
-        auto message = co_await (*connected)->read();
-        CHECK(message && message->data == "echo:hi");
-        co_await (*connected)->close();
-      },
-      chhttp::asio::use_future);
-  io.run();
-  result.get();
+  auto connected = chhttp::AsyncWebSocketClient::connect(
+      "ws://127.0.0.1:" + std::to_string(fixture().server.port()) + "/ws",
+      {{"Sec-WebSocket-Protocol", "other, agent.v1"}}).get();
+  CHECK(connected);
+  CHECK((*connected)->subprotocol() == "agent.v1");
+  CHECK((*connected)->send_text("hi").get());
+  auto message = (*connected)->read().get();
+  CHECK(message && message->data == "echo:hi");
+  (*connected)->close().get();
+
+  auto rejected = chhttp::AsyncWebSocketClient::connect(
+      "ws://127.0.0.1:" + std::to_string(fixture().server.port()) +
+      "/hello").get();
+  CHECK(!rejected &&
+        rejected.error().code == chhttp::Error::websocket_handshake);
+
+  std::string fragmented_request =
+      "GET /ws HTTP/1.1\r\n"
+      "Host: localhost\r\n"
+      "Upgrade: websocket\r\n"
+      "Connection: Upgrade\r\n"
+      "Sec-WebSocket-Version: 13\r\n"
+      "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n";
+  fragmented_request += masked_websocket_frame(0x01, "hel");
+  fragmented_request += masked_websocket_frame(0x89, "p");
+  fragmented_request += masked_websocket_frame(0x80, "lo");
+  const auto fragmented = raw_http_exchange(fixture().server.port(),
+                                             fragmented_request);
+  CHECK(fragmented.starts_with("HTTP/1.1 101 Switching Protocols\r\n"));
+  CHECK(fragmented.find("echo:hello") != std::string::npos);
 }
 
 TEST(sse_parser_and_stream) {
-  chhttp::asio::io_context io;
-  chhttp::AsyncClient client(io.get_executor(), fixture().base_url);
+  chhttp::AsyncClient client(fixture().base_url);
   chhttp::SseClient events(client, "/sse", {}, {.reconnect = false});
   std::vector<chhttp::SseEvent> received;
   events.on_event("tick", [&](const chhttp::SseEvent &event) {
     received.push_back(event);
   });
-  auto future = chhttp::asio::co_spawn(io, events.connect(),
-                                       chhttp::asio::use_future);
-  io.run();
-  auto error = future.get();
+  auto error = events.connect().get();
   CHECK(error.code == chhttp::Error::read);
   CHECK(received.size() == 3);
   CHECK(received[0].data == "line1\nline2");
@@ -593,8 +891,7 @@ struct CertificateFiles {
 
 CertificateFiles make_certificate() {
   CertificateFiles files;
-  files.directory = std::filesystem::temp_directory_path() / "chhttp-tls-test";
-  std::filesystem::create_directories(files.directory);
+  files.directory = unique_test_directory("chhttp-tls-test");
   files.certificate = files.directory / "cert.pem";
   files.key = files.directory / "key.pem";
   EVP_PKEY *key = EVP_RSA_gen(2048);
@@ -658,7 +955,7 @@ TEST(https_client_server) {
   });
   server.websocket(
       "/ws", [](const chhttp::Request &, chhttp::WebSocket &socket)
-                  -> chhttp::asio::awaitable<void> {
+                  -> chhttp::Task<void> {
         auto message = co_await socket.read();
         if (message) co_await socket.send_text("secure:" + message->data);
       });
@@ -683,31 +980,31 @@ TEST(https_client_server) {
   auto verified = verified_client.get("/secure");
   CHECK(verified && verified->body == "secure");
 
+  chhttp::ClientOptions verified_ip_options;
+  verified_ip_options.tls.use_system_certificates = false;
+  verified_ip_options.tls.ca_file = certificate.certificate;
+  chhttp::Client verified_ip_client(
+      "https://127.0.0.1:" + std::to_string(server.port()),
+      std::move(verified_ip_options));
+  auto verified_ip = verified_ip_client.get("/secure");
+  CHECK(verified_ip && verified_ip->body == "secure");
+
   chhttp::Client untrusted_client("https://localhost:" +
                                   std::to_string(server.port()));
   auto untrusted = untrusted_client.get("/secure");
   CHECK(!untrusted &&
         untrusted.error().code == chhttp::Error::tls_verification);
 
-  chhttp::asio::io_context websocket_io;
-  auto websocket_future = chhttp::asio::co_spawn(
-      websocket_io,
-      [&]() -> chhttp::asio::awaitable<void> {
-        chhttp::ClientOptions websocket_options;
-        websocket_options.tls.verify_peer = false;
-        auto connected = co_await chhttp::AsyncWebSocketClient::connect(
-            co_await chhttp::asio::this_coro::executor,
-            "wss://127.0.0.1:" + std::to_string(server.port()) + "/ws", {},
-            std::move(websocket_options));
-        CHECK(connected);
-        CHECK(co_await (*connected)->send_text("agent"));
-        auto message = co_await (*connected)->read();
-        CHECK(message && message->data == "secure:agent");
-        co_await (*connected)->close();
-      },
-      chhttp::asio::use_future);
-  websocket_io.run();
-  websocket_future.get();
+  chhttp::ClientOptions websocket_options;
+  websocket_options.tls.verify_peer = false;
+  auto connected = chhttp::AsyncWebSocketClient::connect(
+      "wss://127.0.0.1:" + std::to_string(server.port()) + "/ws", {},
+      std::move(websocket_options)).get();
+  CHECK(connected);
+  CHECK((*connected)->send_text("agent").get());
+  auto message = (*connected)->read().get();
+  CHECK(message && message->data == "secure:agent");
+  (*connected)->close().get();
   server.stop();
 }
 
@@ -750,9 +1047,15 @@ TEST(mtls_requires_client_certificate) {
 
 } // namespace
 
-int main() {
+int main(int argc, char **argv) {
+  std::cout << std::unitbuf;
+  std::cerr << std::unitbuf;
   int failures = 0;
+  std::size_t executed = 0;
   for (const auto &[name, function] : tests()) {
+    if (argc > 1 && std::string_view(name).find(argv[1]) == std::string_view::npos)
+      continue;
+    ++executed;
     const auto started = std::chrono::steady_clock::now();
     try {
       function();
@@ -768,7 +1071,7 @@ int main() {
     }
   }
   fixture().server.stop();
-  std::cout << (tests().size() - failures) << "/" << tests().size()
+  std::cout << (executed - failures) << "/" << executed
             << " tests passed\n";
   return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

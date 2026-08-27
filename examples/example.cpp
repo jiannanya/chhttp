@@ -14,9 +14,9 @@ int main() {
   });
   server.get_async(
       "/events", [](const chhttp::Request &,
-                     chhttp::Response &response) -> chhttp::asio::awaitable<void> {
+                     chhttp::Response &response) -> chhttp::Task<void> {
         response.set_sse([](chhttp::SseWriter &events)
-                             -> chhttp::asio::awaitable<void> {
+                             -> chhttp::Task<void> {
           for (int index = 0; index < 3; ++index) {
             if (!co_await events.send({.data = "event " + std::to_string(index),
                                       .event = "message",
@@ -40,4 +40,3 @@ int main() {
 
   server.stop();
 }
-

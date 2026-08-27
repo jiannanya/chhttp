@@ -1,12 +1,11 @@
 {
   "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
   "name": "chhttp",
-  "version-semver": "0.1.0",
+  "version-semver": "0.2.0",
   "builtin-baseline": "a2b75031b909a2d6b051725c3909230c72d4bd4a",
   "description": "A C++20 asynchronous HTTP/HTTPS, SSE and WebSocket library",
   "dependencies": [
-    "boost-beast",
-    "boost-url",
+    "libuv",
     "openssl",
     "zlib",
     "brotli",

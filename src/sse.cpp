@@ -1,9 +1,5 @@
 #include "detail.hpp"
 
-#include <boost/asio/redirect_error.hpp>
-#include <boost/asio/steady_timer.hpp>
-#include <boost/asio/use_awaitable.hpp>
-
 #include <charconv>
 #include <mutex>
 
@@ -103,7 +99,7 @@ public:
     }
   }
 
-  asio::awaitable<ErrorInfo> connect() {
+  Task<ErrorInfo> connect() {
     bool expected = false;
     if (!running.compare_exchange_strong(expected, true)) {
       co_return ErrorInfo{Error::protocol, "SSE client is already running"};
@@ -156,11 +152,7 @@ public:
         running = false;
         co_return error;
       }
-      asio::steady_timer timer(co_await asio::this_coro::executor);
-      timer.expires_after(retry);
-      boost::system::error_code timer_error;
-      co_await timer.async_wait(
-          asio::redirect_error(asio::use_awaitable, timer_error));
+      co_await chhttp::sleep_for(retry);
       retry = std::min(retry * 2, options.max_retry);
     }
     running = false;
@@ -186,7 +178,7 @@ public:
 
 SseClient::SseClient(AsyncClient &client, std::string target, Headers headers,
                      SseClientOptions options)
-    : impl_(std::make_unique<Impl>(client, std::move(target),
+    : impl_(std::make_shared<Impl>(client, std::move(target),
                                    std::move(headers), std::move(options))) {}
 SseClient::~SseClient() { stop(); }
 SseClient::SseClient(SseClient &&) noexcept = default;
@@ -207,8 +199,10 @@ SseClient &SseClient::on_error(ErrorCallback handler) {
   return *this;
 }
 
-asio::awaitable<ErrorInfo> SseClient::connect() {
-  co_return co_await impl_->connect();
+Task<ErrorInfo> SseClient::connect() {
+  if (!impl_) co_return ErrorInfo{Error::internal, "Empty SSE client"};
+  auto impl = impl_;
+  co_return co_await impl->connect();
 }
 
 void SseClient::stop() {
@@ -220,4 +214,3 @@ bool SseClient::running() const noexcept {
 }
 
 } // namespace chhttp
-

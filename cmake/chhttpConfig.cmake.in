@@ -1,13 +1,8 @@
 @PACKAGE_INIT@
 
 include(CMakeFindDependencyMacro)
-if(POLICY CMP0167)
-  cmake_policy(SET CMP0167 NEW)
-endif()
-find_dependency(Boost CONFIG COMPONENTS system url)
-if(@CHHTTP_ENABLE_TLS@)
-  find_dependency(OpenSSL)
-endif()
+find_dependency(libuv CONFIG)
+find_dependency(OpenSSL)
 if(@CHHTTP_ENABLE_COMPRESSION@)
   find_dependency(ZLIB)
   find_dependency(unofficial-brotli CONFIG)

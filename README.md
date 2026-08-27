@@ -1,21 +1,29 @@
 # chhttp
 
-`chhttp` is a compiled C++20 HTTP/HTTPS library for agent runtimes and other
+`chhttp` is a compiled static C++20 HTTP/HTTPS library for agent runtimes and other
 long-running services. Its synchronous and asynchronous APIs share one
-Boost.Asio/Beast protocol engine: asynchronous operations are stackless C++20
-coroutines, while `Client` is a blocking adapter over `AsyncClient`.
+libuv transport engine: asynchronous operations use the library's small
+`Task<T>` C++20 coroutine type, while `Client` is a blocking adapter over
+`AsyncClient`.
 
-The implementation is not header-only. On Windows it uses IOCP through Asio;
-on Linux and macOS it uses the best available Asio reactor. A connection is a
-small coroutine rather than a dedicated thread, so idle SSE and WebSocket
-connections do not consume an operating-system thread.
+The implementation is not header-only. On Windows libuv uses IOCP, on Linux it
+uses epoll and on macOS/BSD it uses kqueue. A connection is a small state
+machine and coroutine rather than a dedicated thread, so idle SSE and
+WebSocket connections do not consume an operating-system thread.
+
+The HTTP/1.x protocol layer is implemented by chhttp itself. It includes the
+incremental request/response parser, serializer, message framing, Chunked and
+Trailer handling, Keep-Alive state, `Expect: 100-continue`, pipelining buffers,
+proxy forms and the RFC 6455 WebSocket handshake/frame state machine. libuv is
+used only for cross-platform asynchronous TCP, DNS, timers and event dispatch;
+no third-party HTTP, WebSocket or URL library is used.
 
 ## Capabilities
 
 - HTTP/1.0 and HTTP/1.1 client and server; GET, HEAD, POST, PUT, PATCH, DELETE,
   OPTIONS and arbitrary extension methods
 - Synchronous client and non-blocking coroutine client/server APIs
-- Concurrent server sessions, configurable I/O thread count, timeouts, payload
+- Concurrent server sessions, configurable handler worker pool, timeouts, payload
   and header limits, keep-alive, TCP_NODELAY, cancellation and graceful stop
 - Per-origin HTTP/HTTPS/CONNECT idle connection pools with exclusive checkout,
   bounded retention and safe stale-connection retry for idempotent requests
@@ -56,7 +64,7 @@ ctest --preset windows-msvc
 The matching `windows-clang` configure, build and test presets provide an
 independent Clang 17/MSVC-ABI verification on Windows.
 
-For another generator, point CMake at vcpkg or provide Boost 1.89+, OpenSSL 3,
+For another generator, point CMake at vcpkg or provide libuv 1.x, OpenSSL 3,
 zlib, Brotli and Zstd packages yourself:
 
 ```sh
@@ -87,7 +95,7 @@ int main() {
                       "application/json");
     });
 
-  server.start("127.0.0.1", 8080); // non-blocking; server owns I/O threads
+  server.start("127.0.0.1", 8080); // non-blocking; server owns its I/O loop
 
   chhttp::Client client("http://127.0.0.1:8080");
   auto response = client.get("/v1/agents/demo");
@@ -103,12 +111,13 @@ Passing port `0` asks the operating system for a free port; retrieve it with
 
 ## Async client and high concurrency
 
-`AsyncClient` uses the caller's executor. The same client can have many
+`AsyncClient` owns one libuv event-loop thread. The same client can have many
 independent requests in flight; each operation owns its parser and transport
-state and does not block an I/O thread.
+state and does not block the loop. A returned `Task<T>` can be awaited or
+consumed with `.get()` by a blocking caller.
 
 ```cpp
-chhttp::asio::awaitable<void> invoke(chhttp::AsyncClient& client) {
+chhttp::Task<void> invoke(chhttp::AsyncClient& client) {
   chhttp::Request request;
   request.method = "POST";
   request.target = "/v1/chat/completions";
@@ -138,15 +147,15 @@ auto response = co_await client.get("/stream", {}, {
 
 ## Async handlers and streaming responses
 
-Blocking work should be moved to a separate executor. Network waits and timers
-can remain directly in an async handler:
+Synchronous route handlers run on the configured worker pool. Network waits and
+timers can remain directly in an async handler:
 
 ```cpp
 server.get_async("/events",
   [](const chhttp::Request&, chhttp::Response& response)
-      -> chhttp::asio::awaitable<void> {
+      -> chhttp::Task<void> {
     response.set_sse([](chhttp::SseWriter& writer)
-        -> chhttp::asio::awaitable<void> {
+        -> chhttp::Task<void> {
       for (std::uint64_t sequence = 0; writer.open(); ++sequence) {
         if (!co_await writer.send({
               .data = make_delta(sequence),
@@ -158,7 +167,8 @@ server.get_async("/events",
   });
 ```
 
-`Response::set_stream` exposes the same chunked writer for arbitrary content.
+`Response::set_stream` exposes the same streamed writer for arbitrary content
+(chunked in HTTP/1.1 and connection-delimited in HTTP/1.0).
 The writer applies backpressure: each `co_await write` completes only after the
 transport accepted that chunk.
 
@@ -180,19 +190,18 @@ event IDs and server-provided retry delays. Reconnect is enabled by default.
 ```cpp
 server.websocket("/ws",
   [](const chhttp::Request&, chhttp::WebSocket& ws)
-      -> chhttp::asio::awaitable<void> {
+      -> chhttp::Task<void> {
     while (auto message = co_await ws.read()) {
       if (!co_await ws.send_text(message->data)) break;
     }
   });
 
 auto ws = co_await chhttp::AsyncWebSocketClient::connect(
-    co_await chhttp::asio::this_coro::executor,
     "wss://example.test/ws");
 ```
 
 All operations on a single WebSocket must be serialized by the application;
-many different WebSockets can operate concurrently on the same executor.
+many different WebSockets can operate concurrently on their libuv runtimes.
 
 ## TLS
 
@@ -226,5 +235,5 @@ paths are canonicalized, and credentials are removed on cross-origin redirects.
 
 Tune `ServerOptions` and `ClientOptions` for model payload sizes and expected
 connection counts. The async server does not create a thread per connection;
-`worker_threads` normally needs only the number of CPU cores used for network
-and lightweight handler work.
+one libuv loop handles network I/O and `worker_threads` controls the pool used
+for synchronous route handlers.

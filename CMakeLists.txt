@@ -1,8 +1,5 @@
 cmake_minimum_required(VERSION 3.25)
-if(POLICY CMP0167)
-  cmake_policy(SET CMP0167 NEW)
-endif()
-project(chhttp VERSION 0.1.0 LANGUAGES CXX)
+project(chhttp VERSION 0.2.0 LANGUAGES CXX)
 
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
@@ -12,11 +9,8 @@ option(CHHTTP_BUILD_EXAMPLES "Build chhttp examples" ON)
 option(CHHTTP_ENABLE_TLS "Enable TLS through OpenSSL" ON)
 option(CHHTTP_ENABLE_COMPRESSION "Enable gzip/deflate, Brotli and Zstd" ON)
 
-find_package(Boost CONFIG REQUIRED COMPONENTS system url)
-
-if(CHHTTP_ENABLE_TLS)
-  find_package(OpenSSL REQUIRED)
-endif()
+find_package(libuv CONFIG REQUIRED)
+find_package(OpenSSL REQUIRED)
 
 if(CHHTTP_ENABLE_COMPRESSION)
   find_package(ZLIB REQUIRED)
@@ -24,8 +18,10 @@ if(CHHTTP_ENABLE_COMPRESSION)
   find_package(zstd CONFIG REQUIRED)
 endif()
 
-add_library(chhttp
+add_library(chhttp STATIC
   src/common.cpp
+  src/runtime.cpp
+  src/protocol.cpp
   src/server.cpp
   src/client.cpp
   src/sse.cpp
@@ -38,12 +34,15 @@ target_include_directories(chhttp
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
-target_link_libraries(chhttp PUBLIC Boost::system Boost::url)
-target_compile_definitions(chhttp PUBLIC BOOST_ASIO_NO_DEPRECATED)
+target_link_libraries(chhttp PUBLIC
+  $<IF:$<TARGET_EXISTS:libuv::uv_a>,libuv::uv_a,libuv::uv>
+  OpenSSL::Crypto
+)
+target_compile_definitions(chhttp PUBLIC CHHTTP_HAS_CRYPTO=1)
 
 if(CHHTTP_ENABLE_TLS)
   target_compile_definitions(chhttp PUBLIC CHHTTP_HAS_TLS=1)
-  target_link_libraries(chhttp PUBLIC OpenSSL::SSL OpenSSL::Crypto)
+  target_link_libraries(chhttp PUBLIC OpenSSL::SSL)
 endif()
 
 if(CHHTTP_ENABLE_COMPRESSION)
@@ -63,7 +62,7 @@ if(WIN32)
 endif()
 
 if(MSVC)
-  target_compile_options(chhttp PRIVATE /W4 /permissive- /utf-8 /Zc:preprocessor /bigobj)
+  target_compile_options(chhttp PRIVATE /W4 /permissive- /utf-8 /Zc:preprocessor)
 else()
   target_compile_options(chhttp PRIVATE -Wall -Wextra -Wpedantic)
 endif()

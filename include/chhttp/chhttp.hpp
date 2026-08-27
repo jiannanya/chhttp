@@ -1,30 +1,223 @@
 #pragma once
 
-#include <boost/asio/any_io_executor.hpp>
-#include <boost/asio/awaitable.hpp>
-#include <boost/asio/io_context.hpp>
-
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <coroutine>
+#include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <filesystem>
 #include <functional>
-#include <future>
+#include <initializer_list>
 #include <memory>
+#include <mutex>
 #include <optional>
-#include <regex>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
-#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
 namespace chhttp {
 
-namespace asio = boost::asio;
 using namespace std::chrono_literals;
+
+template <class T> class Task;
+
+namespace detail {
+
+template <class T> struct TaskState {
+  std::mutex mutex;
+  std::condition_variable completed_cv;
+  std::coroutine_handle<> continuation{};
+  std::optional<T> value;
+  std::exception_ptr exception;
+  bool completed{false};
+
+  void complete() noexcept {
+    std::coroutine_handle<> pending_continuation;
+    {
+      std::lock_guard lock(mutex);
+      completed = true;
+      pending_continuation = std::exchange(continuation, {});
+    }
+    completed_cv.notify_all();
+    if (pending_continuation) pending_continuation.resume();
+  }
+};
+
+template <> struct TaskState<void> {
+  std::mutex mutex;
+  std::condition_variable completed_cv;
+  std::coroutine_handle<> continuation{};
+  std::exception_ptr exception;
+  bool completed{false};
+
+  void complete() noexcept {
+    std::coroutine_handle<> pending_continuation;
+    {
+      std::lock_guard lock(mutex);
+      completed = true;
+      pending_continuation = std::exchange(continuation, {});
+    }
+    completed_cv.notify_all();
+    if (pending_continuation) pending_continuation.resume();
+  }
+};
+
+} // namespace detail
+
+// A small executor-neutral C++20 coroutine result. Network operations resume
+// on the libuv loop that owns them; get() may be used by blocking callers.
+template <class T> class [[nodiscard]] Task {
+public:
+  using state_type = detail::TaskState<T>;
+
+  struct promise_type {
+    std::shared_ptr<state_type> state = std::make_shared<state_type>();
+
+    Task get_return_object() noexcept { return Task(state); }
+    std::suspend_never initial_suspend() const noexcept { return {}; }
+    std::suspend_never final_suspend() const noexcept { return {}; }
+    ~promise_type() { state->complete(); }
+    template <class U> void return_value(U &&result) {
+      state->value.emplace(std::forward<U>(result));
+    }
+    void unhandled_exception() noexcept {
+      state->exception = std::current_exception();
+    }
+  };
+
+  Task() = default;
+  Task(Task &&) noexcept = default;
+  Task &operator=(Task &&) noexcept = default;
+  Task(const Task &) = delete;
+  Task &operator=(const Task &) = delete;
+  ~Task() = default;
+
+  [[nodiscard]] bool ready() const noexcept {
+    if (!state_) return true;
+    std::lock_guard lock(state_->mutex);
+    return state_->completed;
+  }
+
+  T get() {
+    if (!state_) throw std::logic_error("Empty chhttp::Task");
+    auto state = std::exchange(state_, {});
+    {
+      std::unique_lock lock(state->mutex);
+      state->completed_cv.wait(lock, [&] { return state->completed; });
+    }
+    if (state->exception) std::rethrow_exception(state->exception);
+    return std::move(*state->value);
+  }
+
+  struct Awaiter {
+    std::shared_ptr<state_type> state;
+    bool await_ready() const noexcept {
+      if (!state) return true;
+      std::lock_guard lock(state->mutex);
+      return state->completed;
+    }
+    bool await_suspend(std::coroutine_handle<> continuation) noexcept {
+      if (!state) return false;
+      std::lock_guard lock(state->mutex);
+      if (state->completed) return false;
+      state->continuation = continuation;
+      return true;
+    }
+    T await_resume() {
+      if (!state) throw std::logic_error("Empty chhttp::Task");
+      auto completed_state = std::exchange(state, {});
+      if (completed_state->exception)
+        std::rethrow_exception(completed_state->exception);
+      return std::move(*completed_state->value);
+    }
+  };
+
+  Awaiter operator co_await() && noexcept {
+    return Awaiter{std::exchange(state_, {})};
+  }
+
+private:
+  explicit Task(std::shared_ptr<state_type> state) noexcept
+      : state_(std::move(state)) {}
+  std::shared_ptr<state_type> state_;
+};
+
+template <> class [[nodiscard]] Task<void> {
+public:
+  using state_type = detail::TaskState<void>;
+
+  struct promise_type {
+    std::shared_ptr<state_type> state = std::make_shared<state_type>();
+
+    Task get_return_object() noexcept { return Task(state); }
+    std::suspend_never initial_suspend() const noexcept { return {}; }
+    std::suspend_never final_suspend() const noexcept { return {}; }
+    ~promise_type() { state->complete(); }
+    void return_void() const noexcept {}
+    void unhandled_exception() noexcept {
+      state->exception = std::current_exception();
+    }
+  };
+
+  Task() = default;
+  Task(Task &&) noexcept = default;
+  Task &operator=(Task &&) noexcept = default;
+  Task(const Task &) = delete;
+  Task &operator=(const Task &) = delete;
+  ~Task() = default;
+
+  [[nodiscard]] bool ready() const noexcept {
+    if (!state_) return true;
+    std::lock_guard lock(state_->mutex);
+    return state_->completed;
+  }
+  void get() {
+    if (!state_) throw std::logic_error("Empty chhttp::Task");
+    auto state = std::exchange(state_, {});
+    {
+      std::unique_lock lock(state->mutex);
+      state->completed_cv.wait(lock, [&] { return state->completed; });
+    }
+    if (state->exception) std::rethrow_exception(state->exception);
+  }
+  struct Awaiter {
+    std::shared_ptr<state_type> state;
+    bool await_ready() const noexcept {
+      if (!state) return true;
+      std::lock_guard lock(state->mutex);
+      return state->completed;
+    }
+    bool await_suspend(std::coroutine_handle<> continuation) noexcept {
+      if (!state) return false;
+      std::lock_guard lock(state->mutex);
+      if (state->completed) return false;
+      state->continuation = continuation;
+      return true;
+    }
+    void await_resume() {
+      if (!state) throw std::logic_error("Empty chhttp::Task");
+      auto completed_state = std::exchange(state, {});
+      if (completed_state->exception)
+        std::rethrow_exception(completed_state->exception);
+    }
+  };
+  Awaiter operator co_await() && noexcept {
+    return Awaiter{std::exchange(state_, {})};
+  }
+
+private:
+  explicit Task(std::shared_ptr<state_type> state) noexcept
+      : state_(std::move(state)) {}
+  std::shared_ptr<state_type> state_;
+};
+
+Task<void> sleep_for(std::chrono::milliseconds duration);
 
 class Headers {
 public:
@@ -159,16 +352,16 @@ class StreamWriter {
 public:
   struct Sink {
     virtual ~Sink() = default;
-    virtual asio::awaitable<bool> write(std::string data) = 0;
-    virtual asio::awaitable<bool> flush() = 0;
+    virtual Task<bool> write(std::string data) = 0;
+    virtual Task<bool> flush() = 0;
     virtual bool open() const noexcept = 0;
   };
 
   StreamWriter() = default;
   explicit StreamWriter(std::shared_ptr<Sink> sink) : sink_(std::move(sink)) {}
-  asio::awaitable<bool> write(std::string_view data);
-  asio::awaitable<bool> write(std::span<const std::byte> data);
-  asio::awaitable<bool> flush();
+  Task<bool> write(std::string_view data);
+  Task<bool> write(std::span<const std::byte> data);
+  Task<bool> flush();
   [[nodiscard]] bool open() const noexcept;
 
 private:
@@ -178,17 +371,17 @@ private:
 class SseWriter {
 public:
   explicit SseWriter(StreamWriter writer) : writer_(std::move(writer)) {}
-  asio::awaitable<bool> send(const SseEvent &event);
-  asio::awaitable<bool> data(std::string_view value);
-  asio::awaitable<bool> comment(std::string_view value = "keep-alive");
+  Task<bool> send(const SseEvent &event);
+  Task<bool> data(std::string_view value);
+  Task<bool> comment(std::string_view value = "keep-alive");
   [[nodiscard]] bool open() const noexcept { return writer_.open(); }
 
 private:
   StreamWriter writer_;
 };
 
-using StreamHandler = std::function<asio::awaitable<void>(StreamWriter &)>;
-using SseHandler = std::function<asio::awaitable<void>(SseWriter &)>;
+using StreamHandler = std::function<Task<void>(StreamWriter &)>;
+using SseHandler = std::function<Task<void>(SseWriter &)>;
 
 struct Response {
   int status{200};
@@ -216,8 +409,7 @@ private:
 
 using ResponseResult = Result<Response>;
 using Handler = std::function<void(const Request &, Response &)>;
-using AsyncHandler =
-    std::function<asio::awaitable<void>(const Request &, Response &)>;
+using AsyncHandler = std::function<Task<void>(const Request &, Response &)>;
 using Middleware = std::function<bool(const Request &, Response &)>;
 using Logger = std::function<void(const Request &, const Response &)>;
 using ErrorHandler = std::function<void(const Request &, Response &)>;
@@ -262,23 +454,21 @@ public:
   };
   struct Channel {
     virtual ~Channel() = default;
-    virtual asio::awaitable<Result<Message>> read() = 0;
-    virtual asio::awaitable<bool> send(std::string data, bool binary) = 0;
-    virtual asio::awaitable<void> ping(std::string data) = 0;
-    virtual asio::awaitable<void> close(std::uint16_t code,
-                                        std::string reason) = 0;
+    virtual Task<Result<Message>> read() = 0;
+    virtual Task<bool> send(std::string data, bool binary) = 0;
+    virtual Task<void> ping(std::string data) = 0;
+    virtual Task<void> close(std::uint16_t code, std::string reason) = 0;
     virtual bool open() const noexcept = 0;
     virtual std::string subprotocol() const = 0;
   };
 
   explicit WebSocket(std::shared_ptr<Channel> channel)
       : channel_(std::move(channel)) {}
-  asio::awaitable<Result<Message>> read();
-  asio::awaitable<bool> send_text(std::string_view data);
-  asio::awaitable<bool> send_binary(std::span<const std::byte> data);
-  asio::awaitable<void> ping(std::string_view data = {});
-  asio::awaitable<void> close(std::uint16_t code = 1000,
-                              std::string_view reason = {});
+  Task<Result<Message>> read();
+  Task<bool> send_text(std::string_view data);
+  Task<bool> send_binary(std::span<const std::byte> data);
+  Task<void> ping(std::string_view data = {});
+  Task<void> close(std::uint16_t code = 1000, std::string_view reason = {});
   [[nodiscard]] bool open() const noexcept;
   [[nodiscard]] std::string subprotocol() const;
 
@@ -286,8 +476,7 @@ private:
   std::shared_ptr<Channel> channel_;
 };
 
-using WebSocketHandler =
-    std::function<asio::awaitable<void>(const Request &, WebSocket &)>;
+using WebSocketHandler = std::function<Task<void>(const Request &, WebSocket &)>;
 using SubprotocolSelector =
     std::function<std::string(const std::vector<std::string> &)>;
 
@@ -328,7 +517,6 @@ public:
   void stop();
   [[nodiscard]] bool running() const noexcept;
   [[nodiscard]] std::uint16_t port() const noexcept;
-  [[nodiscard]] asio::any_io_executor executor() const;
 
 private:
   class Impl;
@@ -388,41 +576,33 @@ struct RequestOptions {
 
 class AsyncClient {
 public:
-  AsyncClient(asio::any_io_executor executor, std::string base_url,
-              ClientOptions options = {});
+  explicit AsyncClient(std::string base_url, ClientOptions options = {});
   ~AsyncClient();
   AsyncClient(AsyncClient &&) noexcept;
   AsyncClient &operator=(AsyncClient &&) noexcept;
   AsyncClient(const AsyncClient &) = delete;
   AsyncClient &operator=(const AsyncClient &) = delete;
 
-  asio::awaitable<ResponseResult> request(Request request,
-                                           RequestOptions options = {});
-  asio::awaitable<ResponseResult> get(std::string target,
-                                      Headers headers = {},
-                                      RequestOptions options = {});
-  asio::awaitable<ResponseResult> head(std::string target,
-                                       Headers headers = {});
-  asio::awaitable<ResponseResult> post(std::string target, std::string body,
-                                       std::string content_type,
-                                       Headers headers = {},
-                                       RequestOptions options = {});
-  asio::awaitable<ResponseResult> put(std::string target, std::string body,
-                                      std::string content_type,
-                                      Headers headers = {},
-                                      RequestOptions options = {});
-  asio::awaitable<ResponseResult> patch(std::string target, std::string body,
-                                        std::string content_type,
-                                        Headers headers = {},
-                                        RequestOptions options = {});
-  asio::awaitable<ResponseResult> del(std::string target,
-                                      Headers headers = {},
-                                      RequestOptions options = {});
+  Task<ResponseResult> request(Request request, RequestOptions options = {});
+  Task<ResponseResult> get(std::string target, Headers headers = {},
+                           RequestOptions options = {});
+  Task<ResponseResult> head(std::string target, Headers headers = {});
+  Task<ResponseResult> post(std::string target, std::string body,
+                            std::string content_type, Headers headers = {},
+                            RequestOptions options = {});
+  Task<ResponseResult> put(std::string target, std::string body,
+                           std::string content_type, Headers headers = {},
+                           RequestOptions options = {});
+  Task<ResponseResult> patch(std::string target, std::string body,
+                             std::string content_type, Headers headers = {},
+                             RequestOptions options = {});
+  Task<ResponseResult> del(std::string target, Headers headers = {},
+                           RequestOptions options = {});
   void cancel();
 
 private:
   class Impl;
-  std::unique_ptr<Impl> impl_;
+  std::shared_ptr<Impl> impl_;
 };
 
 class Client {
@@ -479,20 +659,19 @@ public:
   SseClient &on_message(MessageHandler handler);
   SseClient &on_event(std::string event, MessageHandler handler);
   SseClient &on_error(ErrorCallback handler);
-  asio::awaitable<ErrorInfo> connect();
+  Task<ErrorInfo> connect();
   void stop();
   [[nodiscard]] bool running() const noexcept;
 
 private:
   class Impl;
-  std::unique_ptr<Impl> impl_;
+  std::shared_ptr<Impl> impl_;
 };
 
 class AsyncWebSocketClient {
 public:
-  static asio::awaitable<Result<std::shared_ptr<WebSocket>>>
-  connect(asio::any_io_executor executor, std::string url,
-          Headers headers = {}, ClientOptions options = {});
+  static Task<Result<std::shared_ptr<WebSocket>>>
+  connect(std::string url, Headers headers = {}, ClientOptions options = {});
 };
 
 std::string url_encode(std::string_view value, bool space_as_plus = false);

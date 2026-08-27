@@ -1,9 +1,6 @@
 #include "detail.hpp"
 
-#include <boost/beast/core/detail/base64.hpp>
-#include <boost/url.hpp>
-
-#ifdef CHHTTP_HAS_TLS
+#ifdef CHHTTP_HAS_CRYPTO
 #include <openssl/evp.h>
 #include <openssl/sha.h>
 #endif
@@ -89,19 +86,19 @@ std::string Request::get_param(std::string_view name,
   return found == query.end() ? std::string(fallback) : found->second;
 }
 
-asio::awaitable<bool> StreamWriter::write(std::string_view data) {
+Task<bool> StreamWriter::write(std::string_view data) {
   if (!sink_) {
     co_return false;
   }
   co_return co_await sink_->write(std::string(data));
 }
 
-asio::awaitable<bool> StreamWriter::write(std::span<const std::byte> data) {
+Task<bool> StreamWriter::write(std::span<const std::byte> data) {
   const auto *ptr = reinterpret_cast<const char *>(data.data());
   co_return co_await write(std::string_view(ptr, data.size()));
 }
 
-asio::awaitable<bool> StreamWriter::flush() {
+Task<bool> StreamWriter::flush() {
   if (!sink_) {
     co_return false;
   }
@@ -110,15 +107,15 @@ asio::awaitable<bool> StreamWriter::flush() {
 
 bool StreamWriter::open() const noexcept { return sink_ && sink_->open(); }
 
-asio::awaitable<bool> SseWriter::send(const SseEvent &event) {
+Task<bool> SseWriter::send(const SseEvent &event) {
   co_return co_await writer_.write(format_sse(event));
 }
 
-asio::awaitable<bool> SseWriter::data(std::string_view value) {
+Task<bool> SseWriter::data(std::string_view value) {
   co_return co_await send(SseEvent{.data = std::string(value)});
 }
 
-asio::awaitable<bool> SseWriter::comment(std::string_view value) {
+Task<bool> SseWriter::comment(std::string_view value) {
   std::string line = ": ";
   line.append(value);
   line.append("\n\n");
@@ -160,7 +157,7 @@ void Response::set_stream(std::string content_type, StreamHandler handler) {
 void Response::set_sse(SseHandler handler) {
   set_stream("text/event-stream; charset=utf-8",
              [handler = std::move(handler)](StreamWriter &writer)
-                 -> asio::awaitable<void> {
+                 -> Task<void> {
                SseWriter sse(writer);
                co_await handler(sse);
              });
@@ -172,33 +169,32 @@ bool Response::is_streaming() const noexcept {
   return static_cast<bool>(stream_handler_);
 }
 
-asio::awaitable<Result<WebSocket::Message>> WebSocket::read() {
+Task<Result<WebSocket::Message>> WebSocket::read() {
   if (!channel_) {
     co_return ErrorInfo{Error::websocket_closed, "WebSocket is not connected"};
   }
   co_return co_await channel_->read();
 }
 
-asio::awaitable<bool> WebSocket::send_text(std::string_view data) {
+Task<bool> WebSocket::send_text(std::string_view data) {
   if (!channel_) co_return false;
   co_return co_await channel_->send(std::string(data), false);
 }
 
-asio::awaitable<bool>
+Task<bool>
 WebSocket::send_binary(std::span<const std::byte> data) {
   if (!channel_) co_return false;
   const auto *ptr = reinterpret_cast<const char *>(data.data());
   co_return co_await channel_->send(std::string(ptr, data.size()), true);
 }
 
-asio::awaitable<void> WebSocket::ping(std::string_view data) {
+Task<void> WebSocket::ping(std::string_view data) {
   if (channel_) {
     co_await channel_->ping(std::string(data));
   }
 }
 
-asio::awaitable<void> WebSocket::close(std::uint16_t code,
-                                       std::string_view reason) {
+Task<void> WebSocket::close(std::uint16_t code, std::string_view reason) {
   if (channel_) {
     co_await channel_->close(code, std::string(reason));
   }
@@ -238,7 +234,9 @@ Result<std::string> url_decode(std::string_view value, bool plus_as_space) {
     return -1;
   };
   for (std::size_t index = 0; index < value.size(); ++index) {
-    if (value[index] == '%' && index + 2 < value.size()) {
+    if (value[index] == '%') {
+      if (index + 2 >= value.size())
+        return ErrorInfo{Error::invalid_url, "Truncated percent escape"};
       const int high = hex_value(value[index + 1]);
       const int low = hex_value(value[index + 2]);
       if (high < 0 || low < 0) {
@@ -289,29 +287,107 @@ std::string make_query(const Params &params) {
   return output;
 }
 
+namespace {
+
+std::vector<std::string> split_header_parameters(std::string_view value) {
+  std::vector<std::string> parameters;
+  std::size_t start = 0;
+  bool quoted = false;
+  bool escaped = false;
+  for (std::size_t index = 0; index <= value.size(); ++index) {
+    const char ch = index < value.size() ? value[index] : ';';
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (quoted && ch == '\\') {
+      escaped = true;
+      continue;
+    }
+    if (ch == '"') quoted = !quoted;
+    if (ch == ';' && !quoted) {
+      parameters.push_back(detail::trim(value.substr(start, index - start)));
+      start = index + 1;
+    }
+  }
+  return parameters;
+}
+
+Result<std::string> decode_header_parameter(std::string_view value) {
+  auto trimmed = detail::trim(value);
+  if (trimmed.empty() || trimmed.front() != '"') return trimmed;
+  if (trimmed.size() < 2 || trimmed.back() != '"')
+    return ErrorInfo{Error::multipart, "Unterminated quoted parameter"};
+  std::string decoded;
+  for (std::size_t index = 1; index + 1 < trimmed.size(); ++index) {
+    if (trimmed[index] == '\\' && index + 2 < trimmed.size()) ++index;
+    decoded.push_back(trimmed[index]);
+  }
+  return decoded;
+}
+
+bool valid_multipart_boundary(std::string_view boundary) noexcept {
+  if (boundary.empty() || boundary.size() > 70 || boundary.back() == ' ')
+    return false;
+  constexpr std::string_view punctuation = "'()+_,-./:=? ";
+  return std::ranges::all_of(boundary, [&](unsigned char ch) {
+    return std::isalnum(ch) || punctuation.find(static_cast<char>(ch)) !=
+                                   std::string_view::npos;
+  });
+}
+
+std::string quote_multipart_parameter(std::string_view value) {
+  std::string quoted;
+  quoted.reserve(value.size());
+  for (const char ch : value) {
+    if (ch == '\r' || ch == '\n') continue;
+    if (ch == '\\' || ch == '"') quoted.push_back('\\');
+    quoted.push_back(ch);
+  }
+  return quoted;
+}
+
+} // namespace
+
 Result<MultipartForm> parse_multipart(std::string_view body,
                                      std::string_view content_type,
                                      std::size_t max_parts) {
-  const auto boundary_pos = detail::lower(content_type).find("boundary=");
-  if (boundary_pos == std::string::npos) {
+  std::string boundary;
+  const auto parameters = split_header_parameters(content_type);
+  if (parameters.empty() ||
+      !detail::iequals(parameters.front(), "multipart/form-data"))
+    return ErrorInfo{Error::multipart, "Content-Type is not multipart/form-data"};
+  for (std::size_t index = 1; index < parameters.size(); ++index) {
+    const auto equal = parameters[index].find('=');
+    if (equal == std::string::npos ||
+        !detail::iequals(detail::trim(std::string_view(parameters[index])
+                                         .substr(0, equal)),
+                         "boundary"))
+      continue;
+    auto decoded = decode_header_parameter(
+        std::string_view(parameters[index]).substr(equal + 1));
+    if (!decoded) return decoded.error();
+    boundary = std::move(*decoded);
+    break;
+  }
+  if (boundary.empty()) {
     return ErrorInfo{Error::multipart, "Missing multipart boundary"};
   }
-  auto boundary = detail::trim(content_type.substr(boundary_pos + 9));
-  if (!boundary.empty() && boundary.front() == '"' && boundary.back() == '"') {
-    boundary = boundary.substr(1, boundary.size() - 2);
-  }
-  if (boundary.empty() || boundary.size() > 70 ||
-      boundary.find_first_of("\r\n") != std::string::npos) {
+  if (!valid_multipart_boundary(boundary)) {
     return ErrorInfo{Error::multipart, "Invalid multipart boundary"};
   }
   const std::string marker = "--" + boundary;
   MultipartForm parts;
   std::size_t cursor = 0;
+  bool closed = false;
   while (true) {
     auto begin = body.find(marker, cursor);
     if (begin == std::string_view::npos) break;
     begin += marker.size();
-    if (body.substr(begin, 2) == "--") break;
+    if (body.substr(begin, 2) == "--") {
+      closed = true;
+      break;
+    }
     if (body.substr(begin, 2) != "\r\n") {
       return ErrorInfo{Error::multipart, "Malformed multipart delimiter"};
     }
@@ -332,19 +408,23 @@ Result<MultipartForm> parse_multipart(std::string_view body,
       }
       auto name = detail::trim(line.substr(0, colon));
       auto value = detail::trim(line.substr(colon + 1));
+      if (!detail::valid_header_name(name) ||
+          !detail::valid_header_value(value))
+        return ErrorInfo{Error::multipart, "Invalid multipart header"};
       part.headers.add(name, value);
       if (detail::iequals(name, "Content-Type")) part.content_type = value;
       if (detail::iequals(name, "Content-Disposition")) {
-        for (const auto &token : detail::split_tokens(value, ';')) {
+        const auto disposition = split_header_parameters(value);
+        for (std::size_t index = 1; index < disposition.size(); ++index) {
+          const auto &token = disposition[index];
           const auto equals = token.find('=');
           if (equals == std::string::npos) continue;
           auto key = detail::trim(std::string_view(token).substr(0, equals));
-          auto val = detail::trim(std::string_view(token).substr(equals + 1));
-          if (val.size() >= 2 && val.front() == '"' && val.back() == '"') {
-            val = val.substr(1, val.size() - 2);
-          }
-          if (detail::iequals(key, "name")) part.name = val;
-          if (detail::iequals(key, "filename")) part.filename = val;
+          auto val = decode_header_parameter(
+              std::string_view(token).substr(equals + 1));
+          if (!val) return val.error();
+          if (detail::iequals(key, "name")) part.name = *val;
+          if (detail::iequals(key, "filename")) part.filename = *val;
         }
       }
       if (line_end == std::string_view::npos || line_end >= header_end) break;
@@ -362,24 +442,31 @@ Result<MultipartForm> parse_multipart(std::string_view body,
     }
     cursor = next + 2;
   }
+  if (!closed)
+    return ErrorInfo{Error::multipart, "Multipart body has no closing delimiter"};
   return parts;
 }
 
 std::pair<std::string, std::string>
 make_multipart(const MultipartForm &parts, std::string boundary) {
-  if (boundary.empty()) boundary = detail::random_boundary();
+  if (!valid_multipart_boundary(boundary)) boundary = detail::random_boundary();
   std::string body;
   for (const auto &part : parts) {
     body += "--" + boundary + "\r\n";
-    body += "Content-Disposition: form-data; name=\"" + part.name + "\"";
-    if (!part.filename.empty()) body += "; filename=\"" + part.filename + "\"";
+    body += "Content-Disposition: form-data; name=\"" +
+            quote_multipart_parameter(part.name) + "\"";
+    if (!part.filename.empty())
+      body += "; filename=\"" + quote_multipart_parameter(part.filename) +
+              "\"";
     body += "\r\n";
     if (!part.content_type.empty()) {
       body += "Content-Type: " + part.content_type + "\r\n";
     }
     for (const auto &[name, value] : part.headers) {
       if (!detail::iequals(name, "Content-Disposition") &&
-          !detail::iequals(name, "Content-Type")) {
+          !detail::iequals(name, "Content-Type") &&
+          detail::valid_header_name(name) &&
+          detail::valid_header_value(value)) {
         body += name + ": " + value + "\r\n";
       }
     }
@@ -409,8 +496,71 @@ std::string mime_type(const std::filesystem::path &path) {
 }
 
 std::string status_reason(int status) {
-  return std::string(boost::beast::http::obsolete_reason(
-      static_cast<boost::beast::http::status>(status)));
+  switch (status) {
+  case 100: return "Continue";
+  case 101: return "Switching Protocols";
+  case 102: return "Processing";
+  case 103: return "Early Hints";
+  case 200: return "OK";
+  case 201: return "Created";
+  case 202: return "Accepted";
+  case 203: return "Non-Authoritative Information";
+  case 204: return "No Content";
+  case 205: return "Reset Content";
+  case 206: return "Partial Content";
+  case 207: return "Multi-Status";
+  case 208: return "Already Reported";
+  case 226: return "IM Used";
+  case 300: return "Multiple Choices";
+  case 301: return "Moved Permanently";
+  case 302: return "Found";
+  case 303: return "See Other";
+  case 304: return "Not Modified";
+  case 305: return "Use Proxy";
+  case 307: return "Temporary Redirect";
+  case 308: return "Permanent Redirect";
+  case 400: return "Bad Request";
+  case 401: return "Unauthorized";
+  case 402: return "Payment Required";
+  case 403: return "Forbidden";
+  case 404: return "Not Found";
+  case 405: return "Method Not Allowed";
+  case 406: return "Not Acceptable";
+  case 407: return "Proxy Authentication Required";
+  case 408: return "Request Timeout";
+  case 409: return "Conflict";
+  case 410: return "Gone";
+  case 411: return "Length Required";
+  case 412: return "Precondition Failed";
+  case 413: return "Payload Too Large";
+  case 414: return "URI Too Long";
+  case 415: return "Unsupported Media Type";
+  case 416: return "Range Not Satisfiable";
+  case 417: return "Expectation Failed";
+  case 418: return "I'm a teapot";
+  case 421: return "Misdirected Request";
+  case 422: return "Unprocessable Content";
+  case 423: return "Locked";
+  case 424: return "Failed Dependency";
+  case 425: return "Too Early";
+  case 426: return "Upgrade Required";
+  case 428: return "Precondition Required";
+  case 429: return "Too Many Requests";
+  case 431: return "Request Header Fields Too Large";
+  case 451: return "Unavailable For Legal Reasons";
+  case 500: return "Internal Server Error";
+  case 501: return "Not Implemented";
+  case 502: return "Bad Gateway";
+  case 503: return "Service Unavailable";
+  case 504: return "Gateway Timeout";
+  case 505: return "HTTP Version Not Supported";
+  case 506: return "Variant Also Negotiates";
+  case 507: return "Insufficient Storage";
+  case 508: return "Loop Detected";
+  case 510: return "Not Extended";
+  case 511: return "Network Authentication Required";
+  default: return "Unknown";
+  }
 }
 
 std::string basic_auth(std::string_view username, std::string_view password) {
@@ -492,7 +642,7 @@ Result<std::string> digest_auth(
     std::string_view method, std::string_view uri, std::string_view username,
     std::string_view password, const DigestChallenge &challenge,
     std::uint32_t nonce_count, std::string cnonce) {
-#ifndef CHHTTP_HAS_TLS
+#ifndef CHHTTP_HAS_CRYPTO
   (void)method;
   (void)uri;
   (void)username;
@@ -672,90 +822,219 @@ std::string random_boundary() {
 Result<ParsedUrl> parse_url(std::string_view input, std::string_view base) {
   std::string complete(input);
   if (input.find("://") == std::string_view::npos) {
-    if (base.empty()) {
-      return ErrorInfo{Error::invalid_url, "URL has no scheme"};
-    }
-    if (!complete.empty() && complete.front() != '/') complete.insert(0, "/");
-    complete = std::string(base) + complete;
+    if (base.empty()) return ErrorInfo{Error::invalid_url, "URL has no scheme"};
+    auto resolved = resolve_url(base, input);
+    if (!resolved) return resolved.error();
+    complete = std::move(*resolved);
   }
-  auto parsed = boost::urls::parse_uri(complete);
-  if (!parsed || !parsed->has_authority()) {
-    return ErrorInfo{Error::invalid_url, "Invalid URL: " + complete};
+  for (unsigned char ch : complete) {
+    if (ch <= 0x20 || ch == 0x7f)
+      return ErrorInfo{Error::invalid_url, "URL contains whitespace or control characters"};
   }
+  const auto scheme_end = complete.find("://");
+  if (scheme_end == std::string::npos || scheme_end == 0)
+    return ErrorInfo{Error::invalid_url, "Malformed URL scheme"};
   ParsedUrl result;
-  result.scheme = lower(parsed->scheme());
+  result.scheme = lower(std::string_view(complete).substr(0, scheme_end));
   result.secure = result.scheme == "https" || result.scheme == "wss";
   if (result.scheme != "http" && result.scheme != "https" &&
       result.scheme != "ws" && result.scheme != "wss") {
     return ErrorInfo{Error::invalid_url, "Unsupported URL scheme: " + result.scheme};
   }
-  result.host = std::string(parsed->host());
+  const auto authority_begin = scheme_end + 3;
+  const auto target_begin = complete.find_first_of("/?#", authority_begin);
+  auto authority = std::string_view(complete).substr(
+      authority_begin, target_begin == std::string::npos
+                           ? std::string::npos
+                           : target_begin - authority_begin);
+  if (authority.empty() || authority.find('@') != std::string_view::npos)
+    return ErrorInfo{Error::invalid_url, "URL has an invalid authority"};
+  std::string_view port_text;
+  if (authority.front() == '[') {
+    const auto bracket = authority.find(']');
+    if (bracket == std::string_view::npos || bracket == 1)
+      return ErrorInfo{Error::invalid_url, "Malformed IPv6 URL host"};
+    result.host = std::string(authority.substr(1, bracket - 1));
+    if (bracket + 1 < authority.size()) {
+      if (authority[bracket + 1] != ':')
+        return ErrorInfo{Error::invalid_url, "Malformed URL authority"};
+      port_text = authority.substr(bracket + 2);
+    }
+  } else {
+    const auto colon = authority.rfind(':');
+    if (colon != std::string_view::npos) {
+      if (authority.find(':') != colon)
+        return ErrorInfo{Error::invalid_url, "IPv6 URL hosts must use brackets"};
+      result.host = std::string(authority.substr(0, colon));
+      port_text = authority.substr(colon + 1);
+    } else {
+      result.host = std::string(authority);
+    }
+  }
   if (result.host.empty()) return ErrorInfo{Error::invalid_url, "URL has no host"};
-  if (parsed->has_port()) {
+  if (!port_text.empty()) {
     unsigned value = 0;
-    const auto port_text = parsed->port();
     const auto conversion = std::from_chars(port_text.data(),
                                             port_text.data() + port_text.size(), value);
-    if (conversion.ec != std::errc{} || value > 65535 || value == 0) {
+    if (conversion.ec != std::errc{} ||
+        conversion.ptr != port_text.data() + port_text.size() ||
+        value > 65535 || value == 0) {
       return ErrorInfo{Error::invalid_url, "Invalid URL port"};
     }
     result.port = static_cast<std::uint16_t>(value);
+  } else if (!authority.empty() && authority.back() == ':') {
+    return ErrorInfo{Error::invalid_url, "URL port is empty"};
   } else {
     result.port = result.secure ? 443 : 80;
   }
-  result.target = parsed->encoded_path().empty() ? "/" : std::string(parsed->encoded_path());
-  if (parsed->has_query()) result.target += "?" + std::string(parsed->encoded_query());
-  return result;
-}
-
-Headers from_beast_headers(const http::fields &fields) {
-  Headers result;
-  for (const auto &field : fields) {
-    result.add(std::string(field.name_string()), std::string(field.value()));
+  if (target_begin != std::string::npos && complete[target_begin] != '#') {
+    const auto fragment = complete.find('#', target_begin);
+    result.target = complete.substr(target_begin, fragment == std::string::npos
+                                                      ? std::string::npos
+                                                      : fragment - target_begin);
   }
+  if (result.target.empty()) result.target = "/";
+  if (result.target.front() == '?') result.target.insert(result.target.begin(), '/');
   return result;
 }
 
-void to_beast_headers(const Headers &headers, http::fields &fields) {
-  for (const auto &[name, value] : headers) fields.insert(name, value);
+std::string ParsedUrl::authority() const {
+  std::string value = host.find(':') == std::string::npos ? host : "[" + host + "]";
+  const bool default_port = (secure && port == 443) || (!secure && port == 80);
+  if (!default_port) value += ":" + std::to_string(port);
+  return value;
 }
 
-Request from_beast_request(const http::request<http::string_body> &source) {
-  Request result;
-  result.method = std::string(source.method_string());
-  result.target = std::string(source.target());
-  const auto query_at = result.target.find('?');
-  result.path = query_at == std::string::npos ? result.target
-                                              : result.target.substr(0, query_at);
-  if (result.path.empty()) result.path = "/";
-  if (query_at != std::string::npos) result.query = parse_query(result.target.substr(query_at + 1));
-  result.version = source.version();
-  result.headers = from_beast_headers(source.base());
-  result.body = source.body();
-  result.keep_alive = source.keep_alive();
-  return result;
+std::string ParsedUrl::origin() const {
+  return scheme + "://" + authority();
 }
 
-Response from_beast_response(const http::response<http::string_body> &source) {
-  Response result;
-  result.status = source.result_int();
-  result.version = source.version();
-  result.headers = from_beast_headers(source.base());
-  result.body = source.body();
-  result.keep_alive = source.keep_alive();
-  return result;
+Result<std::string> resolve_url(std::string_view base,
+                                std::string_view reference) {
+  if (reference.find("://") != std::string_view::npos)
+    return std::string(reference);
+  auto parsed_base = parse_url(base);
+  if (!parsed_base) return parsed_base.error();
+  if (reference.starts_with("//"))
+    return parsed_base->scheme + ":" + std::string(reference);
+  const auto origin = parsed_base->origin();
+  if (reference.empty() || reference.front() == '#')
+    return origin + parsed_base->target;
+  if (reference.front() == '?') {
+    const auto query = parsed_base->target.find('?');
+    return origin + parsed_base->target.substr(0, query) + std::string(reference);
+  }
+  std::string combined;
+  if (reference.front() == '/') {
+    combined = std::string(reference);
+  } else {
+    auto path = parsed_base->target.substr(0, parsed_base->target.find('?'));
+    const auto slash = path.rfind('/');
+    combined = path.substr(0, slash == std::string::npos ? 0 : slash + 1) +
+               std::string(reference);
+  }
+  const auto query_at = combined.find('?');
+  const auto query = query_at == std::string::npos ? std::string{} : combined.substr(query_at);
+  auto path = combined.substr(0, query_at);
+  std::vector<std::string> segments;
+  for (const auto &segment : split_tokens(path, '/')) {
+    if (segment == ".") continue;
+    if (segment == "..") {
+      if (!segments.empty()) segments.pop_back();
+    } else {
+      segments.push_back(segment);
+    }
+  }
+  path = "/";
+  for (std::size_t index = 0; index < segments.size(); ++index) {
+    if (index) path += '/';
+    path += segments[index];
+  }
+  if (combined.ends_with('/') && !path.ends_with('/')) path += '/';
+  return origin + path + query;
+}
+
+bool valid_header_name(std::string_view value) noexcept {
+  if (value.empty()) return false;
+  constexpr std::string_view separators = "()<>@,;:\\\"/[]?={} \t";
+  return std::ranges::all_of(value, [&](unsigned char ch) {
+    return ch > 0x20 && ch < 0x7f && separators.find(static_cast<char>(ch)) ==
+                                           std::string_view::npos;
+  });
+}
+
+bool valid_header_value(std::string_view value) noexcept {
+  return std::ranges::all_of(value, [](unsigned char ch) {
+    return ch == '\t' || (ch >= 0x20 && ch != 0x7f);
+  });
+}
+
+bool has_token(const Headers &headers, std::string_view name,
+               std::string_view token) {
+  for (const auto &value : headers.get_all(name)) {
+    for (const auto &candidate : split_tokens(value, ',')) {
+      if (iequals(candidate, token)) return true;
+    }
+  }
+  return false;
 }
 
 std::string base64_encode(std::string_view value) {
+  static constexpr std::string_view alphabet =
+      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
   std::string output;
-  output.resize(beast::detail::base64::encoded_size(value.size()));
-  const auto written = beast::detail::base64::encode(output.data(), value.data(), value.size());
-  output.resize(written);
+  output.reserve((value.size() + 2) / 3 * 4);
+  for (std::size_t offset = 0; offset < value.size(); offset += 3) {
+    const auto first = static_cast<unsigned char>(value[offset]);
+    const auto second = offset + 1 < value.size()
+                            ? static_cast<unsigned char>(value[offset + 1])
+                            : 0;
+    const auto third = offset + 2 < value.size()
+                           ? static_cast<unsigned char>(value[offset + 2])
+                           : 0;
+    const std::uint32_t bits = (static_cast<std::uint32_t>(first) << 16) |
+                               (static_cast<std::uint32_t>(second) << 8) | third;
+    output.push_back(alphabet[(bits >> 18) & 0x3f]);
+    output.push_back(alphabet[(bits >> 12) & 0x3f]);
+    output.push_back(offset + 1 < value.size() ? alphabet[(bits >> 6) & 0x3f] : '=');
+    output.push_back(offset + 2 < value.size() ? alphabet[bits & 0x3f] : '=');
+  }
+  return output;
+}
+
+Result<std::string> base64_decode(std::string_view value) {
+  static constexpr std::string_view alphabet =
+      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  if (value.size() % 4 != 0)
+    return ErrorInfo{Error::protocol, "Invalid Base64 length"};
+  std::string output;
+  output.reserve(value.size() / 4 * 3);
+  for (std::size_t offset = 0; offset < value.size(); offset += 4) {
+    std::uint32_t bits = 0;
+    int padding = 0;
+    for (int index = 0; index < 4; ++index) {
+      const char ch = value[offset + index];
+      if (ch == '=') {
+        if (index < 2 || offset + 4 != value.size())
+          return ErrorInfo{Error::protocol, "Invalid Base64 padding"};
+        ++padding;
+        bits <<= 6;
+      } else {
+        const auto position = alphabet.find(ch);
+        if (position == std::string_view::npos || padding)
+          return ErrorInfo{Error::protocol, "Invalid Base64 character"};
+        bits = (bits << 6) | static_cast<std::uint32_t>(position);
+      }
+    }
+    output.push_back(static_cast<char>((bits >> 16) & 0xff));
+    if (padding < 2) output.push_back(static_cast<char>((bits >> 8) & 0xff));
+    if (padding == 0) output.push_back(static_cast<char>(bits & 0xff));
+  }
   return output;
 }
 
 std::string sha1_base64(std::string_view value) {
-#ifdef CHHTTP_HAS_TLS
+#ifdef CHHTTP_HAS_CRYPTO
   std::array<unsigned char, SHA_DIGEST_LENGTH> digest{};
   SHA1(reinterpret_cast<const unsigned char *>(value.data()), value.size(),
        digest.data());
@@ -771,10 +1050,9 @@ std::string websocket_accept(std::string_view key) {
   return sha1_base64(std::string(key) + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
 }
 
-ErrorInfo make_error(Error code, std::string message,
-                     const boost::system::error_code &ec) {
-  if (ec) message += ": " + ec.message();
-  return ErrorInfo{code, std::move(message), ec.value(), 0};
+ErrorInfo make_error(Error code, std::string message, int system_code,
+                     long tls_code) {
+  return ErrorInfo{code, std::move(message), system_code, tls_code};
 }
 
 bool path_is_within(const std::filesystem::path &root,
@@ -915,17 +1193,54 @@ Result<std::string> decompress(std::string_view input, std::string_view encoding
 }
 
 std::string select_encoding(std::string_view accept_encoding) {
-  const auto normalized = lower(accept_encoding);
-  for (const auto *encoding : {"br", "zstd", "gzip", "deflate"}) {
-    const auto at = normalized.find(encoding);
-    if (at != std::string::npos) {
-      const auto q = normalized.find("q=0", at);
-      const auto comma = normalized.find(',', at);
-      if (q == std::string::npos || (comma != std::string::npos && q > comma))
-        return encoding;
+  constexpr std::array<std::string_view, 4> supported{
+      "br", "zstd", "gzip", "deflate"};
+  std::array<double, supported.size()> explicit_quality{};
+  explicit_quality.fill(-1.0);
+  double wildcard_quality = -1.0;
+  for (const auto &item : split_tokens(accept_encoding, ',')) {
+    const auto semicolon = item.find(';');
+    const auto coding = lower(trim(std::string_view(item).substr(0, semicolon)));
+    double quality = 1.0;
+    std::size_t parameter = semicolon;
+    while (parameter != std::string::npos) {
+      const auto next = item.find(';', parameter + 1);
+      const auto value = trim(std::string_view(item).substr(
+          parameter + 1, next == std::string::npos
+                             ? std::string_view::npos
+                             : next - parameter - 1));
+      const auto equal = value.find('=');
+      if (equal != std::string::npos &&
+          iequals(trim(std::string_view(value).substr(0, equal)), "q")) {
+        const auto number = trim(std::string_view(value).substr(equal + 1));
+        const auto parsed = std::from_chars(number.data(),
+                                            number.data() + number.size(),
+                                            quality);
+        if (parsed.ec != std::errc{} ||
+            parsed.ptr != number.data() + number.size() || quality < 0.0 ||
+            quality > 1.0)
+          quality = 0.0;
+      }
+      parameter = next;
+    }
+    if (coding == "*") wildcard_quality = std::max(wildcard_quality, quality);
+    for (std::size_t index = 0; index < supported.size(); ++index)
+      if (coding == supported[index])
+        explicit_quality[index] =
+            std::max(explicit_quality[index], quality);
+  }
+  double selected_quality = 0.0;
+  std::string selected;
+  for (std::size_t index = 0; index < supported.size(); ++index) {
+    const double quality = explicit_quality[index] >= 0.0
+                               ? explicit_quality[index]
+                               : wildcard_quality;
+    if (quality > selected_quality) {
+      selected_quality = quality;
+      selected = supported[index];
     }
   }
-  return {};
+  return selected;
 }
 
 } // namespace chhttp::detail
