@@ -74,8 +74,7 @@ set_target_properties(chhttp PROPERTIES
 )
 
 if(CHHTTP_BUILD_EXAMPLES)
-  add_executable(chhttp_example examples/example.cpp)
-  target_link_libraries(chhttp_example PRIVATE chhttp::chhttp)
+  add_subdirectory(examples)
 endif()
 
 if(CHHTTP_BUILD_TESTS)

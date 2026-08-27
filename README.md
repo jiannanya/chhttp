@@ -127,6 +127,40 @@ Use `listen` instead of `start` when the calling thread should remain blocked.
 Passing port `0` asks the operating system for a free port; retrieve it with
 `server.port()`.
 
+## Examples
+
+With `CHHTTP_BUILD_EXAMPLES=ON` (the default), CMake builds the following
+independent programs. Each source file contains comments about ownership,
+backpressure, cancellation, verification, and other behavior that matters in
+long-running agent processes.
+
+| Target | Source | Demonstrates |
+|---|---|---|
+| `chhttp_example` | `examples/example.cpp` | Minimal local server and client |
+| `chhttp_sync_client` | `examples/sync_client.cpp` | Blocking requests, options, headers, queries, and errors |
+| `chhttp_async_concurrency` | `examples/async_concurrency.cpp` | Concurrent requests through one libuv client |
+| `chhttp_rest_server` | `examples/rest_server.cpp` | Long-running REST routes and graceful stop |
+| `chhttp_streaming` | `examples/streaming.cpp` | Chunked producer backpressure and download callbacks |
+| `chhttp_sse` | `examples/sse.cpp` | SSE server, client, named events, IDs, and retry values |
+| `chhttp_websocket` | `examples/websocket.cpp` | Subprotocols, ping/pong, text echo, and close |
+| `chhttp_multipart` | `examples/multipart.cpp` | Binary multipart upload and automatic server parsing |
+| `chhttp_static_files` | `examples/static_files.cpp` | Static mounts, index files, MIME types, and byte ranges |
+| `chhttp_middleware` | `examples/middleware.cpp` | Authentication middleware, logging, and error hooks |
+| `chhttp_proxy` | `examples/proxy.cpp` | Forward-proxy absolute targets and Basic proxy auth |
+| `chhttp_https` | `examples/https.cpp` | HTTPS server/client trust configuration |
+| `chhttp_cancellation` | `examples/cancellation.cpp` | Active cancellation and safe client reuse |
+
+For example:
+
+```powershell
+cmake --build --preset windows-msvc --target chhttp_sse
+.\build-msvc\examples\chhttp_sse.exe
+```
+
+`chhttp_https` is the only example that needs external files. Pass a PEM
+certificate and private key; optionally pass a trusted CA file to keep peer and
+hostname verification enabled.
+
 ## Async client and high concurrency
 
 `AsyncClient` owns one libuv event-loop thread. The same client can have many
