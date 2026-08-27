@@ -389,6 +389,7 @@ Fixture &fixture() {
   return value;
 }
 
+// Verifies case-insensitive lookup while preserving duplicate header fields.
 TEST(headers_preserve_duplicates_and_ignore_case) {
   chhttp::Headers headers{{"Content-Type", "text/plain"},
                           {"Set-Cookie", "a=1"},
@@ -403,6 +404,7 @@ TEST(headers_preserve_duplicates_and_ignore_case) {
   CHECK(!headers.erase("missing"));
 }
 
+// Verifies that invalid methods, header injection, and unsafe targets are never serialized.
 TEST(outbound_request_rejects_invalid_syntax) {
   chhttp::Client client(fixture().base_url);
   chhttp::Request bad_method;
@@ -423,6 +425,7 @@ TEST(outbound_request_rejects_invalid_syntax) {
   CHECK(!bad_target && bad_target.error().code == chhttp::Error::invalid_url);
 }
 
+// Verifies Unicode URL encoding, ordered query round-trips, and malformed escapes.
 TEST(url_and_query_round_trip) {
   const std::string input = "hello 世界 /?";
   const auto encoded = chhttp::url_encode(input);
@@ -439,6 +442,7 @@ TEST(url_and_query_round_trip) {
         chhttp::Params({{"empty", ""}, {"flag", ""}}));
 }
 
+// Verifies rejection of unsupported schemes, userinfo, malformed hosts, and invalid ports.
 TEST(invalid_url_authorities_and_ports_are_rejected) {
   for (const auto *url : {"ftp://127.0.0.1/", "http://:80/",
                           "http://user@127.0.0.1/", "http://127.0.0.1:/",
@@ -451,6 +455,7 @@ TEST(invalid_url_authorities_and_ports_are_rejected) {
   }
 }
 
+// Verifies multipart encoding and parsing of quoted names, filenames, and binary content.
 TEST(multipart_round_trip) {
   chhttp::MultipartForm input{
       {.name = "prompt", .content = "hello"},
@@ -468,6 +473,7 @@ TEST(multipart_round_trip) {
   CHECK(quoted_boundary && quoted_boundary->size() == 2);
 }
 
+// Verifies multipart failure paths for missing delimiters, broken headers, and part limits.
 TEST(multipart_rejects_malformed_and_excessive_parts) {
   CHECK(!chhttp::parse_multipart("", "text/plain"));
   CHECK(!chhttp::parse_multipart("", "multipart/form-data"));
@@ -489,6 +495,7 @@ TEST(multipart_rejects_malformed_and_excessive_parts) {
   CHECK(!excessive && excessive.error().code == chhttp::Error::multipart);
 }
 
+// Verifies that empty header values and original insertion order remain observable.
 TEST(headers_preserve_empty_values_and_insertion_order) {
   chhttp::Headers headers;
   headers.add("X-First", "");
@@ -504,6 +511,7 @@ TEST(headers_preserve_empty_values_and_insertion_order) {
   CHECK(headers.get("missing", "fallback") == "fallback");
 }
 
+// Verifies that set() collapses all case-insensitive duplicates without affecting other fields.
 TEST(headers_set_replaces_every_duplicate_in_place) {
   chhttp::Headers headers{{"X-Value", "one"},
                           {"x-value", "two"},
@@ -517,6 +525,7 @@ TEST(headers_set_replaces_every_duplicate_in_place) {
   CHECK(headers.size() == 3 && headers.get("x-new") == "new");
 }
 
+// Verifies lossless percent-encoding for every possible byte, including NUL and high bytes.
 TEST(url_encoding_round_trips_every_byte_value) {
   std::string bytes;
   bytes.reserve(256);
@@ -529,6 +538,7 @@ TEST(url_encoding_round_trips_every_byte_value) {
   CHECK(encoded.find('%') != std::string::npos);
 }
 
+// Verifies duplicate keys, empty keys/values, flag fields, and plus-as-space query semantics.
 TEST(query_parser_keeps_duplicate_empty_and_flag_fields) {
   const auto query = chhttp::parse_query("?a=1&a=&flag&=value&&plus=a+b");
   CHECK(query == chhttp::Params({{"a", "1"},
@@ -540,12 +550,14 @@ TEST(query_parser_keeps_duplicate_empty_and_flag_fields) {
         "a=1&a=&flag=&=value&plus=a+b");
 }
 
+// Verifies that client-side URL fragments are removed before constructing the HTTP target.
 TEST(url_fragments_are_never_sent_to_the_server) {
   chhttp::Client client(fixture().base_url);
   auto response = client.get("/hello?who=fragment#client-only");
   CHECK(response && response->body == "hello:fragment");
 }
 
+// Verifies relative redirect resolution, dot-segment normalization, query retention, and fragment removal.
 TEST(relative_redirects_normalize_dot_segments_and_fragments) {
   chhttp::Server server;
   server.get("/a/b/start", [](const chhttp::Request &,
@@ -564,6 +576,7 @@ TEST(relative_redirects_normalize_dot_segments_and_fragments) {
   server.stop();
 }
 
+// Verifies that an empty multipart form emits and accepts a valid closing delimiter.
 TEST(multipart_empty_form_round_trips) {
   auto [content_type, body] = chhttp::make_multipart({}, "empty-boundary");
   CHECK(body == "--empty-boundary--\r\n");
@@ -571,6 +584,7 @@ TEST(multipart_empty_form_round_trips) {
   CHECK(parsed && parsed->empty());
 }
 
+// Verifies preservation of custom part headers without duplicating reserved multipart fields.
 TEST(multipart_custom_headers_survive_round_trip) {
   chhttp::MultipartPart part{.name = "file",
                              .filename = "agent.bin",
@@ -587,6 +601,7 @@ TEST(multipart_custom_headers_survive_round_trip) {
   CHECK((*parsed)[0].content_type == "application/octet-stream");
 }
 
+// Verifies the RFC boundary length ceiling and rejection of unsupported boundary characters.
 TEST(multipart_boundary_length_and_character_limits) {
   const std::string maximum(70, 'b');
   auto [content_type, body] = chhttp::make_multipart({}, maximum);
@@ -603,6 +618,7 @@ TEST(multipart_boundary_length_and_character_limits) {
       "multipart/form-data; boundary=bad@boundary"));
 }
 
+// Verifies that legal multipart preamble and epilogue text does not become part data.
 TEST(multipart_accepts_preamble_and_epilogue) {
   const std::string body =
       "preamble ignored\r\n--b\r\n"
@@ -614,6 +630,7 @@ TEST(multipart_accepts_preamble_and_epilogue) {
   CHECK((*parsed)[0].name == "field" && (*parsed)[0].content == "value");
 }
 
+// Verifies Basic/Bearer helpers, a known Digest vector, and automatic Digest challenge retry.
 TEST(authentication_helpers_and_digest_retry) {
   CHECK(chhttp::basic_auth("Aladdin", "open sesame") ==
         "Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ==");
@@ -654,6 +671,7 @@ TEST(authentication_helpers_and_digest_retry) {
   CHECK(digest->body.find("uri=\"/digest\"") != std::string::npos);
 }
 
+// Verifies Digest rejection for wrong schemes, missing fields, bad quoting, algorithms, and qop.
 TEST(digest_helpers_reject_malformed_and_unsupported_challenges) {
   CHECK(!chhttp::parse_digest_challenge("Basic realm=\"x\""));
   CHECK(!chhttp::parse_digest_challenge("Digest realm=\"x\""));
@@ -669,6 +687,7 @@ TEST(digest_helpers_reject_malformed_and_unsupported_challenges) {
   CHECK(!chhttp::digest_auth("GET", "/", "u", "p", unsupported));
 }
 
+// Verifies session Digest algorithms, SHA-512/256, nonce formatting, and legacy no-qop mode.
 TEST(digest_helpers_support_session_and_sha512_256_variants) {
   for (const auto *algorithm : {"MD5-sess", "SHA-256-sess", "SHA-512-256"}) {
     chhttp::DigestChallenge challenge{.realm = "agents",
@@ -689,6 +708,7 @@ TEST(digest_helpers_support_session_and_sha512_256_variants) {
   CHECK(without_qop && without_qop->find("qop=") == std::string::npos);
 }
 
+// Verifies representative status phrases and case-insensitive known/unknown MIME detection.
 TEST(status_reason_and_mime_type_cover_known_and_unknown_values) {
   CHECK(chhttp::status_reason(100) == "Continue");
   CHECK(chhttp::status_reason(418) == "I'm a teapot");
@@ -700,6 +720,7 @@ TEST(status_reason_and_mime_type_cover_known_and_unknown_values) {
         "application/octet-stream");
 }
 
+// Verifies SSE wire formatting for multiline data, trailing empty lines, IDs, events, and retry.
 TEST(sse_formatter_handles_multiline_empty_and_metadata_fields) {
   const auto formatted = chhttp::format_sse(
       {.data = "one\ntwo\n",
@@ -712,6 +733,7 @@ TEST(sse_formatter_handles_multiline_empty_and_metadata_fields) {
   CHECK(chhttp::format_sse({.data = ""}) == "data: \n\n");
 }
 
+// Verifies colon parameters, wildcard captures, explicit regex routes, and negative matches.
 TEST(route_patterns_support_colon_wildcard_and_regular_expressions) {
   chhttp::Server server;
   server.get("/items/:id", [](const chhttp::Request &request,
@@ -736,6 +758,7 @@ TEST(route_patterns_support_colon_wildcard_and_regular_expressions) {
   server.stop();
 }
 
+// Verifies OPTIONS and extension-method routing through the unified request API.
 TEST(server_accepts_options_and_arbitrary_extension_methods) {
   chhttp::Server server;
   server.options("/resource", [](const chhttp::Request &,
@@ -765,6 +788,7 @@ TEST(server_accepts_options_and_arbitrary_extension_methods) {
   server.stop();
 }
 
+// Verifies HEAD-to-GET route fallback while retaining the generated Content-Length and omitting bytes.
 TEST(head_requests_fall_back_to_get_routes_without_a_body) {
   chhttp::Server server;
   server.get("/head", [](const chhttp::Request &request,
@@ -781,6 +805,7 @@ TEST(head_requests_fall_back_to_get_routes_without_a_body) {
   server.stop();
 }
 
+// Verifies exception translation and that logger exceptions cannot corrupt a completed response.
 TEST(custom_exception_handler_and_logger_are_isolated) {
   chhttp::Server server;
   std::atomic_int logged{0};
@@ -811,6 +836,7 @@ TEST(custom_exception_handler_and_logger_are_isolated) {
   server.stop();
 }
 
+// Verifies decoded path parameters, ordered duplicate queries, empty values, and helper fallbacks.
 TEST(request_helpers_expose_duplicate_query_and_decoded_path_parameters) {
   chhttp::Server server;
   server.get("/query/{id}", [](const chhttp::Request &request,
@@ -830,6 +856,7 @@ TEST(request_helpers_expose_duplicate_query_and_decoded_path_parameters) {
   server.stop();
 }
 
+// Verifies proxy-style absolute-form targets are parsed into the correct route path and query.
 TEST(server_accepts_absolute_form_request_targets) {
   chhttp::Server server;
   server.get("/absolute", [](const chhttp::Request &request,
@@ -847,6 +874,7 @@ TEST(server_accepts_absolute_form_request_targets) {
   server.stop();
 }
 
+// Verifies synchronous methods, parameterized routes, duplicate response headers, and HEAD behavior.
 TEST(sync_client_routes_methods_and_headers) {
   chhttp::Client client(fixture().base_url);
   auto hello = client.get("/hello?who=agent");
@@ -867,6 +895,7 @@ TEST(sync_client_routes_methods_and_headers) {
   CHECK(head && head->body.empty());
 }
 
+// Verifies pre/post middleware, custom 404 handling, exception responses, and redirect limits.
 TEST(middleware_error_exception_and_redirect) {
   chhttp::Client client(fixture().base_url);
   auto blocked = client.get("/blocked");
@@ -886,6 +915,7 @@ TEST(middleware_error_exception_and_redirect) {
   CHECK(!loop && loop.error().code == chhttp::Error::redirect_limit);
 }
 
+// Verifies server upload limits, client response limits, read timeouts, and invalid base URLs.
 TEST(payload_limits_timeouts_and_invalid_urls) {
   chhttp::ServerOptions limited_server_options;
   limited_server_options.max_body_size = 8;
@@ -921,6 +951,7 @@ TEST(payload_limits_timeouts_and_invalid_urls) {
   CHECK(!invalid && invalid.error().code == chhttp::Error::invalid_url);
 }
 
+// Verifies that automatic Authorization credentials are stripped on cross-origin redirects.
 TEST(cross_origin_redirect_strips_authorization) {
   chhttp::Server target;
   target.get("/target", [](const chhttp::Request &request,
@@ -949,6 +980,7 @@ TEST(cross_origin_redirect_strips_authorization) {
   target.stop();
 }
 
+// Verifies transparent codec decompression and callback-streamed chunk delivery without body buffering.
 TEST(compression_and_stream_callbacks) {
   chhttp::Client client(fixture().base_url);
   auto large = client.get("/large");
@@ -968,6 +1000,7 @@ TEST(compression_and_stream_callbacks) {
   }
 }
 
+// Verifies mounted files, cache headers, byte ranges, unsatisfied ranges, and traversal prevention.
 TEST(static_files_and_ranges) {
   chhttp::Client client(fixture().base_url);
   auto file = client.get("/static/asset.txt");
@@ -993,6 +1026,7 @@ TEST(static_files_and_ranges) {
   CHECK(traversal && traversal->status == 404);
 }
 
+// Verifies automatic server-side multipart parsing into ordered request file parts.
 TEST(multipart_server_parsing) {
   chhttp::MultipartForm parts{{.name = "a", .content = "one"},
                               {.name = "b", .content = "two"}};
@@ -1002,6 +1036,7 @@ TEST(multipart_server_parsing) {
   CHECK(response && response->body == "a=one;b=two;");
 }
 
+// Verifies native chunk framing, trailers, pipelining, 100-continue, HTTP/1.0, and no-body statuses.
 TEST(native_http_protocol_framing_pipeline_and_expect) {
   chhttp::Server server;
   server.post("/raw", [](const chhttp::Request &request,
@@ -1080,6 +1115,7 @@ TEST(native_http_protocol_framing_pipeline_and_expect) {
   server.stop();
 }
 
+// Verifies opt-in HTTP/1.0 keep-alive across two pipelined requests and an explicit final close.
 TEST(http10_keep_alive_can_process_multiple_pipelined_requests) {
   chhttp::Server server;
   server.get("/one", [](const chhttp::Request &,
@@ -1103,6 +1139,7 @@ TEST(http10_keep_alive_can_process_multiple_pipelined_requests) {
   server.stop();
 }
 
+// Verifies that the configured keep-alive request cap closes a connection at the exact boundary.
 TEST(server_keep_alive_request_cap_closes_after_exact_limit) {
   chhttp::ServerOptions options;
   options.keep_alive_max_requests = 2;
@@ -1128,6 +1165,7 @@ TEST(server_keep_alive_request_cap_closes_after_exact_limit) {
   server.stop();
 }
 
+// Verifies that Content-Length zero reaches the handler as a valid empty request body.
 TEST(content_length_zero_is_a_valid_empty_request_body) {
   chhttp::Server server;
   server.post("/", [](const chhttp::Request &request,
@@ -1144,6 +1182,7 @@ TEST(content_length_zero_is_a_valid_empty_request_body) {
   server.stop();
 }
 
+// Verifies that an immediate terminal chunk represents a valid empty request body.
 TEST(chunked_zero_chunk_is_a_valid_empty_request_body) {
   chhttp::Server server;
   server.post("/", [](const chhttp::Request &request,
@@ -1161,6 +1200,7 @@ TEST(chunked_zero_chunk_is_a_valid_empty_request_body) {
   server.stop();
 }
 
+// Verifies acceptance of syntactically valid token and quoted chunk extensions.
 TEST(chunk_extensions_accept_valid_quoted_and_token_values) {
   chhttp::Server server;
   server.post("/", [](const chhttp::Request &request,
@@ -1178,6 +1218,7 @@ TEST(chunk_extensions_accept_valid_quoted_and_token_values) {
   server.stop();
 }
 
+// Verifies that duplicate non-framing trailer fields are appended in wire order.
 TEST(chunked_trailers_preserve_duplicate_field_values) {
   chhttp::Server server;
   server.post("/", [](const chhttp::Request &request,
@@ -1197,6 +1238,7 @@ TEST(chunked_trailers_preserve_duplicate_field_values) {
   server.stop();
 }
 
+// Verifies trimming of legal spaces and tabs surrounding an inbound header value.
 TEST(inbound_header_optional_whitespace_is_trimmed) {
   chhttp::Server server;
   server.get("/", [](const chhttp::Request &request,
@@ -1212,6 +1254,7 @@ TEST(inbound_header_optional_whitespace_is_trimmed) {
   server.stop();
 }
 
+// Verifies rejection of control-byte header injection before request dispatch.
 TEST(inbound_header_control_characters_are_rejected) {
   chhttp::Server server;
   server.get("/", [](const chhttp::Request &, chhttp::Response &response) {
@@ -1228,6 +1271,7 @@ TEST(inbound_header_control_characters_are_rejected) {
   server.stop();
 }
 
+// Verifies rejection of spaces, tabs, and separator characters in inbound header names.
 TEST(inbound_header_names_with_whitespace_are_rejected) {
   chhttp::Server server;
   server.get("/", [](const chhttp::Request &, chhttp::Response &response) {
@@ -1245,6 +1289,7 @@ TEST(inbound_header_names_with_whitespace_are_rejected) {
   server.stop();
 }
 
+// Verifies strict unsigned Content-Length parsing, conflict detection, and overflow handling.
 TEST(content_length_rejects_signs_suffixes_conflicts_and_overflow) {
   chhttp::Server server;
   server.post("/", [](const chhttp::Request &, chhttp::Response &response) {
@@ -1263,6 +1308,7 @@ TEST(content_length_rejects_signs_suffixes_conflicts_and_overflow) {
   server.stop();
 }
 
+// Verifies request-smuggling defenses for conflicting framing, duplicate Host, and empty tokens.
 TEST(native_http_protocol_rejects_request_smuggling) {
   chhttp::Server server;
   server.post("/", [](const chhttp::Request &,
@@ -1302,6 +1348,7 @@ TEST(native_http_protocol_rejects_request_smuggling) {
   server.stop();
 }
 
+// Verifies bytewise parsing plus malformed lines, expectations, framing, header, and body limits.
 TEST(native_http_server_incremental_syntax_and_size_boundaries) {
   chhttp::ServerOptions options;
   options.worker_threads = 1;
@@ -1377,6 +1424,7 @@ TEST(native_http_server_incremental_syntax_and_size_boundaries) {
   server.stop();
 }
 
+// Verifies rejection of transfer-coding parameters, chains, duplicates, and non-chunked codings.
 TEST(transfer_encoding_rejects_parameters_and_multiple_codings) {
   chhttp::Server server;
   server.post("/", [](const chhttp::Request &, chhttp::Response &response) {
@@ -1395,6 +1443,7 @@ TEST(transfer_encoding_rejects_parameters_and_multiple_codings) {
   server.stop();
 }
 
+// Verifies the chunk-size line length guard before numeric conversion or allocation.
 TEST(chunk_size_lines_over_16kib_are_rejected) {
   chhttp::Server server;
   server.post("/", [](const chhttp::Request &, chhttp::Response &response) {
@@ -1410,6 +1459,7 @@ TEST(chunk_size_lines_over_16kib_are_rejected) {
   server.stop();
 }
 
+// Verifies that accumulated chunk trailers cannot bypass the configured header-size limit.
 TEST(chunked_trailers_obey_the_header_size_limit) {
   chhttp::ServerOptions options;
   options.max_header_size = 128;
@@ -1428,6 +1478,7 @@ TEST(chunked_trailers_obey_the_header_size_limit) {
   server.stop();
 }
 
+// Verifies that a HEAD client never consumes body bytes even when a peer sends them illegally.
 TEST(head_clients_ignore_illegal_wire_bodies) {
   RawResponseServer server(
       "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n"
@@ -1440,6 +1491,7 @@ TEST(head_clients_ignore_illegal_wire_bodies) {
   CHECK(response->headers.get("Content-Length") == "4");
 }
 
+// Verifies that 205 and 304 responses remain bodyless despite misleading wire framing.
 TEST(no_body_statuses_ignore_illegal_wire_bodies) {
   for (const int status : {205, 304}) {
     auto response = fetch_raw_response(
@@ -1451,6 +1503,7 @@ TEST(no_body_statuses_ignore_illegal_wire_bodies) {
   }
 }
 
+// Verifies both fixed-length zero and terminal-chunk-only response bodies.
 TEST(zero_length_and_empty_chunked_responses_are_valid) {
   auto fixed = fetch_raw_response(
       "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n"
@@ -1463,6 +1516,7 @@ TEST(zero_length_and_empty_chunked_responses_are_valid) {
   CHECK(chunked && chunked->body.empty());
 }
 
+// Verifies that response header control bytes are reported as protocol errors.
 TEST(client_rejects_response_header_control_characters) {
   std::string response = "HTTP/1.1 200 OK\r\nX-Bad: value";
   response.push_back('\x01');
@@ -1471,6 +1525,7 @@ TEST(client_rejects_response_header_control_characters) {
   CHECK(!result && result.error().code == chhttp::Error::protocol);
 }
 
+// Verifies client rejection of empty and control-character chunk extensions.
 TEST(client_rejects_empty_and_invalid_chunk_extensions) {
   for (const auto &line : {std::string("1;\r\na\r\n0\r\n\r\n"),
                            std::string("1;") + std::string(1, '\x01') +
@@ -1484,6 +1539,7 @@ TEST(client_rejects_empty_and_invalid_chunk_extensions) {
   }
 }
 
+// Verifies early body-limit enforcement from a declared chunk size before payload buffering.
 TEST(client_body_limit_applies_before_reading_large_chunks) {
   chhttp::ClientOptions options;
   options.max_response_body_size = 4;
@@ -1494,6 +1550,7 @@ TEST(client_body_limit_applies_before_reading_large_chunks) {
   CHECK(!response && response.error().code == chhttp::Error::body_too_large);
 }
 
+// Verifies bytewise callback ordering, empty buffered bodies, totals, and monotonic progress.
 TEST(stream_callbacks_preserve_byte_order_and_monotonic_progress) {
   const std::string body = "abcdefghijklmnopqrstuvwxyz";
   RawResponseServer server(
@@ -1520,6 +1577,7 @@ TEST(stream_callbacks_preserve_byte_order_and_monotonic_progress) {
   CHECK(std::ranges::is_sorted(progress));
 }
 
+// Verifies bytewise chunk/trailer parsing and rejection of ambiguous response framing.
 TEST(native_http_client_incremental_chunked_and_malformed_response) {
   {
     RawResponseServer server(
@@ -1550,6 +1608,7 @@ TEST(native_http_client_incremental_chunked_and_malformed_response) {
   }
 }
 
+// Verifies interim 103 handling, EOF-delimited HTTP/1.0, duplicate lengths, and 204 semantics.
 TEST(native_http_client_interim_close_delimited_and_no_body_responses) {
   auto interim = fetch_raw_response(
       "HTTP/1.1 103 Early Hints\r\nLink: </style.css>; rel=preload\r\n\r\n"
@@ -1575,6 +1634,7 @@ TEST(native_http_client_interim_close_delimited_and_no_body_responses) {
   CHECK(no_content && no_content->status == 204 && no_content->body.empty());
 }
 
+// Verifies client failure for bad versions/statuses/framing/chunks/trailers/truncation and huge headers.
 TEST(native_http_client_rejects_malformed_and_truncated_responses) {
   const std::vector<std::string> malformed{
       "HTTP/2 200 OK\r\nConnection: close\r\n\r\n",
@@ -1605,6 +1665,7 @@ TEST(native_http_client_rejects_malformed_and_truncated_responses) {
         oversized_headers.error().code == chhttp::Error::protocol);
 }
 
+// Verifies cancellation from data/progress callbacks and decompression failure propagation.
 TEST(response_callbacks_can_cancel_body_and_progress) {
   chhttp::Client client(fixture().base_url);
   std::size_t data_calls = 0;
@@ -1639,6 +1700,7 @@ TEST(response_callbacks_can_cancel_body_and_progress) {
 #endif
 }
 
+// Verifies that an already-set per-request token cancels before connection acquisition.
 TEST(pre_cancelled_request_tokens_avoid_network_work) {
   auto cancellation = std::make_shared<std::atomic_bool>(true);
   chhttp::AsyncClient client(fixture().base_url);
@@ -1647,6 +1709,7 @@ TEST(pre_cancelled_request_tokens_avoid_network_work) {
   CHECK(!response && response.error().code == chhttp::Error::cancelled);
 }
 
+// Verifies that a per-request token set during I/O prevents delivery of the completed response.
 TEST(request_tokens_cancel_a_response_while_it_is_inflight) {
   auto cancellation = std::make_shared<std::atomic_bool>(false);
   chhttp::AsyncClient client(fixture().base_url);
@@ -1658,6 +1721,7 @@ TEST(request_tokens_cancel_a_response_while_it_is_inflight) {
   CHECK(!response && response.error().code == chhttp::Error::cancelled);
 }
 
+// Verifies that follow_redirects=false exposes the original status and Location unchanged.
 TEST(disabled_redirect_following_returns_the_original_response) {
   chhttp::ClientOptions options;
   options.follow_redirects = false;
@@ -1667,6 +1731,7 @@ TEST(disabled_redirect_following_returns_the_original_response) {
   CHECK(response->headers.get("Location") == "/hello?who=redirected");
 }
 
+// Verifies POST-to-GET rewriting for 302 and method/body preservation for 307.
 TEST(post_redirects_rewrite_302_and_preserve_307_requests) {
   chhttp::Server server;
   server.post("/start302", [](const chhttp::Request &,
@@ -1695,6 +1760,7 @@ TEST(post_redirects_rewrite_302_and_preserve_307_requests) {
   server.stop();
 }
 
+// Verifies encoding q-values, identity fallback, and rejection of corrupt compressed uploads.
 TEST(compression_negotiation_honors_quality_and_request_errors) {
 #ifdef CHHTTP_HAS_COMPRESSION
   chhttp::ServerOptions server_options;
@@ -1730,6 +1796,7 @@ TEST(compression_negotiation_honors_quality_and_request_errors) {
 #endif
 }
 
+// Verifies directory indexes, unknown MIME fallback, and ranged HEAD metadata without body bytes.
 TEST(static_index_unknown_mime_head_and_range_boundaries) {
   std::ofstream(fixture().root / "index.html", std::ios::binary) << "index";
   std::ofstream(fixture().root / "blob.agentdata", std::ios::binary) << "blob";
@@ -1746,6 +1813,7 @@ TEST(static_index_unknown_mime_head_and_range_boundaries) {
   CHECK(head->headers.get("Content-Range") == "bytes 2-4/10");
 }
 
+// Verifies SSE rejection of incorrect Content-Type and non-success endpoint status.
 TEST(sse_clients_reject_non_event_stream_and_non_200_endpoints) {
   {
     RawResponseServer server(
@@ -1771,6 +1839,7 @@ TEST(sse_clients_reject_non_event_stream_and_non_200_endpoints) {
   }
 }
 
+// Verifies single-connect exclusivity and safe cancellation of an active SSE stream.
 TEST(sse_rejects_duplicate_connect_and_stops_an_active_stream) {
   chhttp::Server server;
   std::atomic_bool entered{false};
@@ -1807,6 +1876,7 @@ TEST(sse_rejects_duplicate_connect_and_stops_an_active_stream) {
   server.stop();
 }
 
+// Verifies WebSocket scheme, subprotocol-token, and unsupported-version handshake failures.
 TEST(websocket_clients_reject_invalid_urls_and_subprotocol_tokens) {
   auto wrong_scheme =
       chhttp::AsyncWebSocketClient::connect(fixture().base_url + "/ws").get();
@@ -1825,6 +1895,7 @@ TEST(websocket_clients_reject_invalid_urls_and_subprotocol_tokens) {
   CHECK(bad_version.starts_with("HTTP/1.1 404 Not Found\r\n"));
 }
 
+// Verifies automatic pong handling and lossless binary frames containing NUL and high bytes.
 TEST(websocket_binary_and_ping_pong_frames_round_trip) {
   chhttp::Server server;
   server.websocket(
@@ -1862,6 +1933,7 @@ TEST(websocket_binary_and_ping_pong_frames_round_trip) {
   server.stop();
 }
 
+// Exercises four batches of 256 concurrent async requests and validates every response independently.
 TEST(stress_async_high_concurrency) {
   chhttp::ClientOptions options;
   options.connection_pool_size = 64;
@@ -1891,6 +1963,7 @@ TEST(stress_async_high_concurrency) {
   }
 }
 
+// Exercises eight blocking clients in parallel to detect cross-thread response corruption.
 TEST(stress_multithreaded_sync_request_integrity) {
   constexpr int thread_count = 8;
   constexpr int requests_per_thread = 100;
@@ -1916,6 +1989,7 @@ TEST(stress_multithreaded_sync_request_integrity) {
   CHECK(failures.load() == 0);
 }
 
+// Exercises repeated server-enforced keep-alive closures and transparent idempotent reconnection.
 TEST(stress_keep_alive_limit_reconnects_transparently) {
   chhttp::ServerOptions server_options;
   server_options.worker_threads = 2;
@@ -1939,6 +2013,7 @@ TEST(stress_keep_alive_limit_reconnects_transparently) {
   server.stop();
 }
 
+// Exercises cancellation of 128 active requests followed by successful reuse of the same client.
 TEST(stress_cancellation_storm_and_client_recovery) {
   chhttp::ClientOptions options;
   options.connection_pool_size = 32;
@@ -1958,6 +2033,7 @@ TEST(stress_cancellation_storm_and_client_recovery) {
   CHECK(recovered && recovered->body == "hello:recovered");
 }
 
+// Exercises repeated construction, ephemeral binding, request handling, and clean server shutdown.
 TEST(stress_server_restart_cycles) {
   for (int cycle = 0; cycle != 30; ++cycle) {
     chhttp::ServerOptions options;
@@ -1977,6 +2053,7 @@ TEST(stress_server_restart_cycles) {
   }
 }
 
+// Verifies sequential connection reuse, global cancellation, and safe client destruction in flight.
 TEST(connection_pool_and_active_cancellation) {
   chhttp::Client client(fixture().base_url);
   auto first = client.get("/connection");
@@ -2002,6 +2079,7 @@ TEST(connection_pool_and_active_cancellation) {
         safely_cancelled.error().code == chhttp::Error::cancelled);
 }
 
+// Verifies that graceful stop waits for one accepted asynchronous response to finish.
 TEST(graceful_shutdown_drains_inflight_response) {
   chhttp::ServerOptions server_options;
   server_options.shutdown_timeout = std::chrono::seconds(2);
@@ -2029,6 +2107,7 @@ TEST(graceful_shutdown_drains_inflight_response) {
   CHECK(elapsed >= std::chrono::milliseconds(50));
 }
 
+// Exercises graceful shutdown while 64 handlers are simultaneously blocked and then released.
 TEST(stress_graceful_shutdown_drains_many_inflight_responses) {
   chhttp::ServerOptions server_options;
   server_options.worker_threads = 2;
@@ -2077,6 +2156,7 @@ TEST(stress_graceful_shutdown_drains_many_inflight_responses) {
   }
 }
 
+// Verifies absolute-form proxy requests and automatic Basic Proxy-Authorization generation.
 TEST(http_proxy_request_format_and_authentication) {
   chhttp::Server proxy;
   proxy.get("^.*$", [](const chhttp::Request &request,
@@ -2098,6 +2178,7 @@ TEST(http_proxy_request_format_and_authentication) {
   proxy.stop();
 }
 
+// Verifies WebSocket negotiation, UTF-8 rejection, echo, failed upgrade, fragmentation, and ping interleave.
 TEST(websocket_echo_and_subprotocol) {
   auto connected = chhttp::AsyncWebSocketClient::connect(
       "ws://127.0.0.1:" + std::to_string(fixture().server.port()) + "/ws",
@@ -2132,6 +2213,7 @@ TEST(websocket_echo_and_subprotocol) {
   CHECK(fragmented.find("echo:hello") != std::string::npos);
 }
 
+// Exercises 24 concurrent WebSockets with extended-length frames, including a 128 KiB payload.
 TEST(stress_websocket_concurrent_large_frames) {
   chhttp::Server server;
   server.websocket(
@@ -2181,6 +2263,7 @@ TEST(stress_websocket_concurrent_large_frames) {
   server.stop();
 }
 
+// Verifies end-to-end SSE comments, named events, multiline data, IDs, and retry metadata.
 TEST(sse_parser_and_stream) {
   chhttp::AsyncClient client(fixture().base_url);
   chhttp::SseClient events(client, "/sse", {}, {.reconnect = false});
@@ -2195,6 +2278,7 @@ TEST(sse_parser_and_stream) {
   CHECK(received[2].id == "2");
 }
 
+// Verifies bytewise SSE parsing with BOM, CRLF, comments, empty IDs, and EOF dispatch.
 TEST(sse_parser_handles_bytewise_bom_crlf_and_final_event) {
   const std::string body =
       std::string("\xEF\xBB\xBF") +
@@ -2223,6 +2307,7 @@ TEST(sse_parser_handles_bytewise_bom_crlf_and_final_event) {
   CHECK(received[1].id.empty());
 }
 
+// Verifies that consumer exceptions become SSE errors instead of escaping the I/O coroutine.
 TEST(sse_callback_failures_are_reported_without_escape) {
   chhttp::AsyncClient client(fixture().base_url);
   chhttp::SseClient events(client, "/sse", {}, {.reconnect = false});
@@ -2235,6 +2320,7 @@ TEST(sse_callback_failures_are_reported_without_escape) {
   CHECK(!events.running());
 }
 
+// Exercises 3,000 sequential requests while asserting reuse of one client TCP source port.
 TEST(stress_thousands_of_requests_reuse_one_keep_alive_connection) {
   chhttp::ServerOptions options;
   options.keep_alive_max_requests = 5000;
@@ -2256,6 +2342,7 @@ TEST(stress_thousands_of_requests_reuse_one_keep_alive_connection) {
   server.stop();
 }
 
+// Exercises concurrent GET and POST operations through one async client without method/body mixups.
 TEST(stress_mixed_methods_share_one_async_client) {
   chhttp::ClientOptions options;
   options.connection_pool_size = 64;
@@ -2280,6 +2367,7 @@ TEST(stress_mixed_methods_share_one_async_client) {
   }
 }
 
+// Exercises 32 concurrent 256 KiB uploads and verifies size plus endpoint marker bytes.
 TEST(stress_concurrent_large_uploads_preserve_body_integrity) {
   chhttp::Server server;
   server.post("/upload", [](const chhttp::Request &request,
@@ -2312,6 +2400,7 @@ TEST(stress_concurrent_large_uploads_preserve_body_integrity) {
   server.stop();
 }
 
+// Exercises 128 concurrent streamed downloads with isolated callback destinations.
 TEST(stress_concurrent_stream_callbacks_do_not_cross_contaminate) {
   chhttp::AsyncClient client(fixture().base_url);
   constexpr int count = 128;
@@ -2333,6 +2422,7 @@ TEST(stress_concurrent_stream_callbacks_do_not_cross_contaminate) {
   }
 }
 
+// Exercises 96 in-flight requests where alternating tokens cancel without affecting neighbors.
 TEST(stress_individual_cancellation_tokens_isolate_requests) {
   chhttp::AsyncClient client(fixture().base_url);
   constexpr int count = 96;
@@ -2356,6 +2446,7 @@ TEST(stress_individual_cancellation_tokens_isolate_requests) {
   }
 }
 
+// Exercises destruction of 80 async clients with outstanding work to detect lifetime races.
 TEST(stress_async_client_construction_and_destruction_cancels_safely) {
   for (int iteration = 0; iteration != 80; ++iteration) {
     chhttp::Task<chhttp::ResponseResult> pending;
@@ -2368,6 +2459,7 @@ TEST(stress_async_client_construction_and_destruction_cancels_safely) {
   }
 }
 
+// Exercises 12 independent servers and clients concurrently to detect runtime state leakage.
 TEST(stress_multiple_servers_and_clients_run_in_parallel) {
   constexpr int server_count = 12;
   constexpr int requests_per_server = 50;
@@ -2402,6 +2494,7 @@ TEST(stress_multiple_servers_and_clients_run_in_parallel) {
   for (auto &server : servers) server->stop();
 }
 
+// Exercises 24 simultaneous SSE clients and verifies each receives its own complete event sequence.
 TEST(stress_many_sse_clients_receive_complete_independent_streams) {
   constexpr int count = 24;
   std::array<int, count> received{};
@@ -2428,6 +2521,7 @@ TEST(stress_many_sse_clients_receive_complete_independent_streams) {
   }
 }
 
+// Exercises 48 simultaneous WebSocket handshakes, echoes, close frames, and runtime teardown.
 TEST(stress_websocket_connection_churn) {
   chhttp::Server server;
   server.websocket(
@@ -2464,6 +2558,7 @@ TEST(stress_websocket_connection_churn) {
   server.stop();
 }
 
+// Exercises 200 ordered WebSocket round-trips on one connection, ending with a 70 KiB frame.
 TEST(stress_websocket_many_messages_on_one_connection) {
   constexpr int count = 200;
   chhttp::Server server;
@@ -2492,6 +2587,7 @@ TEST(stress_websocket_many_messages_on_one_connection) {
   server.stop();
 }
 
+// Exercises 200 concurrent smuggling attempts and verifies the server remains healthy afterward.
 TEST(stress_malformed_request_flood_remains_available) {
   chhttp::Server server;
   server.get("/health", [](const chhttp::Request &,
@@ -2595,6 +2691,7 @@ CertificateFiles make_certificate() {
   return files;
 }
 
+// Verifies HTTPS trust modes, DNS/IP SAN checks, TLS keep-alive, rejection, and secure WebSockets.
 TEST(https_client_server) {
   auto certificate = make_certificate();
   chhttp::ServerOptions server_options;
@@ -2665,6 +2762,7 @@ TEST(https_client_server) {
   server.stop();
 }
 
+// Exercises 96 concurrent HTTPS requests with independently validated 32 KiB response bodies.
 TEST(stress_https_async_concurrency_and_large_payloads) {
   auto certificate = make_certificate();
   chhttp::ServerOptions server_options;
@@ -2703,6 +2801,7 @@ TEST(stress_https_async_concurrency_and_large_payloads) {
   server.stop();
 }
 
+// Exercises 64 independently constructed TLS clients and handshakes across eight threads.
 TEST(stress_tls_client_context_and_handshake_churn) {
   auto certificate = make_certificate();
   chhttp::ServerOptions server_options;
@@ -2738,6 +2837,7 @@ TEST(stress_tls_client_context_and_handshake_churn) {
   server.stop();
 }
 
+// Verifies mTLS rejection without a certificate and success with a trusted client identity.
 TEST(mtls_requires_client_certificate) {
   auto certificate = make_certificate();
   chhttp::ServerOptions server_options;
