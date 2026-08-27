@@ -892,9 +892,9 @@ private:
 
 } // namespace
 
-Task<Result<Request>> read_request(const std::shared_ptr<Connection> &connection,
-                                   std::string &buffer,
-                                   const HttpReadOptions &options) {
+Task<Result<RequestHeadResult>>
+read_request_head(const std::shared_ptr<Connection> &connection,
+                  std::string &buffer, const HttpReadOptions &options) {
   auto bytes = co_await read_head_bytes(connection, buffer, options);
   if (!bytes) co_return bytes.error();
   auto head = parse_head(*bytes);
@@ -944,17 +944,121 @@ Task<Result<Request>> read_request(const std::shared_ptr<Connection> &connection
   request.path = std::move(*decoded_path);
   if (query != std::string::npos)
     request.query = parse_query(std::string_view(routing_target).substr(query + 1));
+  bool expect_continue = false;
   if (head->headers.contains("Expect")) {
     if (!has_token(head->headers, "Expect", "100-continue"))
       co_return ErrorInfo{Error::protocol, "Unsupported HTTP expectation"};
+    expect_continue = true;
+  }
+  RequestBodyState body_state{
+      .headers = std::move(head->headers),
+      .content_length = head->content_length,
+      .chunked = head->chunked,
+      .expect_continue = expect_continue};
+  request.headers = body_state.headers;
+  co_return RequestHeadResult{std::move(request), std::move(body_state)};
+}
+
+Task<Result<std::string>>
+read_request_body(const std::shared_ptr<Connection> &connection,
+                  std::string &buffer, RequestBodyState &state,
+                  const HttpReadOptions &options) {
+  if (state.expect_continue && !state.continue_sent) {
     auto continued = co_await connection->write("HTTP/1.1 100 Continue\r\n\r\n",
                                                  options.read_timeout);
     if (continued) co_return continued;
+    state.continue_sent = true;
   }
-  auto body = co_await read_body(connection, buffer, *head, options, false, false);
+  ParsedHead head{
+      .headers = state.headers,
+      .content_length = state.content_length,
+      .chunked = state.chunked};
+  HttpReadOptions body_options = options;
+  const auto encoding = state.headers.get("Content-Encoding");
+  const bool decode = options.auto_decompress && !encoding.empty();
+  std::unique_ptr<StreamingDecoder> decoder;
+  std::string decoded_body;
+  std::uint64_t decoded_received = 0;
+  ErrorInfo decode_error;
+  const auto consume_decoded = [&](std::string_view data) -> Task<ErrorInfo> {
+    if (data.empty()) co_return ErrorInfo{};
+    if (data.size() > options.max_body_size ||
+        decoded_received > options.max_body_size - data.size())
+      co_return ErrorInfo{Error::body_too_large,
+                          "Decoded request body exceeds configured limit"};
+    decoded_received += data.size();
+    try {
+      if (options.on_data) {
+        if (!options.on_data(data))
+          co_return ErrorInfo{Error::cancelled,
+                              "Request body callback cancelled the transfer"};
+      } else if (options.on_data_async) {
+        if (!co_await options.on_data_async(data))
+          co_return ErrorInfo{
+              Error::cancelled,
+              "Request async body callback cancelled the transfer"};
+      } else {
+        decoded_body.append(data);
+      }
+      if (options.on_progress &&
+          !options.on_progress(decoded_received, 0))
+        co_return ErrorInfo{Error::cancelled,
+                            "Request progress callback cancelled the transfer"};
+    } catch (const std::exception &exception) {
+      co_return ErrorInfo{Error::internal,
+                          "Request body callback failed: " +
+                              std::string(exception.what())};
+    } catch (...) {
+      co_return ErrorInfo{Error::internal, "Request body callback failed"};
+    }
+    co_return ErrorInfo{};
+  };
+  if (decode) {
+    auto created = StreamingDecoder::create(encoding, options.max_body_size);
+    if (!created) co_return created.error();
+    decoder = std::move(*created);
+    body_options.on_data = {};
+    body_options.on_data_async = [&](std::string_view data) -> Task<bool> {
+      auto decoded = decoder->feed(data, false);
+      if (!decoded) {
+        decode_error = decoded.error();
+        co_return false;
+      }
+      auto consumed = co_await consume_decoded(*decoded);
+      if (consumed) {
+        decode_error = std::move(consumed);
+        co_return false;
+      }
+      co_return true;
+    };
+    body_options.on_progress = {};
+  }
+  auto body = co_await read_body(connection, buffer, head, body_options, false,
+                                 false);
+  if (!body) co_return decode_error ? decode_error : body.error();
+  state.headers = std::move(head.headers);
+  if (decode) {
+    auto tail = decoder->feed({}, true);
+    if (!tail) co_return tail.error();
+    if (auto consumed = co_await consume_decoded(*tail); consumed)
+      co_return consumed;
+    state.headers.erase("Content-Encoding");
+    state.headers.erase("Content-Length");
+    co_return decoded_body;
+  }
+  co_return body;
+}
+
+Task<Result<Request>> read_request(const std::shared_ptr<Connection> &connection,
+                                   std::string &buffer,
+                                   const HttpReadOptions &options) {
+  auto head = co_await read_request_head(connection, buffer, options);
+  if (!head) co_return head.error();
+  auto body = co_await read_request_body(connection, buffer, head->body, options);
   if (!body) co_return body.error();
+  auto request = std::move(head->request);
   request.body = std::move(*body);
-  request.headers = std::move(head->headers);
+  request.headers = std::move(head->body.headers);
   co_return request;
 }
 
@@ -1193,7 +1297,7 @@ Task<ErrorInfo> write_request(const std::shared_ptr<Connection> &connection,
   }
   if (!headers.contains("Connection"))
     headers.set("Connection", request.keep_alive ? "keep-alive" : "close");
-  if (!headers.contains("User-Agent")) headers.set("User-Agent", "chhttp/0.3");
+  if (!headers.contains("User-Agent")) headers.set("User-Agent", "chhttp/0.4");
   auto output = serialize_head(request.method + " " + std::string(wire_target) +
                                    (request.version == 10 ? " HTTP/1.0" : " HTTP/1.1"),
                                headers);
@@ -1230,7 +1334,7 @@ Task<ErrorInfo> write_response_head(
       response.status < 100 || response.status > 999)
     co_return ErrorInfo{Error::protocol, "Invalid outbound HTTP response line"};
   Headers headers = response.headers;
-  if (!headers.contains("Server")) headers.set("Server", "chhttp/0.3");
+  if (!headers.contains("Server")) headers.set("Server", "chhttp/0.4");
   const bool keep = request.keep_alive && response.keep_alive;
   headers.set("Connection", keep ? "keep-alive" : "close");
   if ((response.status >= 100 && response.status < 200) ||

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <array>
 #include <chrono>
 #include <condition_variable>
 #include <coroutine>
@@ -381,6 +382,154 @@ private:
   std::shared_ptr<Sink> sink_;
 };
 
+using AsyncBodyConsumer =
+    std::function<Task<bool>(std::string_view)>;
+using BodyConsumer = std::function<bool(std::string_view)>;
+
+struct StoredBody {
+  std::filesystem::path path;
+  std::uint64_t size{0};
+};
+
+// A single-use, pull-owned server request body. consume() does not read ahead
+// while its awaited callback is suspended, so the callback is the backpressure
+// boundary. Chunk views remain valid only until the callback returns.
+class RequestBodyStream {
+public:
+  struct Source {
+    virtual ~Source() = default;
+    virtual Task<ErrorInfo> consume(AsyncBodyConsumer consumer) = 0;
+    virtual void cancel() noexcept = 0;
+    [[nodiscard]] virtual std::optional<std::uint64_t>
+    content_length() const noexcept = 0;
+    [[nodiscard]] virtual std::uint64_t received() const noexcept = 0;
+    [[nodiscard]] virtual bool consumed() const noexcept = 0;
+    [[nodiscard]] virtual bool complete() const noexcept = 0;
+  };
+
+  RequestBodyStream() = default;
+  explicit RequestBodyStream(std::shared_ptr<Source> source)
+      : source_(std::move(source)) {}
+  Task<ErrorInfo> consume(AsyncBodyConsumer consumer);
+  Task<ErrorInfo> consume(BodyConsumer consumer);
+  Task<ErrorInfo> discard();
+  Task<Result<StoredBody>> save_to_file(std::filesystem::path path);
+  Task<Result<StoredBody>>
+  save_to_temp(std::filesystem::path directory = {});
+  void cancel() noexcept;
+  [[nodiscard]] std::optional<std::uint64_t> content_length() const noexcept;
+  [[nodiscard]] std::uint64_t received() const noexcept;
+  [[nodiscard]] bool consumed() const noexcept;
+  [[nodiscard]] bool complete() const noexcept;
+
+private:
+  std::shared_ptr<Source> source_;
+};
+
+struct MultipartParserOptions {
+  std::size_t max_parts{1024};
+  std::size_t max_header_size{64 * 1024};
+  std::uint64_t max_part_size{128ull * 1024 * 1024};
+  std::uint64_t max_total_size{128ull * 1024 * 1024};
+};
+
+enum class MultipartEventType { part_begin, part_data, part_end };
+
+struct MultipartEvent {
+  MultipartEventType type{MultipartEventType::part_data};
+  std::size_t part_index{0};
+  MultipartPart part;
+  std::string data;
+};
+
+// An incremental multipart/form-data parser. feed() may return several owned
+// events; it retains at most boundary/header look-behind bytes between calls.
+class MultipartParser {
+public:
+  explicit MultipartParser(std::string content_type,
+                           MultipartParserOptions options = {});
+  ~MultipartParser();
+  MultipartParser(MultipartParser &&) noexcept;
+  MultipartParser &operator=(MultipartParser &&) noexcept;
+  MultipartParser(const MultipartParser &) = delete;
+  MultipartParser &operator=(const MultipartParser &) = delete;
+
+  Result<std::vector<MultipartEvent>> feed(std::string_view data);
+  Result<std::vector<MultipartEvent>> finish();
+  [[nodiscard]] bool complete() const noexcept;
+
+private:
+  class Impl;
+  std::unique_ptr<Impl> impl_;
+};
+
+struct MultipartCallbacks {
+  std::function<Task<bool>(const MultipartPart &)> on_part_begin;
+  AsyncBodyConsumer on_part_data;
+  std::function<Task<bool>(const MultipartPart &)> on_part_end;
+};
+
+Task<ErrorInfo> consume_multipart(RequestBodyStream &body,
+                                  std::string content_type,
+                                  MultipartCallbacks callbacks,
+                                  MultipartParserOptions options = {});
+
+class MultipartWriter {
+public:
+  explicit MultipartWriter(std::string boundary = {});
+  MultipartWriter &add_field(std::string name, std::string value,
+                             std::string content_type = {});
+  MultipartWriter &add_file(std::string name, std::filesystem::path path,
+                            std::string content_type = {},
+                            std::string filename = {});
+  MultipartWriter &add_stream(std::string name, std::string filename,
+                              std::string content_type,
+                              StreamHandler producer,
+                              std::optional<std::uint64_t> size = std::nullopt,
+                              Headers headers = {});
+  [[nodiscard]] std::string content_type() const;
+  [[nodiscard]] std::optional<std::uint64_t> content_length() const;
+  Task<void> write(StreamWriter &writer) const;
+  void apply(Request &request) const;
+
+private:
+  class Impl;
+  std::shared_ptr<Impl> impl_;
+};
+
+class Base64Encoder {
+public:
+  std::string update(std::span<const std::byte> data);
+  std::string finish();
+  void reset() noexcept;
+
+private:
+  std::array<std::byte, 3> pending_{};
+  std::size_t pending_size_{0};
+  bool finished_{false};
+};
+
+[[nodiscard]] std::optional<std::uint64_t>
+base64_encoded_size(std::uint64_t input_size) noexcept;
+
+// Writes JSON syntax directly to a streamed request body. String helpers
+// escape incrementally; the Base64 string API retains only two source bytes.
+class JsonStreamWriter {
+public:
+  explicit JsonStreamWriter(StreamWriter &writer) : writer_(writer) {}
+  Task<bool> raw(std::string_view json);
+  Task<bool> string(std::string_view value);
+  Task<bool> begin_base64_string(std::string_view prefix = {});
+  Task<bool> base64(std::span<const std::byte> data);
+  Task<bool> end_base64_string();
+  [[nodiscard]] bool open() const noexcept;
+
+private:
+  StreamWriter &writer_;
+  Base64Encoder base64_;
+  bool base64_string_open_{false};
+};
+
 class SseWriter {
 public:
   explicit SseWriter(StreamWriter writer) : writer_(std::move(writer)) {}
@@ -432,6 +581,8 @@ struct ResponseHead {
 
 using Handler = std::function<void(const Request &, Response &)>;
 using AsyncHandler = std::function<Task<void>(const Request &, Response &)>;
+using StreamRequestHandler =
+    std::function<Task<void>(Request &, RequestBodyStream &, Response &)>;
 using Middleware = std::function<bool(const Request &, Response &)>;
 using Logger = std::function<void(const Request &, const Response &)>;
 using ErrorHandler = std::function<void(const Request &, Response &)>;
@@ -463,6 +614,15 @@ struct ServerOptions {
   bool auto_decompress_request{true};
   bool auto_compress_response{true};
   std::optional<TlsServerOptions> tls;
+};
+
+struct StreamRouteOptions {
+  // Zero inherits ServerOptions::max_body_size.
+  std::size_t max_body_size{0};
+  std::optional<std::chrono::milliseconds> first_body_byte_timeout;
+  std::optional<std::chrono::milliseconds> idle_timeout;
+  std::optional<std::chrono::milliseconds> total_timeout;
+  bool auto_decompress{true};
 };
 
 enum class RoutingResult { pass, handled, rejected };
@@ -514,6 +674,9 @@ public:
   Server &route(std::string method, std::string pattern, Handler handler);
   Server &route_async(std::string method, std::string pattern,
                       AsyncHandler handler);
+  Server &route_stream(std::string method, std::string pattern,
+                       StreamRequestHandler handler,
+                       StreamRouteOptions options = {});
   Server &get(std::string pattern, Handler handler);
   Server &post(std::string pattern, Handler handler);
   Server &put(std::string pattern, Handler handler);
@@ -523,6 +686,12 @@ public:
   Server &head(std::string pattern, Handler handler);
   Server &get_async(std::string pattern, AsyncHandler handler);
   Server &post_async(std::string pattern, AsyncHandler handler);
+  Server &post_stream(std::string pattern, StreamRequestHandler handler,
+                      StreamRouteOptions options = {});
+  Server &put_stream(std::string pattern, StreamRequestHandler handler,
+                     StreamRouteOptions options = {});
+  Server &patch_stream(std::string pattern, StreamRequestHandler handler,
+                       StreamRouteOptions options = {});
   Server &websocket(std::string pattern, WebSocketHandler handler,
                     SubprotocolSelector selector = {});
   Server &mount(std::string url_prefix, std::filesystem::path directory,

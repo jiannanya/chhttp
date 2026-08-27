@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.25)
-project(chhttp VERSION 0.3.0 LANGUAGES CXX)
+project(chhttp VERSION 0.4.0 LANGUAGES CXX)
 
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
@@ -22,6 +22,7 @@ add_library(chhttp STATIC
   src/common.cpp
   src/runtime.cpp
   src/protocol.cpp
+  src/streaming_body.cpp
   src/server.cpp
   src/client.cpp
   src/sse.cpp

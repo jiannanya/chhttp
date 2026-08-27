@@ -231,6 +231,87 @@ private:
 
 } // namespace
 
+class ServerRequestBodySource final : public RequestBodyStream::Source {
+public:
+  ServerRequestBodySource(std::shared_ptr<detail::Connection> connection,
+                          std::shared_ptr<std::string> buffer,
+                          detail::RequestBodyState state,
+                          detail::HttpReadOptions options, Request *request)
+      : connection_(std::move(connection)), buffer_(std::move(buffer)),
+        state_(std::move(state)), options_(std::move(options)),
+        request_(request) {
+    if (!state_.chunked && state_.content_length.value_or(0) == 0) {
+      complete_ = true;
+    }
+  }
+
+  Task<ErrorInfo> consume(AsyncBodyConsumer consumer) override {
+    if (consumed_.exchange(true))
+      co_return complete_
+                    ? ErrorInfo{Error::invalid_argument,
+                                "Request body stream was already consumed"}
+                    : ErrorInfo{Error::cancelled,
+                                "Request body stream is no longer available"};
+    if (complete_) co_return ErrorInfo{};
+    if (cancelled_)
+      co_return ErrorInfo{Error::cancelled, "Request body stream cancelled"};
+    if (state_.content_length &&
+        *state_.content_length > options_.max_body_size) {
+      error_ = {Error::body_too_large,
+                "Request body exceeds the stream route limit"};
+      co_return error_;
+    }
+    options_.cancelled = [this] { return cancelled_.load(); };
+    options_.on_data_async =
+        [this, consumer = std::move(consumer)](
+            std::string_view data) mutable -> Task<bool> {
+      if (cancelled_) co_return false;
+      received_ += data.size();
+      const bool accepted = co_await consumer(data);
+      co_return accepted;
+    };
+    auto body = co_await detail::read_request_body(connection_, *buffer_, state_,
+                                                   options_);
+    if (!body) {
+      error_ = body.error();
+      co_return error_;
+    }
+    complete_ = true;
+    if (request_) request_->headers = state_.headers;
+    co_return ErrorInfo{};
+  }
+
+  void cancel() noexcept override {
+    cancelled_ = true;
+    if (connection_) connection_->close();
+  }
+
+  [[nodiscard]] std::optional<std::uint64_t>
+  content_length() const noexcept override {
+    return state_.content_length;
+  }
+  [[nodiscard]] std::uint64_t received() const noexcept override {
+    return received_.load();
+  }
+  [[nodiscard]] bool consumed() const noexcept override { return consumed_; }
+  [[nodiscard]] bool complete() const noexcept override { return complete_; }
+  [[nodiscard]] const Headers &headers() const noexcept { return state_.headers; }
+  [[nodiscard]] const ErrorInfo &error() const noexcept { return error_; }
+  void detach_request() noexcept { request_ = nullptr; }
+
+private:
+  std::shared_ptr<detail::Connection> connection_;
+  std::shared_ptr<std::string> buffer_;
+  detail::RequestBodyState state_;
+  detail::HttpReadOptions options_;
+  Request *request_{nullptr};
+  std::atomic_uint64_t received_{0};
+  std::atomic_bool consumed_{false};
+  std::atomic_bool complete_{false};
+  std::atomic_bool cancelled_{false};
+  ErrorInfo error_;
+};
+
 class Server::Impl {
 public:
   struct Route {
@@ -243,6 +324,12 @@ public:
     CompiledPattern pattern;
     WebSocketHandler handler;
     SubprotocolSelector selector;
+  };
+  struct StreamRoute {
+    std::string method;
+    CompiledPattern pattern;
+    StreamRequestHandler handler;
+    StreamRouteOptions options;
   };
   struct Mount {
     std::string prefix;
@@ -393,7 +480,7 @@ public:
       }
     }
 #endif
-    std::string buffer;
+    auto buffer = std::make_shared<std::string>();
     std::size_t request_count = 0;
     while (connection->open() &&
            request_count < options.keep_alive_max_requests) {
@@ -401,8 +488,8 @@ public:
       if (stopping) break;
       const auto timeout = request_count == 0 ? options.request_timeout
                                               : options.keep_alive_timeout;
-      auto parsed = co_await detail::read_request(
-          connection, buffer,
+      auto parsed = co_await detail::read_request_head(
+          connection, *buffer,
           {.max_header_size = options.max_header_size,
            .max_body_size = options.max_body_size,
            .read_timeout = timeout});
@@ -421,26 +508,91 @@ public:
         break;
       }
       session->in_request = true;
-      Request request = std::move(*parsed);
+      Request request = std::move(parsed->request);
       request.remote_address = connection->remote_address();
       request.remote_port = connection->remote_port();
-      if (options.auto_decompress_request &&
-          request.headers.contains("Content-Encoding")) {
-        auto decoded = detail::decompress(request.body,
-                                          request.headers.get("Content-Encoding"),
-                                          options.max_body_size);
-        if (!decoded) {
+      if (const auto route = find_stream_route(request)) {
+        auto &entry = stream_routes[*route];
+        const auto body_limit = entry.options.max_body_size == 0
+                                    ? options.max_body_size
+                                    : entry.options.max_body_size;
+        if (parsed->body.content_length &&
+            *parsed->body.content_length > body_limit) {
           Response response;
-          response.status = decoded.error().code == Error::body_too_large ? 413 : 400;
+          response.status = 413;
           response.keep_alive = false;
-          response.set_content(decoded.error().message);
+          response.set_content(status_reason(response.status));
           co_await detail::write_response(connection, request, response,
                                            options.request_timeout);
           break;
         }
-        request.body = std::move(*decoded);
-        request.headers.erase("Content-Encoding");
+        detail::HttpReadOptions read_options{
+            .max_header_size = options.max_header_size,
+            .max_body_size = body_limit,
+            .read_timeout = options.request_timeout,
+            .first_body_byte_timeout = entry.options.first_body_byte_timeout,
+            .idle_timeout = entry.options.idle_timeout,
+            .auto_decompress = options.auto_decompress_request &&
+                               entry.options.auto_decompress};
+        if (entry.options.total_timeout)
+          read_options.deadline = std::chrono::steady_clock::now() +
+                                  *entry.options.total_timeout;
+        auto source = std::make_shared<ServerRequestBodySource>(
+            connection, buffer, std::move(parsed->body),
+            std::move(read_options), &request);
+        RequestBodyStream body(source);
+        Response response;
+        response.version = request.version;
+        response.keep_alive = request.keep_alive;
+        co_await dispatch_stream(entry, request, body, response);
+        source->detach_request();
+        request.headers = source->headers();
+        if (source->error() && response.status == 200 && response.body.empty() &&
+            !response.is_streaming()) {
+          response.status = source->error().code == Error::body_too_large
+                                ? 413
+                                : source->error().code == Error::timeout ? 408
+                                                                         : 400;
+          response.set_content(source->error().message);
+        }
+        if (!source->complete()) response.keep_alive = false;
+        if (request_count + 1 >= options.keep_alive_max_requests || stopping)
+          response.keep_alive = false;
+        const bool reusable = response.keep_alive && request.keep_alive &&
+                              source->complete();
+        auto error = co_await send_response(connection, request, response);
+        if (logger) {
+          try {
+            logger(request, response);
+          } catch (...) {
+          }
+        }
+        ++request_count;
+        session->in_request = false;
+        if (error || !reusable) break;
+        continue;
       }
+
+      auto request_body = co_await detail::read_request_body(
+          connection, *buffer, parsed->body,
+          {.max_header_size = options.max_header_size,
+           .max_body_size = options.max_body_size,
+           .read_timeout = options.request_timeout,
+           .auto_decompress = options.auto_decompress_request});
+      if (!request_body) {
+        Response response;
+        response.status = request_body.error().code == Error::body_too_large
+                              ? 413
+                              : request_body.error().code == Error::timeout ? 408
+                                                                             : 400;
+        response.keep_alive = false;
+        response.set_content(request_body.error().message);
+        co_await detail::write_response(connection, request, response,
+                                         options.request_timeout);
+        break;
+      }
+      request.body = std::move(*request_body);
+      request.headers = std::move(parsed->body.headers);
       const auto content_type = request.headers.get("Content-Type");
       if (detail::lower(content_type).starts_with("multipart/form-data")) {
         auto files = parse_multipart(request.body, content_type);
@@ -475,7 +627,7 @@ public:
             connection, request, selected, options.request_timeout);
         if (handshake) break;
         auto channel = detail::make_websocket_channel(
-            connection, std::move(buffer), false, selected,
+            connection, std::move(*buffer), false, selected,
             options.request_timeout);
         WebSocket socket(channel);
         bool handler_failed = false;
@@ -537,6 +689,20 @@ public:
     return std::nullopt;
   }
 
+  std::optional<std::size_t> find_stream_route(Request &request) const {
+    for (std::size_t index = 0; index < stream_routes.size(); ++index) {
+      if (!detail::iequals(stream_routes[index].method, request.method))
+        continue;
+      PathParams parameters;
+      if (match_pattern(stream_routes[index].pattern, request.path,
+                        parameters)) {
+        request.path_params = std::move(parameters);
+        return index;
+      }
+    }
+    return std::nullopt;
+  }
+
   std::optional<std::size_t> find_ws_route(Request &request) const {
     for (std::size_t index = 0; index < websocket_routes.size(); ++index) {
       PathParams parameters;
@@ -586,6 +752,18 @@ public:
         response.status = 404;
         (error_handler ? error_handler : default_error_handler)(request, response);
       }
+      if (post_routing) post_routing(request, response);
+    } catch (...) {
+      (exception_handler ? exception_handler : default_exception_handler)(
+          request, response, std::current_exception());
+    }
+  }
+
+  Task<void> dispatch_stream(StreamRoute &route, Request &request,
+                             RequestBodyStream &body, Response &response) {
+    try {
+      if (pre_routing && pre_routing(request, response)) co_return;
+      co_await route.handler(request, body, response);
       if (post_routing) post_routing(request, response);
     } catch (...) {
       (exception_handler ? exception_handler : default_exception_handler)(
@@ -705,6 +883,7 @@ public:
   SSL_CTX *tls_context{nullptr};
 #endif
   std::vector<Route> routes;
+  std::vector<StreamRoute> stream_routes;
   std::vector<WsRoute> websocket_routes;
   std::vector<Mount> mounts;
   Middleware pre_routing;
@@ -748,6 +927,17 @@ Server &Server::route_async(std::string method, std::string pattern,
   return *this;
 }
 
+Server &Server::route_stream(std::string method, std::string pattern,
+                             StreamRequestHandler handler,
+                             StreamRouteOptions options) {
+  if (impl_->started) throw std::logic_error("Routes cannot change while running");
+  if (!handler) throw std::invalid_argument("Stream route handler is empty");
+  impl_->stream_routes.push_back({detail::lower(method),
+                                  compile_pattern(pattern), std::move(handler),
+                                  std::move(options)});
+  return *this;
+}
+
 Server &Server::get(std::string pattern, Handler handler) {
   return route("GET", std::move(pattern), std::move(handler));
 }
@@ -774,6 +964,24 @@ Server &Server::get_async(std::string pattern, AsyncHandler handler) {
 }
 Server &Server::post_async(std::string pattern, AsyncHandler handler) {
   return route_async("POST", std::move(pattern), std::move(handler));
+}
+Server &Server::post_stream(std::string pattern,
+                            StreamRequestHandler handler,
+                            StreamRouteOptions options) {
+  return route_stream("POST", std::move(pattern), std::move(handler),
+                      std::move(options));
+}
+Server &Server::put_stream(std::string pattern,
+                           StreamRequestHandler handler,
+                           StreamRouteOptions options) {
+  return route_stream("PUT", std::move(pattern), std::move(handler),
+                      std::move(options));
+}
+Server &Server::patch_stream(std::string pattern,
+                             StreamRequestHandler handler,
+                             StreamRouteOptions options) {
+  return route_stream("PATCH", std::move(pattern), std::move(handler),
+                      std::move(options));
 }
 Server &Server::websocket(std::string pattern, WebSocketHandler handler,
                           SubprotocolSelector selector) {

@@ -35,11 +35,16 @@ no third-party HTTP, WebSocket or URL library is used.
   consumers with backpressure, progress and exact per-request cancellation
 - Fixed-length and HTTP/1.1 chunked request-body producers with awaited
   transport backpressure, avoiding complete upload buffers in the client
+- Server request-body stream routes with per-route size/deadline/idle limits,
+  awaited consumer backpressure, active cancellation and temporary-file spooling
 - Public incremental WHATWG SSE parser plus GET/POST/arbitrary-method SSE
   client, event IDs, named events, retry delays, reconnect and `Last-Event-ID`
 - RFC 6455 WebSocket client/server, text/binary messages, ping, close and
   subprotocol negotiation; connections remain asynchronous at scale
-- `multipart/form-data` encoding/parsing including binary file data
+- Buffered and incremental `multipart/form-data` parsing plus a high-level
+  field/file/custom-stream writer with automatic fixed-length or chunked framing
+- Incremental Base64 and streamed JSON-string production for vision/audio model
+  inputs without constructing the encoded payload in memory
 - Incremental gzip, deflate, Brotli and Zstandard response decoding, including
   genuinely streamed compressed responses
 - Static file mounts, index files, MIME types, byte ranges, HEAD, traversal
@@ -88,13 +93,14 @@ ctest --test-dir build -L stress --output-on-failure
 ctest --test-dir build -L stress --repeat until-fail:30 --output-on-failure
 ```
 
-Running `chhttp_tests` without an argument executes all 128 registered groups:
-105 focused functional/boundary groups and 23 load/lifecycle groups. The stress
+Running `chhttp_tests` without an argument executes all 149 registered groups:
+123 focused functional/boundary groups and 26 load/lifecycle groups. The stress
 group covers concurrent sync/async HTTP, thousands of keep-alive requests,
-large buffered and streamed uploads, streamed callbacks, connection recycling, independent and
-global cancellation, client/server churn, parallel servers, graceful draining,
-SSE fan-out, WebSocket connection/message load, malformed-request floods and
-HTTPS/TLS handshake concurrency.
+large buffered and streamed uploads (including bounded-memory 100 MiB and
+concurrent 10 MiB cases), streamed callbacks, connection recycling, independent
+and global cancellation, client/server churn, parallel servers, graceful
+draining, SSE fan-out, WebSocket connection/message load, malformed-request
+floods and HTTPS/TLS handshake concurrency.
 
 Consumers link the installed package as follows:
 
@@ -158,7 +164,9 @@ long-running agent processes.
 | `chhttp_agent_parallel_fanout` | `examples/agent_parallel_fanout.cpp` | Many agent streams through a bounded per-origin pool |
 | `chhttp_agent_stream_recovery` | `examples/agent_stream_recovery.cpp` | Retry before visible output and explicit interruption afterward |
 | `chhttp_agent_backpressure` | `examples/agent_backpressure.cpp` | Public SSE parser with awaited durable-consumer backpressure |
-| `chhttp_agent_stream_upload` | `examples/agent_stream_upload.cpp` | Memory-bounded agent attachment upload with chunked backpressure |
+| `chhttp_agent_stream_upload` | `examples/agent_stream_upload.cpp` | Memory-bounded client and server attachment streaming |
+| `chhttp_agent_vision_json` | `examples/agent_vision_json.cpp` | Incremental Base64-in-JSON vision input from a file |
+| `chhttp_agent_multipart_stream` | `examples/agent_multipart_stream.cpp` | Agent metadata/file multipart writer and incremental gateway parser |
 
 For example:
 
@@ -262,6 +270,96 @@ upload.set_stream_body([](chhttp::StreamWriter& writer)
 auto response = co_await client.request(std::move(upload));
 ```
 
+## Server request-body streaming
+
+Use a stream route when the service must not allocate the complete upload.
+Routing happens after the request head and before the body is read. The awaited
+consumer is the backpressure boundary: chhttp does not issue another socket read
+while the callback is suspended.
+
+```cpp
+server.post_stream("/v1/files/{kind}",
+  [](chhttp::Request& request, chhttp::RequestBodyStream& body,
+     chhttp::Response& response) -> chhttp::Task<void> {
+    std::uint64_t bytes = 0;
+    auto error = co_await body.consume(
+      [&](std::string_view chunk) -> chhttp::Task<bool> {
+        co_await bounded_storage_queue.push(chunk); // copy before returning
+        bytes += chunk.size();
+        co_return true;
+      });
+    if (error) {
+      response.status = error.code == chhttp::Error::body_too_large ? 413 : 400;
+      response.set_content(error.message);
+      co_return;
+    }
+    response.set_content(std::to_string(bytes));
+  },
+  {.max_body_size = 128 * 1024 * 1024,
+   .first_body_byte_timeout = 10s,
+   .idle_timeout = 30s,
+   .total_timeout = 5min});
+```
+
+`discard()`, `save_to_file()`, and `save_to_temp()` are convenience consumers.
+`save_to_temp()` creates a unique owned directory and removes it on failure; on
+success the caller owns the returned file and its parent directory. Calling
+`cancel()` actively closes only that request's connection. A callback returning
+`false` stops parsing and makes the connection non-reusable because unread body
+bytes remain. The server attempts to send the handler's response before closing,
+but a client that is still uploading and does not read concurrently may observe
+a transport error instead; consume/discard the body when a delivered error
+response must be reliable.
+
+Stream routes run on the server libuv thread. Do not perform long blocking file
+or database operations in callbacks. Await an asynchronous sink or a bounded
+queue instead. The `string_view` is valid only until its callback returns.
+`save_to_file()` and `save_to_temp()` use synchronous incremental file writes;
+they bound memory but an async file sink is preferable on latency-sensitive
+servers.
+
+## Streaming multipart and model payloads
+
+`MultipartWriter` accepts buffered fields, regular files and custom streamed
+parts. Regular-file chunks are read through a small shared worker pool so disk
+reads do not block the client's libuv thread. If every size is known, `apply()`
+declares an exact `Content-Length`; otherwise it selects HTTP/1.1 chunked
+transfer coding.
+
+```cpp
+chhttp::MultipartWriter form;
+form.add_field("metadata", metadata_json, "application/json")
+    .add_file("image", image_path, "image/png");
+chhttp::Request request;
+request.method = "POST";
+request.target = "/v1/artifacts";
+form.apply(request);
+auto response = co_await client.request(std::move(request));
+```
+
+On the server, `MultipartParser::feed()` exposes owned `part_begin`, `part_data`
+and `part_end` events and retains only delimiter/header look-behind. The
+`consume_multipart()` convenience function dispatches those events to awaited
+callbacks and enforces independent part count, header, per-part and total-data
+limits. It is suitable for routing file chunks directly to temporary files or
+object storage.
+
+For providers that require Base64 embedded in JSON, `JsonStreamWriter` combines
+JSON escaping with `Base64Encoder`'s two-byte carry buffer:
+
+```cpp
+request.set_stream_body([path](chhttp::StreamWriter& output)
+    -> chhttp::Task<void> {
+  chhttp::JsonStreamWriter json(output);
+  if (!co_await json.raw(R"({"image":)")) co_return;
+  if (!co_await json.begin_base64_string("data:image/png;base64,")) co_return;
+  while (auto bytes = next_file_block(path))
+    if (!co_await json.base64(*bytes)) co_return;
+  if (!co_await json.end_base64_string()) co_return;
+  co_await json.raw("}");
+});
+```
+
 ## SSE client
 
 ```cpp
@@ -337,9 +435,10 @@ is intended only for controlled tests.
 
 ## Resource and safety defaults
 
-The defaults cap request bodies at 64 MiB, response bodies at 128 MiB, headers
+The defaults cap buffered request bodies at 64 MiB, response bodies at 128 MiB, headers
 at 64 KiB, each client origin at 64 total connections and keep-alive sessions
-at 1000 requests. Streaming callbacks avoid a second body allocation.
+at 1000 requests. A stream route can raise or lower its body limit independently
+without allocating that amount. Streaming callbacks avoid a second body allocation.
 Incremental compression output is bounded by the configured body limit, route
 matching is performed before file access, percent-decoded static paths are
 canonicalized, and credentials are removed on cross-origin redirects.

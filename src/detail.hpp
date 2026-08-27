@@ -233,6 +233,27 @@ struct HttpReadOptions {
   std::function<bool(std::uint64_t, std::uint64_t)> on_progress;
 };
 
+struct RequestBodyState {
+  Headers headers;
+  std::optional<std::uint64_t> content_length;
+  bool chunked{false};
+  bool expect_continue{false};
+  bool continue_sent{false};
+};
+
+struct RequestHeadResult {
+  Request request;
+  RequestBodyState body;
+};
+
+Task<Result<RequestHeadResult>>
+read_request_head(const std::shared_ptr<Connection> &connection,
+                  std::string &buffer, const HttpReadOptions &options);
+Task<Result<std::string>>
+read_request_body(const std::shared_ptr<Connection> &connection,
+                  std::string &buffer, RequestBodyState &state,
+                  const HttpReadOptions &options);
+
 Task<Result<Request>> read_request(const std::shared_ptr<Connection> &connection,
                                    std::string &buffer,
                                    const HttpReadOptions &options);

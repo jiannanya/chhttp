@@ -5,15 +5,28 @@
 
 int main() {
   // This local endpoint represents an agent file/attachment ingestion API.
-  // The server buffers requests by design, while the client never constructs
-  // the complete payload in memory.
+  // Both sides keep only the current transport chunk in memory.
   chhttp::Server service;
-  service.post("/v1/files", [](const chhttp::Request &request,
-                                chhttp::Response &response) {
-    response.set_content(
-        R"({"bytes":)" + std::to_string(request.body.size()) + "}",
-        "application/json");
-  });
+  service.post_stream(
+      "/v1/files",
+      [](chhttp::Request &, chhttp::RequestBodyStream &body,
+         chhttp::Response &response) -> chhttp::Task<void> {
+        std::uint64_t received = 0;
+        const auto error = co_await body.consume(
+            [&](std::string_view chunk) -> chhttp::Task<bool> {
+              received += chunk.size();
+              co_return true;
+            });
+        if (error) {
+          response.status = error.code == chhttp::Error::body_too_large ? 413
+                                                                        : 400;
+          response.set_content(error.message);
+          co_return;
+        }
+        response.set_content(R"({"bytes":)" + std::to_string(received) + "}",
+                             "application/json");
+      },
+      {.max_body_size = 128 * 1024 * 1024});
   if (!service.start("127.0.0.1", 0)) return 1;
 
   chhttp::AsyncClient client("http://127.0.0.1:" +

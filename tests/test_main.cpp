@@ -832,6 +832,10 @@ TEST(custom_exception_handler_and_logger_are_isolated) {
   auto response = client.get("/throw");
   CHECK(response && response->status == 599 &&
         response->body == "caught:handler");
+  const auto logger_deadline = std::chrono::steady_clock::now() +
+                               std::chrono::seconds(1);
+  while (logged == 0 && std::chrono::steady_clock::now() < logger_deadline)
+    std::this_thread::yield();
   CHECK(logged == 1);
   server.stop();
 }
@@ -3441,6 +3445,743 @@ TEST(stress_stop_token_cancellation_isolation_and_recovery) {
   }
   auto recovered = client.get("/hello?who=stop-token").get();
   CHECK(recovered && recovered->body == "hello:stop-token");
+}
+
+// Verifies incremental Base64 encoding across every possible one- and two-byte carry boundary.
+TEST(incremental_base64_preserves_fragmented_binary_input) {
+  const std::array<std::byte, 6> input{
+      std::byte{0x00}, std::byte{0x01}, std::byte{0x02},
+      std::byte{0xfd}, std::byte{0xfe}, std::byte{0xff}};
+  chhttp::Base64Encoder encoder;
+  std::string encoded;
+  encoded += encoder.update(std::span<const std::byte>(input).subspan(0, 1));
+  encoded += encoder.update(std::span<const std::byte>(input).subspan(1, 2));
+  encoded += encoder.update(std::span<const std::byte>(input).subspan(3, 1));
+  encoded += encoder.update(std::span<const std::byte>(input).subspan(4));
+  encoded += encoder.finish();
+  CHECK(encoded == "AAEC/f7/");
+  CHECK(encoder.finish().empty());
+  encoder.reset();
+  CHECK(encoder.update(std::span<const std::byte>(input).first(1)).empty());
+  CHECK(encoder.finish() == "AA==");
+  CHECK(chhttp::base64_encoded_size(0) == 0);
+  CHECK(chhttp::base64_encoded_size(100) == 136);
+  CHECK(!chhttp::base64_encoded_size(
+      (std::numeric_limits<std::uint64_t>::max)()));
+}
+
+// Verifies JsonStreamWriter escapes text and emits an incremental Base64 data URL without buffering the request.
+TEST(incremental_json_base64_producer_streams_valid_json) {
+  chhttp::AsyncClient client(fixture().base_url);
+  const std::array<std::byte, 5> image{std::byte{0x00}, std::byte{0x01},
+                                      std::byte{0x02}, std::byte{0x03},
+                                      std::byte{0xff}};
+  chhttp::Request request;
+  request.method = "POST";
+  request.target = "/echo";
+  request.headers.set("Content-Type", "application/json");
+  request.set_stream_body(
+      [image](chhttp::StreamWriter &output) -> chhttp::Task<void> {
+        chhttp::JsonStreamWriter json(output);
+        CHECK(co_await json.raw("{\"prompt\":"));
+        CHECK(co_await json.string("line 1\n\"quoted\""));
+        CHECK(co_await json.raw(",\"image\":"));
+        CHECK(co_await json.begin_base64_string("data:image/png;base64,"));
+        CHECK(co_await json.base64(
+            std::span<const std::byte>(image).subspan(0, 2)));
+        CHECK(co_await json.base64(
+            std::span<const std::byte>(image).subspan(2)));
+        CHECK(co_await json.end_base64_string());
+        CHECK(co_await json.raw("}"));
+      });
+  auto response = client.request(std::move(request)).get();
+  CHECK(response);
+  CHECK(response->body ==
+        "POST:{\"prompt\":\"line 1\\n\\\"quoted\\\"\","
+        "\"image\":\"data:image/png;base64,AAECA/8=\"}");
+}
+
+// Verifies the incremental multipart parser recognizes quoted metadata when every byte arrives separately.
+TEST(incremental_multipart_parser_handles_bytewise_input) {
+  chhttp::MultipartForm form{{.name = "prompt", .content = "hello"},
+                             {.name = "image",
+                              .filename = "a\"b.png",
+                              .content_type = "image/png",
+                              .content = std::string("\0\1\2", 3)}};
+  auto [content_type, encoded] =
+      chhttp::make_multipart(form, "bytewise-boundary");
+  chhttp::MultipartParser parser(content_type);
+  std::vector<chhttp::MultipartEvent> events;
+  for (const char byte : encoded) {
+    auto parsed = parser.feed(std::string_view(&byte, 1));
+    CHECK(parsed);
+    events.insert(events.end(), std::make_move_iterator(parsed->begin()),
+                  std::make_move_iterator(parsed->end()));
+  }
+  auto tail = parser.finish();
+  CHECK(tail && parser.complete());
+  events.insert(events.end(), std::make_move_iterator(tail->begin()),
+                std::make_move_iterator(tail->end()));
+  CHECK(std::ranges::count_if(events, [](const auto &event) {
+          return event.type == chhttp::MultipartEventType::part_begin;
+        }) == 2);
+  std::array<std::string, 2> bodies;
+  std::string filename;
+  for (const auto &event : events) {
+    if (event.type == chhttp::MultipartEventType::part_begin &&
+        event.part_index == 1)
+      filename = event.part.filename;
+    if (event.type == chhttp::MultipartEventType::part_data)
+      bodies[event.part_index] += event.data;
+  }
+  CHECK(bodies[0] == "hello");
+  CHECK(bodies[1] == std::string("\0\1\2", 3));
+  CHECK(filename == "a\"b.png");
+}
+
+// Verifies boundary-like payload text, legal preamble, and epilogue remain ordinary multipart data.
+TEST(incremental_multipart_parser_rejects_false_boundaries) {
+  const std::string body =
+      "preamble\r\n--b\r\nContent-Disposition: form-data; name=\"x\"\r\n"
+      "\r\nleft\r\n--bX\r\nright\r\n--b--\r\nepilogue";
+  chhttp::MultipartParser parser("multipart/form-data; boundary=b");
+  std::string content;
+  for (std::size_t offset = 0; offset < body.size(); offset += 3) {
+    auto events = parser.feed(std::string_view(body).substr(offset, 3));
+    CHECK(events);
+    for (const auto &event : *events)
+      if (event.type == chhttp::MultipartEventType::part_data)
+        content += event.data;
+  }
+  CHECK(parser.finish());
+  CHECK(content == "left\r\n--bX\r\nright");
+}
+
+// Verifies incremental multipart limits fail before an oversized part can be accumulated.
+TEST(incremental_multipart_parser_enforces_part_header_and_count_limits) {
+  auto [type, body] = chhttp::make_multipart(
+      {{.name = "a", .content = "1234"},
+       {.name = "b", .content = "5678"}},
+      "limits");
+  chhttp::MultipartParser part_limited(
+      type, {.max_parts = 2, .max_header_size = 1024, .max_part_size = 3,
+             .max_total_size = 16});
+  auto too_large = part_limited.feed(body);
+  CHECK(!too_large && too_large.error().code == chhttp::Error::body_too_large);
+
+  chhttp::MultipartParser count_limited(
+      type, {.max_parts = 1, .max_header_size = 1024, .max_part_size = 16,
+             .max_total_size = 16});
+  auto too_many = count_limited.feed(body);
+  CHECK(!too_many && too_many.error().code == chhttp::Error::multipart);
+
+  chhttp::MultipartParser header_limited(
+      type, {.max_parts = 2, .max_header_size = 8, .max_part_size = 16,
+             .max_total_size = 16});
+  auto header = header_limited.feed(body);
+  CHECK(!header && header.error().code == chhttp::Error::multipart);
+}
+
+// Verifies a fixed-length server request body is consumed incrementally with awaited backpressure and route parameters.
+TEST(server_raw_body_stream_applies_backpressure_and_reuses_connection) {
+  chhttp::Server server;
+  std::atomic_int active_callbacks{0};
+  std::atomic_int maximum_callbacks{0};
+  server.post_stream(
+      "/ingest/{kind}",
+      [&](chhttp::Request &request, chhttp::RequestBodyStream &body,
+          chhttp::Response &response) -> chhttp::Task<void> {
+        std::uint64_t received = 0;
+        auto error = co_await body.consume(
+            [&](std::string_view data) -> chhttp::Task<bool> {
+              const int active = active_callbacks.fetch_add(1) + 1;
+              int maximum = maximum_callbacks.load();
+              while (active > maximum &&
+                     !maximum_callbacks.compare_exchange_weak(maximum, active)) {
+              }
+              co_await chhttp::sleep_for(std::chrono::milliseconds(1));
+              received += data.size();
+              active_callbacks.fetch_sub(1);
+              co_return true;
+            });
+        CHECK(!error);
+        CHECK(body.complete());
+        response.set_content(request.path_params.at("kind") + "|" +
+                             std::to_string(received) + "|" +
+                             std::to_string(request.remote_port));
+      });
+  server.get("/port", [](const chhttp::Request &request,
+                           chhttp::Response &response) {
+    response.set_content(std::to_string(request.remote_port));
+  });
+  CHECK(server.start("127.0.0.1", 0));
+  chhttp::Client client("http://127.0.0.1:" +
+                        std::to_string(server.port()));
+  constexpr std::size_t size = 1024 * 1024;
+  auto uploaded = client.post("/ingest/image", std::string(size, 'i'),
+                              "application/octet-stream");
+  CHECK(uploaded && uploaded->body.starts_with("image|1048576|"));
+  const auto separator = uploaded->body.rfind('|');
+  auto port = client.get("/port");
+  CHECK(port && port->body == uploaded->body.substr(separator + 1));
+  CHECK(maximum_callbacks == 1);
+  server.stop();
+}
+
+// Verifies a chunked client producer is decoded by a server stream route without exposing HTTP chunk framing.
+TEST(server_raw_body_stream_accepts_chunked_uploads) {
+  chhttp::Server server;
+  server.post_stream(
+      "/chunked",
+      [](chhttp::Request &request, chhttp::RequestBodyStream &body,
+         chhttp::Response &response) -> chhttp::Task<void> {
+        std::string received;
+        auto error = co_await body.consume([&](std::string_view data) {
+          received.append(data);
+          return true;
+        });
+        CHECK(!error);
+        response.set_content(request.get_header("Transfer-Encoding") + "|" +
+                             received);
+      });
+  CHECK(server.start("127.0.0.1", 0));
+  chhttp::AsyncClient client("http://127.0.0.1:" +
+                             std::to_string(server.port()));
+  chhttp::Request request;
+  request.method = "POST";
+  request.target = "/chunked";
+  request.set_stream_body([](chhttp::StreamWriter &writer)
+                              -> chhttp::Task<void> {
+    CHECK(co_await writer.write("one"));
+    CHECK(co_await writer.write("two"));
+    CHECK(co_await writer.write("three"));
+  });
+  auto response = client.request(std::move(request)).get();
+  CHECK(response && response->body == "chunked|onetwothree");
+  server.stop();
+}
+
+// Verifies stream routes defer 100 Continue until consumption and reject oversized declarations before it.
+TEST(server_stream_route_controls_expect_continue) {
+  chhttp::Server server;
+  server.post_stream(
+      "/expect-stream",
+      [](chhttp::Request &, chhttp::RequestBodyStream &body,
+         chhttp::Response &response) -> chhttp::Task<void> {
+        auto error = co_await body.discard();
+        if (!error) response.set_content("accepted");
+      },
+      {.max_body_size = 4});
+  CHECK(server.start("127.0.0.1", 0));
+  const auto accepted = raw_http_exchange(
+      server.port(),
+      "POST /expect-stream HTTP/1.1\r\nHost: localhost\r\n"
+      "Content-Length: 4\r\nExpect: 100-continue\r\nConnection: close\r\n"
+      "\r\ndata");
+  CHECK(accepted.starts_with("HTTP/1.1 100 Continue\r\n\r\n"));
+  CHECK(accepted.find("HTTP/1.1 200 OK") != std::string::npos);
+
+  const auto rejected = raw_http_exchange(
+      server.port(),
+      "POST /expect-stream HTTP/1.1\r\nHost: localhost\r\n"
+      "Content-Length: 5\r\nExpect: 100-continue\r\nConnection: close\r\n"
+      "\r\n12345");
+  CHECK(rejected.starts_with("HTTP/1.1 413 Payload Too Large\r\n"));
+  CHECK(rejected.find("100 Continue") == std::string::npos);
+  server.stop();
+}
+
+// Verifies chunked request trailers become visible to the stream handler after body consumption.
+TEST(server_stream_route_exposes_request_trailers) {
+  chhttp::Server server;
+  server.post_stream(
+      "/trailers",
+      [](chhttp::Request &request, chhttp::RequestBodyStream &body,
+         chhttp::Response &response) -> chhttp::Task<void> {
+        std::string data;
+        auto error = co_await body.consume([&](std::string_view chunk) {
+          data.append(chunk);
+          return true;
+        });
+        CHECK(!error);
+        response.set_content(data + "|" + request.get_header("X-Checksum"));
+      });
+  CHECK(server.start("127.0.0.1", 0));
+  const auto response = raw_http_exchange(
+      server.port(),
+      "POST /trailers HTTP/1.1\r\nHost: localhost\r\n"
+      "Transfer-Encoding: chunked\r\nTrailer: X-Checksum\r\n"
+      "Connection: close\r\n\r\n3\r\nabc\r\n0\r\n"
+      "X-Checksum: verified\r\n\r\n");
+  CHECK(response.find("\r\n\r\nabc|verified") != std::string::npos);
+  server.stop();
+}
+
+#ifdef CHHTTP_HAS_COMPRESSION
+// Verifies compressed request bodies are decompressed incrementally before the server consumer sees them.
+TEST(server_stream_route_decompresses_request_chunks) {
+  chhttp::Server server;
+  server.post_stream(
+      "/compressed-upload",
+      [](chhttp::Request &request, chhttp::RequestBodyStream &body,
+         chhttp::Response &response) -> chhttp::Task<void> {
+        CHECK(body.content_length() == 25);
+        std::string decoded;
+        auto error = co_await body.consume([&](std::string_view chunk) {
+          decoded.append(chunk);
+          return true;
+        });
+        CHECK(!error);
+        CHECK(!request.has_header("Content-Encoding"));
+        response.set_content(decoded);
+      });
+  CHECK(server.start("127.0.0.1", 0));
+  const std::array<unsigned char, 25> gzip{
+      0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x03, 0xcb, 0x48, 0xcd, 0xc9, 0xc9, 0x07, 0x00, 0x86,
+      0xa6, 0x10, 0x36, 0x05, 0x00, 0x00, 0x00};
+  chhttp::Request request;
+  request.method = "POST";
+  request.target = "/compressed-upload";
+  request.headers.set("Content-Encoding", "gzip");
+  request.body.assign(reinterpret_cast<const char *>(gzip.data()), gzip.size());
+  chhttp::AsyncClient client("http://127.0.0.1:" +
+                             std::to_string(server.port()));
+  auto response = client.request(std::move(request)).get();
+  CHECK(response && response->body == "hello");
+  server.stop();
+}
+#endif
+
+// Verifies declared and chunked request bodies are rejected at a stream route's independent size limit.
+TEST(server_stream_route_enforces_declared_and_runtime_body_limits) {
+  chhttp::Server server;
+  server.post_stream(
+      "/limited",
+      [](chhttp::Request &, chhttp::RequestBodyStream &body,
+         chhttp::Response &response) -> chhttp::Task<void> {
+        auto error = co_await body.discard();
+        if (!error) response.set_content("accepted");
+      },
+      {.max_body_size = 1024});
+  CHECK(server.start("127.0.0.1", 0));
+  chhttp::AsyncClient client("http://127.0.0.1:" +
+                             std::to_string(server.port()));
+  auto declared = client.post("/limited", std::string(1025, 'x'),
+                              "application/octet-stream").get();
+  CHECK(declared && declared->status == 413);
+
+  chhttp::Request chunked;
+  chunked.method = "POST";
+  chunked.target = "/limited";
+  chunked.set_stream_body([](chhttp::StreamWriter &writer)
+                              -> chhttp::Task<void> {
+    co_await writer.write(std::string(700, 'a'));
+    co_await writer.write(std::string(700, 'b'));
+  });
+  auto runtime = client.request(std::move(chunked)).get();
+  CHECK(runtime && runtime->status == 413);
+  server.stop();
+}
+
+// Verifies a server consumer can cancel one request without poisoning a subsequent client operation.
+TEST(server_stream_consumer_cancellation_is_request_scoped) {
+  chhttp::Server server;
+  std::atomic_bool observed_cancellation{false};
+  server.post_stream(
+      "/cancel",
+      [&](chhttp::Request &, chhttp::RequestBodyStream &body,
+          chhttp::Response &response) -> chhttp::Task<void> {
+        auto error = co_await body.consume(
+            [](std::string_view) -> chhttp::Task<bool> { co_return false; });
+        CHECK(error.code == chhttp::Error::cancelled);
+        observed_cancellation = true;
+        response.status = 422;
+        response.set_content("consumer-cancelled");
+      });
+  server.get("/health", [](const chhttp::Request &,
+                            chhttp::Response &response) {
+    response.set_content("healthy");
+  });
+  CHECK(server.start("127.0.0.1", 0));
+  chhttp::Client client("http://127.0.0.1:" +
+                        std::to_string(server.port()));
+  auto cancelled = client.post("/cancel", std::string(128 * 1024, 'x'),
+                               "application/octet-stream");
+  if (cancelled) {
+    CHECK(cancelled->status == 422 && cancelled->body == "consumer-cancelled");
+  }
+  auto health = client.get("/health");
+  CHECK(health && health->body == "healthy");
+  CHECK(observed_cancellation);
+  server.stop();
+}
+
+// Verifies RequestBodyStream::cancel actively closes the selected upload while the server stays available.
+TEST(server_stream_active_cancel_interrupts_the_connection) {
+  chhttp::Server server;
+  std::atomic_uint64_t received{0};
+  server.post_stream(
+      "/active-cancel",
+      [&](chhttp::Request &, chhttp::RequestBodyStream &body,
+          chhttp::Response &) -> chhttp::Task<void> {
+        co_await body.consume(
+            [&](std::string_view chunk) -> chhttp::Task<bool> {
+              received += chunk.size();
+              body.cancel();
+              co_return true;
+            });
+      });
+  server.get("/health-after-cancel", [](const chhttp::Request &,
+                                         chhttp::Response &response) {
+    response.set_content("healthy");
+  });
+  CHECK(server.start("127.0.0.1", 0));
+  chhttp::AsyncClient client("http://127.0.0.1:" +
+                             std::to_string(server.port()));
+  chhttp::Request request;
+  request.method = "POST";
+  request.target = "/active-cancel";
+  request.set_stream_body([](chhttp::StreamWriter &writer)
+                              -> chhttp::Task<void> {
+    const std::string chunk(64 * 1024, 'c');
+    for (int index = 0; index != 32; ++index) {
+      if (!co_await writer.write(chunk)) co_return;
+      co_await chhttp::sleep_for(std::chrono::milliseconds(1));
+    }
+  });
+  auto cancelled = client.request(std::move(request)).get();
+  CHECK(!cancelled);
+  CHECK(received > 0 && received < 2 * 1024 * 1024);
+  auto health = client.get("/health-after-cancel").get();
+  CHECK(health && health->body == "healthy");
+  server.stop();
+}
+
+// Verifies total request-body deadlines include time spent in an awaited slow consumer.
+TEST(server_stream_total_deadline_covers_consumer_backpressure) {
+  chhttp::Server server;
+  std::atomic_bool observed_timeout{false};
+  server.post_stream(
+      "/deadline",
+      [&](chhttp::Request &, chhttp::RequestBodyStream &body,
+          chhttp::Response &response) -> chhttp::Task<void> {
+        auto error = co_await body.consume(
+            [](std::string_view) -> chhttp::Task<bool> {
+              co_await chhttp::sleep_for(std::chrono::milliseconds(20));
+              co_return true;
+            });
+        CHECK(error.code == chhttp::Error::timeout);
+        observed_timeout = true;
+        response.status = 408;
+        response.set_content("deadline");
+      },
+      {.total_timeout = std::chrono::milliseconds(5)});
+  CHECK(server.start("127.0.0.1", 0));
+  chhttp::Client client("http://127.0.0.1:" +
+                        std::to_string(server.port()));
+  auto response = client.post("/deadline", std::string(64 * 1024, 'd'),
+                              "application/octet-stream");
+  if (response) {
+    CHECK(response->status == 408);
+    CHECK(response->body == "deadline");
+  }
+  CHECK(observed_timeout);
+  server.stop();
+}
+
+// Verifies server request bodies can be spooled to a unique temporary file with exact binary contents.
+TEST(server_stream_body_spools_to_temporary_file) {
+  const auto root = unique_test_directory("chhttp-stream-temp");
+  chhttp::Server server;
+  server.post_stream(
+      "/temp",
+      [root](chhttp::Request &, chhttp::RequestBodyStream &body,
+             chhttp::Response &response) -> chhttp::Task<void> {
+        auto stored = co_await body.save_to_temp(root);
+        CHECK(stored && stored->size == 512 * 1024);
+        std::ifstream input(stored->path, std::ios::binary);
+        std::string data((std::istreambuf_iterator<char>(input)), {});
+        CHECK(data == std::string(512 * 1024, '\x7f'));
+        const auto owner = stored->path.parent_path();
+        std::error_code ignored;
+        std::filesystem::remove_all(owner, ignored);
+        response.set_content("stored");
+      });
+  CHECK(server.start("127.0.0.1", 0));
+  chhttp::Client client("http://127.0.0.1:" +
+                        std::to_string(server.port()));
+  auto response = client.post("/temp", std::string(512 * 1024, '\x7f'),
+                              "application/octet-stream");
+  CHECK(response && response->body == "stored");
+  server.stop();
+  std::error_code ignored;
+  std::filesystem::remove_all(root, ignored);
+}
+
+// Verifies MultipartWriter mixes fields and a large file while the server parses every part incrementally.
+TEST(streaming_multipart_writer_and_server_parser_round_trip) {
+  const auto root = unique_test_directory("chhttp-multipart-writer");
+  const auto file = root / "image.bin";
+  std::ofstream(file, std::ios::binary) << std::string(2 * 1024 * 1024, 'p');
+  chhttp::Server server;
+  server.post_stream(
+      "/multipart-stream",
+      [](chhttp::Request &request, chhttp::RequestBodyStream &body,
+         chhttp::Response &response) -> chhttp::Task<void> {
+        std::string current;
+        std::string prompt;
+        std::uint64_t file_size = 0;
+        auto error = co_await chhttp::consume_multipart(
+            body, request.get_header("Content-Type"),
+            {.on_part_begin = [&](const chhttp::MultipartPart &part)
+                                  -> chhttp::Task<bool> {
+               current = part.name;
+               if (current == "image") CHECK(part.filename == "vision.bin");
+               co_return true;
+             },
+             .on_part_data = [&](std::string_view data)
+                                 -> chhttp::Task<bool> {
+               if (current == "prompt") prompt.append(data);
+               if (current == "image") {
+                 CHECK(std::ranges::all_of(data,
+                                           [](char ch) { return ch == 'p'; }));
+                 file_size += data.size();
+               }
+               co_return true;
+             }});
+        CHECK(!error);
+        response.set_content(request.get_header("Content-Length") + "|" +
+                             prompt + "|" + std::to_string(file_size));
+      },
+      {.max_body_size = 4 * 1024 * 1024});
+  CHECK(server.start("127.0.0.1", 0));
+  chhttp::MultipartWriter multipart("known-length-boundary");
+  multipart.add_field("prompt", "describe this image")
+      .add_file("image", file, "application/octet-stream", "vision.bin");
+  CHECK(multipart.content_length());
+  chhttp::Request request;
+  request.method = "POST";
+  request.target = "/multipart-stream";
+  multipart.apply(request);
+  chhttp::AsyncClient client("http://127.0.0.1:" +
+                             std::to_string(server.port()));
+  auto response = client.request(std::move(request)).get();
+  CHECK(response && response->body.ends_with("|describe this image|2097152"));
+  CHECK(!response->body.starts_with("|"));
+  server.stop();
+  std::error_code ignored;
+  std::filesystem::remove_all(root, ignored);
+}
+
+// Verifies an unknown-size multipart producer automatically uses chunked transfer coding and remains parseable.
+TEST(streaming_multipart_writer_supports_unknown_length_parts) {
+  chhttp::Server server;
+  server.post_stream(
+      "/dynamic-multipart",
+      [](chhttp::Request &request, chhttp::RequestBodyStream &body,
+         chhttp::Response &response) -> chhttp::Task<void> {
+        std::string data;
+        auto error = co_await chhttp::consume_multipart(
+            body, request.get_header("Content-Type"),
+            {.on_part_data = [&](std::string_view chunk)
+                                 -> chhttp::Task<bool> {
+               data.append(chunk);
+               co_return true;
+             }});
+        CHECK(!error);
+        response.set_content(request.get_header("Transfer-Encoding") + "|" +
+                             data);
+      });
+  CHECK(server.start("127.0.0.1", 0));
+  chhttp::MultipartWriter multipart;
+  multipart.add_stream(
+      "tokens", "tokens.txt", "text/plain",
+      [](chhttp::StreamWriter &writer) -> chhttp::Task<void> {
+        CHECK(co_await writer.write("alpha"));
+        co_await chhttp::sleep_for(std::chrono::milliseconds(1));
+        CHECK(co_await writer.write("beta"));
+      });
+  CHECK(!multipart.content_length());
+  chhttp::Request request;
+  request.method = "POST";
+  request.target = "/dynamic-multipart";
+  multipart.apply(request);
+  chhttp::AsyncClient client("http://127.0.0.1:" +
+                             std::to_string(server.port()));
+  auto response = client.request(std::move(request)).get();
+  CHECK(response && response->body == "chunked|alphabeta");
+  server.stop();
+}
+
+// Verifies malformed streamed multipart input reports a multipart error instead of accepting a truncated part.
+TEST(server_incremental_multipart_rejects_missing_closing_boundary) {
+  chhttp::Server server;
+  server.post_stream(
+      "/bad-multipart",
+      [](chhttp::Request &request, chhttp::RequestBodyStream &body,
+         chhttp::Response &response) -> chhttp::Task<void> {
+        auto error = co_await chhttp::consume_multipart(
+            body, request.get_header("Content-Type"), {});
+        CHECK(error.code == chhttp::Error::multipart);
+        response.status = 400;
+        response.set_content("malformed");
+      });
+  CHECK(server.start("127.0.0.1", 0));
+  chhttp::Client client("http://127.0.0.1:" +
+                        std::to_string(server.port()));
+  auto response = client.post(
+      "/bad-multipart",
+      "--broken\r\nContent-Disposition: form-data; name=\"x\"\r\n\r\nabc",
+      "multipart/form-data; boundary=broken");
+  CHECK(response && response->status == 400 && response->body == "malformed");
+  server.stop();
+}
+
+// Exercises one 100 MiB chunked upload while keeping both producer and server memory bounded to one chunk.
+TEST(stress_server_streams_one_hundred_megabyte_upload) {
+  constexpr std::uint64_t total_size = 100ull * 1024 * 1024;
+  constexpr std::size_t chunk_size = 64 * 1024;
+  chhttp::Server server;
+  server.post_stream(
+      "/100m",
+      [](chhttp::Request &, chhttp::RequestBodyStream &body,
+         chhttp::Response &response) -> chhttp::Task<void> {
+        std::uint64_t received = 0;
+        auto error = co_await body.consume(
+            [&](std::string_view chunk) -> chhttp::Task<bool> {
+              CHECK(std::ranges::all_of(chunk,
+                                        [](char ch) { return ch == 'L'; }));
+              received += chunk.size();
+              co_return true;
+            });
+        CHECK(!error);
+        response.set_content(std::to_string(received));
+      },
+      {.max_body_size = 128 * 1024 * 1024});
+  CHECK(server.start("127.0.0.1", 0));
+  chhttp::Request request;
+  request.method = "POST";
+  request.target = "/100m";
+  request.set_stream_body([](chhttp::StreamWriter &writer)
+                              -> chhttp::Task<void> {
+    const std::string chunk(chunk_size, 'L');
+    for (std::uint64_t offset = 0; offset < total_size; offset += chunk.size())
+      CHECK(co_await writer.write(chunk));
+  });
+  chhttp::AsyncClient client("http://127.0.0.1:" +
+                             std::to_string(server.port()));
+  auto response = client.request(std::move(request)).get();
+  CHECK(response && response->body == std::to_string(total_size));
+  server.stop();
+}
+
+// Exercises eight concurrent 10 MiB uploads through a four-connection pool and verifies isolation plus limits.
+TEST(stress_concurrent_ten_megabyte_server_streams) {
+  constexpr int count = 8;
+  constexpr std::size_t total_size = 10 * 1024 * 1024;
+  constexpr std::size_t chunk_size = 64 * 1024;
+  chhttp::Server server;
+  server.post_stream(
+      "/large-stream",
+      [](chhttp::Request &, chhttp::RequestBodyStream &body,
+         chhttp::Response &response) -> chhttp::Task<void> {
+        char marker = 0;
+        std::uint64_t received = 0;
+        auto error = co_await body.consume(
+            [&](std::string_view chunk) -> chhttp::Task<bool> {
+              if (marker == 0) marker = chunk.front();
+              CHECK(std::ranges::all_of(
+                  chunk, [&](char value) { return value == marker; }));
+              received += chunk.size();
+              co_return true;
+            });
+        CHECK(!error);
+        response.set_content(std::string(1, marker) + "|" +
+                             std::to_string(received));
+      },
+      {.max_body_size = 12 * 1024 * 1024});
+  CHECK(server.start("127.0.0.1", 0));
+  chhttp::ClientOptions options;
+  options.connection_pool_size = 4;
+  options.max_connections_per_origin = 4;
+  chhttp::AsyncClient client("http://127.0.0.1:" +
+                                 std::to_string(server.port()),
+                             std::move(options));
+  std::vector<chhttp::Task<chhttp::ResponseResult>> uploads;
+  for (int index = 0; index != count; ++index) {
+    const char marker = static_cast<char>('a' + index);
+    chhttp::Request request;
+    request.method = "POST";
+    request.target = "/large-stream";
+    request.set_stream_body(
+        [marker](chhttp::StreamWriter &writer) -> chhttp::Task<void> {
+          const std::string chunk(chunk_size, marker);
+          for (std::size_t offset = 0; offset < total_size;
+               offset += chunk.size())
+            if (!co_await writer.write(chunk)) co_return;
+        });
+    uploads.push_back(client.request(std::move(request)));
+  }
+  for (int index = 0; index != count; ++index) {
+    auto response = uploads[index].get();
+    CHECK(response &&
+          response->body == std::string(1, static_cast<char>('a' + index)) +
+                                "|" + std::to_string(total_size));
+  }
+  server.stop();
+}
+
+// Exercises concurrent multipart file readers, network backpressure, parser isolation, and a bounded connection pool.
+TEST(stress_concurrent_streaming_multipart_files) {
+  constexpr int count = 12;
+  constexpr std::size_t file_size = 4 * 1024 * 1024;
+  const auto root = unique_test_directory("chhttp-multipart-stress");
+  const auto file = root / "artifact.bin";
+  std::ofstream(file, std::ios::binary) << std::string(file_size, 'm');
+  chhttp::Server server;
+  server.post_stream(
+      "/multipart-load",
+      [](chhttp::Request &request, chhttp::RequestBodyStream &body,
+         chhttp::Response &response) -> chhttp::Task<void> {
+        std::uint64_t received = 0;
+        auto error = co_await chhttp::consume_multipart(
+            body, request.get_header("Content-Type"),
+            {.on_part_data = [&](std::string_view chunk)
+                                 -> chhttp::Task<bool> {
+               CHECK(std::ranges::all_of(chunk,
+                                         [](char ch) { return ch == 'm'; }));
+               received += chunk.size();
+               co_return true;
+             }});
+        CHECK(!error);
+        response.set_content(std::to_string(received));
+      },
+      {.max_body_size = 5 * 1024 * 1024});
+  CHECK(server.start("127.0.0.1", 0));
+  chhttp::ClientOptions options;
+  options.connection_pool_size = 4;
+  options.max_connections_per_origin = 4;
+  chhttp::AsyncClient client("http://127.0.0.1:" +
+                                 std::to_string(server.port()),
+                             std::move(options));
+  std::vector<chhttp::Task<chhttp::ResponseResult>> uploads;
+  for (int index = 0; index != count; ++index) {
+    chhttp::MultipartWriter multipart;
+    multipart.add_file("artifact", file);
+    chhttp::Request request;
+    request.method = "POST";
+    request.target = "/multipart-load";
+    multipart.apply(request);
+    uploads.push_back(client.request(std::move(request)));
+  }
+  for (auto &upload : uploads) {
+    auto response = upload.get();
+    CHECK(response && response->body == std::to_string(file_size));
+  }
+  server.stop();
+  std::error_code ignored;
+  std::filesystem::remove_all(root, ignored);
 }
 
 #ifdef CHHTTP_HAS_TLS
