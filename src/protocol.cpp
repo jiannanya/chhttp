@@ -665,14 +665,20 @@ Task<Result<Request>> read_request(const std::shared_ptr<Connection> &connection
   std::string routing_target = request.target;
   if (routing_target.find("://") != std::string::npos) {
     auto absolute = parse_url(routing_target);
-    if (!absolute) co_return absolute.error();
+    if (!absolute)
+      co_return ErrorInfo{Error::protocol,
+                          "Invalid absolute HTTP request target: " +
+                              absolute.error().message};
     routing_target = absolute->target;
   }
   const auto query = routing_target.find('?');
   request.path = routing_target.substr(0, query);
   if (request.path.empty()) request.path = "/";
   auto decoded_path = url_decode(request.path);
-  if (!decoded_path) co_return decoded_path.error();
+  if (!decoded_path)
+    co_return ErrorInfo{Error::protocol,
+                        "Invalid encoded HTTP request path: " +
+                            decoded_path.error().message};
   request.path = std::move(*decoded_path);
   if (query != std::string::npos)
     request.query = parse_query(std::string_view(routing_target).substr(query + 1));
@@ -743,16 +749,15 @@ Task<ResponseResult> read_response(
       response.body = std::move(*decoded);
       response.headers.erase("Content-Encoding");
       response.headers.set("Content-Length", std::to_string(response.body.size()));
-      if (options.on_data) {
-        if (!options.on_data(response.body))
-          co_return ErrorInfo{Error::cancelled,
-                              "HTTP body callback cancelled the transfer"};
-        if (options.on_progress &&
-            !options.on_progress(response.body.size(), response.body.size()))
-          co_return ErrorInfo{Error::cancelled,
-                              "HTTP progress callback cancelled the transfer"};
+      if (options.on_data && !options.on_data(response.body))
+        co_return ErrorInfo{Error::cancelled,
+                            "HTTP body callback cancelled the transfer"};
+      if (options.on_progress &&
+          !options.on_progress(response.body.size(), response.body.size()))
+        co_return ErrorInfo{Error::cancelled,
+                            "HTTP progress callback cancelled the transfer"};
+      if (options.on_data)
         response.body.clear();
-      }
     }
     if (response.status >= 100 && response.status < 200 && response.status != 101)
       continue;

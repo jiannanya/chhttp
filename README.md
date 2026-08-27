@@ -74,6 +74,21 @@ cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
 
+The test executable separates protocol/feature checks from load and lifecycle
+checks. Run either group independently, or repeat the stress group until the
+first failure:
+
+```sh
+ctest --test-dir build -L functional --output-on-failure
+ctest --test-dir build -L stress --output-on-failure
+ctest --test-dir build -L stress --repeat until-fail:30 --output-on-failure
+```
+
+Running `chhttp_tests` without an argument executes both groups. The stress
+group covers concurrent sync/async HTTP, connection recycling, cancellation
+storms, repeated server startup/shutdown, graceful draining, large concurrent
+WebSocket frames and HTTPS concurrency.
+
 Consumers link the installed package as follows:
 
 ```cmake
