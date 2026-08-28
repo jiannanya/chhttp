@@ -199,6 +199,33 @@ bool redirect_status(int status) {
          status == 308;
 }
 
+TransferPhase connection_phase(const ErrorInfo &error) noexcept {
+  switch (error.code) {
+  case Error::resolve:
+    return TransferPhase::resolve;
+  case Error::tls_unavailable:
+  case Error::tls_configuration:
+  case Error::tls_handshake:
+  case Error::tls_verification:
+    return TransferPhase::tls_handshake;
+  default:
+    return TransferPhase::connect;
+  }
+}
+
+ErrorInfo with_transfer(ErrorInfo error, TransferPhase phase,
+                        std::uint64_t uploaded = 0,
+                        std::uint64_t downloaded = 0,
+                        bool response_started = false) {
+  if (!error.transfer)
+    error.transfer = TransferContext{};
+  error.transfer->phase = phase;
+  error.transfer->uploaded = uploaded;
+  error.transfer->downloaded = downloaded;
+  error.transfer->response_started = response_started;
+  return error;
+}
+
 class RequestControl {
 public:
   void bind(const std::shared_ptr<detail::Connection> &connection) {
@@ -494,17 +521,21 @@ public:
       return control->cancelled();
     };
     if (cancelled())
-      co_return ErrorInfo{Error::cancelled, "Request cancelled"};
+      co_return with_transfer(ErrorInfo{Error::cancelled, "Request cancelled"},
+                              TransferPhase::none);
     if (request_options.deadline &&
         std::chrono::steady_clock::now() >= *request_options.deadline)
-      co_return ErrorInfo{Error::timeout, "Request deadline exceeded"};
+      co_return with_transfer(
+          ErrorInfo{Error::timeout, "Request deadline exceeded"},
+          TransferPhase::none);
 
     for (const auto &[name, value] : options.default_headers)
-      if (!request.headers.contains(name)) request.headers.add(name, value);
+      if (!request.headers.contains(name))
+        request.headers.add(name, value);
     request.headers.set("Host", url.authority());
     request.keep_alive = options.keep_alive;
-    const bool auto_decompress = request_options.auto_decompress.value_or(
-        options.auto_decompress);
+    const bool auto_decompress =
+        request_options.auto_decompress.value_or(options.auto_decompress);
 #ifdef CHHTTP_HAS_COMPRESSION
     if (auto_decompress && !request.headers.contains("Accept-Encoding"))
       request.headers.set("Accept-Encoding", "gzip, deflate, br, zstd");
@@ -520,39 +551,63 @@ public:
         request.headers.set("Authorization",
                             bearer_auth(options.authentication.token));
         break;
-      default: break;
+      default:
+        break;
       }
     }
     if (!options.proxy.url.empty() && !url.secure &&
         !options.proxy.username.empty())
-      request.headers.set("Proxy-Authorization",
-                          basic_auth(options.proxy.username,
-                                     options.proxy.password));
+      request.headers.set(
+          "Proxy-Authorization",
+          basic_auth(options.proxy.username, options.proxy.password));
 
     const Request original_request = request;
     for (int attempt = 0; attempt != 2; ++attempt) {
+      std::uint64_t uploaded = 0;
+      std::uint64_t downloaded = 0;
+      bool response_started = false;
+      bool response_head_accepted = false;
+      ProgressHandler upload_progress = [&](const TransferProgress &progress) {
+        uploaded = progress.transferred;
+        return !request_options.on_upload_progress ||
+               request_options.on_upload_progress(progress);
+      };
+      ProgressHandler download_progress =
+          [&](const TransferProgress &progress) {
+            downloaded = progress.transferred;
+            if (request_options.on_download_progress)
+              return request_options.on_download_progress(progress);
+            return !request_options.on_progress ||
+                   request_options.on_progress(progress.transferred,
+                                               progress.total.value_or(0));
+          };
       auto lease_result = co_await acquire(url, control, request_options);
-      if (!lease_result) co_return lease_result.error();
+      if (!lease_result)
+        co_return with_transfer(lease_result.error(),
+                                connection_phase(lease_result.error()));
       auto lease = std::move(*lease_result);
       if (cancelled()) {
         control->unbind(lease.connection);
         discard(std::move(lease));
-        co_return ErrorInfo{Error::cancelled, "Request cancelled"};
+        co_return with_transfer(
+            ErrorInfo{Error::cancelled, "Request cancelled"},
+            TransferPhase::connect);
       }
-      const std::string wire_target =
-          !options.proxy.url.empty() && !url.secure
-              ? url.origin() + url.target
-              : url.target;
+      const std::string wire_target = !options.proxy.url.empty() && !url.secure
+                                          ? url.origin() + url.target
+                                          : url.target;
       auto write_timeout = limited_timeout(
           request_options.write_timeout.value_or(options.write_timeout),
           request_options.deadline);
       if (!write_timeout) {
         control->unbind(lease.connection);
         discard(std::move(lease));
-        co_return write_timeout.error();
+        co_return with_transfer(write_timeout.error(),
+                                TransferPhase::request_head);
       }
-      auto write_error = co_await detail::write_request(
-          lease.connection, request, wire_target, *write_timeout);
+      auto write_error =
+          co_await detail::write_request(lease.connection, request, wire_target,
+                                         *write_timeout, upload_progress);
       if (write_error) {
         const bool retry = lease.reused && attempt == 0 &&
                            idempotent_method(request.method) &&
@@ -560,32 +615,40 @@ public:
         control->unbind(lease.connection);
         discard(std::move(lease));
         if (cancelled())
-          co_return ErrorInfo{Error::cancelled, "Request cancelled"};
-        if (retry) continue;
-        co_return write_error;
+          co_return with_transfer(
+              ErrorInfo{Error::cancelled, "Request cancelled"},
+              write_error.transfer ? write_error.transfer->phase
+                                   : TransferPhase::request_body,
+              uploaded);
+        if (retry)
+          continue;
+        const auto phase = write_error.transfer ? write_error.transfer->phase
+                                                : TransferPhase::request_body;
+        co_return with_transfer(std::move(write_error), phase, uploaded);
       }
-
-      bool response_started = false;
       detail::HttpReadOptions read_options{
           .max_header_size = 64 * 1024,
           .max_body_size = request_options.max_response_body_size.value_or(
               options.max_response_body_size),
-          .read_timeout = request_options.read_timeout.value_or(
-              options.read_timeout),
+          .read_timeout =
+              request_options.read_timeout.value_or(options.read_timeout),
           .header_timeout = request_options.header_timeout,
           .first_body_byte_timeout = request_options.first_body_byte_timeout,
           .idle_timeout = request_options.idle_timeout,
           .deadline = request_options.deadline,
           .auto_decompress = auto_decompress,
           .cancelled = cancelled,
-          .on_response_head = [&](const ResponseHead &head) {
-            response_started = true;
-            return !request_options.on_response_head ||
-                   request_options.on_response_head(head);
-          },
+          .on_response_head =
+              [&](const ResponseHead &head) {
+                response_started = true;
+                const bool accepted = !request_options.on_response_head ||
+                                      request_options.on_response_head(head);
+                response_head_accepted = accepted;
+                return accepted;
+              },
           .on_data = request_options.on_data,
           .on_data_async = request_options.on_data_async,
-          .on_progress = request_options.on_progress};
+          .on_progress = download_progress};
       auto response = co_await detail::read_response(
           lease.connection, lease.buffer, request.method, read_options);
       if (!response) {
@@ -595,14 +658,26 @@ public:
         control->unbind(lease.connection);
         discard(std::move(lease));
         if (cancelled())
-          co_return ErrorInfo{Error::cancelled, "Request cancelled"};
-        if (retry) continue;
-        co_return response.error();
+          co_return with_transfer(
+              ErrorInfo{Error::cancelled, "Request cancelled"},
+              response_head_accepted ? TransferPhase::response_body
+                                     : TransferPhase::response_head,
+              uploaded, downloaded, response_started);
+        if (retry)
+          continue;
+        co_return with_transfer(response.error(),
+                                response_head_accepted
+                                    ? TransferPhase::response_body
+                                    : TransferPhase::response_head,
+                                uploaded, downloaded, response_started);
       }
       if (cancelled()) {
         control->unbind(lease.connection);
         discard(std::move(lease));
-        co_return ErrorInfo{Error::cancelled, "Request cancelled"};
+        co_return with_transfer(
+            ErrorInfo{Error::cancelled, "Request cancelled"},
+            TransferPhase::response_body, uploaded, downloaded,
+            response_started);
       }
 
       const bool reusable = request.keep_alive && response->keep_alive;
@@ -612,13 +687,14 @@ public:
       if (response->status == 401 && !digest_attempted &&
           allow_automatic_auth &&
           options.authentication.type == AuthenticationType::digest) {
-        auto challenge = parse_digest_challenge(
-            response->headers.get("WWW-Authenticate"));
+        auto challenge =
+            parse_digest_challenge(response->headers.get("WWW-Authenticate"));
         if (challenge) {
           auto authorization = digest_auth(
               request.method, url.target, options.authentication.username,
               options.authentication.password, *challenge);
-          if (!authorization) co_return authorization.error();
+          if (!authorization)
+            co_return authorization.error();
           request = original_request;
           request.headers.set("Authorization", std::move(*authorization));
           co_return co_await exchange(url, std::move(request),
@@ -634,11 +710,14 @@ public:
                               "HTTP redirect limit exceeded"};
         auto resolved = detail::resolve_url(url.origin() + url.target,
                                             response->headers.get("Location"));
-        if (!resolved) co_return resolved.error();
+        if (!resolved)
+          co_return resolved.error();
         auto next_url = detail::parse_url(*resolved);
-        if (!next_url) co_return next_url.error();
+        if (!next_url)
+          co_return next_url.error();
         const bool same_origin = next_url->origin() == url.origin();
-        if (!same_origin) request.headers.erase("Authorization");
+        if (!same_origin)
+          request.headers.erase("Authorization");
         if (response->status == 303 ||
             ((response->status == 301 || response->status == 302) &&
              detail::iequals(request.method, "POST"))) {
@@ -649,25 +728,32 @@ public:
           request.headers.erase("Content-Type");
         }
         request.target = next_url->target;
-        co_return co_await exchange(*next_url, std::move(request),
-                                    std::move(request_options), control,
-                                    redirects + 1, false,
-                                    same_origin && allow_automatic_auth);
+        co_return co_await exchange(
+            *next_url, std::move(request), std::move(request_options), control,
+            redirects + 1, false, same_origin && allow_automatic_auth);
       }
       co_return response;
     }
-    co_return ErrorInfo{Error::connect, "Unable to use pooled connection"};
+    co_return with_transfer(
+        ErrorInfo{Error::connect, "Unable to use pooled connection"},
+        TransferPhase::connect);
   }
 
   Task<ResponseResult> request(Request request,
                                RequestOptions request_options) {
-    if (!base) co_return base.error();
+    if (!base)
+      co_return base.error();
     if (request_options.on_data && request_options.on_data_async)
       co_return ErrorInfo{Error::invalid_argument,
                           "Configure either on_data or on_data_async"};
+    if (request_options.on_download_progress && request_options.on_progress)
+      co_return ErrorInfo{
+          Error::invalid_argument,
+          "Configure either on_download_progress or on_progress"};
     if (request.body_stream && !request.body.empty())
-      co_return ErrorInfo{Error::invalid_argument,
-                          "Configure either a buffered or streamed request body"};
+      co_return ErrorInfo{
+          Error::invalid_argument,
+          "Configure either a buffered or streamed request body"};
     if (!request.body_stream && request.body_stream_length)
       co_return ErrorInfo{Error::invalid_argument,
                           "A streamed body length requires a body producer"};
