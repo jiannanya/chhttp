@@ -35,6 +35,9 @@ no third-party HTTP, WebSocket or URL library is used.
   consumers with backpressure, progress and exact per-request cancellation
 - Fixed-length and HTTP/1.1 chunked request-body producers with awaited
   transport backpressure, avoiding complete upload buffers in the client
+- File-slice request bodies, independent upload/download progress, transfer
+  failure context, strict Content-Range helpers and ordered asynchronous file
+  sinks for application-managed resumable transfers
 - Server request-body stream routes with per-route size/deadline/idle limits,
   awaited consumer backpressure, active cancellation and temporary-file spooling
 - Public incremental WHATWG SSE parser plus GET/POST/arbitrary-method SSE
@@ -42,7 +45,8 @@ no third-party HTTP, WebSocket or URL library is used.
 - RFC 6455 WebSocket client/server, text/binary messages, ping, close and
   subprotocol negotiation; connections remain asynchronous at scale
 - Buffered and incremental `multipart/form-data` parsing plus a high-level
-  field/file/custom-stream writer with automatic fixed-length or chunked framing
+  field/file/file-slice/custom-stream writer with automatic fixed-length or
+  chunked framing
 - Incremental Base64 and streamed JSON-string production for vision/audio model
   inputs without constructing the encoded payload in memory
 - Incremental gzip, deflate, Brotli and Zstandard response decoding, including
@@ -93,8 +97,8 @@ ctest --test-dir build -L stress --output-on-failure
 ctest --test-dir build -L stress --repeat until-fail:30 --output-on-failure
 ```
 
-Running `chhttp_tests` without an argument executes all 149 registered groups:
-123 focused functional/boundary groups and 26 load/lifecycle groups. The stress
+Running `chhttp_tests` without an argument executes all 157 registered groups:
+129 focused functional/boundary groups and 28 load/lifecycle groups. The stress
 group covers concurrent sync/async HTTP, thousands of keep-alive requests,
 large buffered and streamed uploads (including bounded-memory 100 MiB and
 concurrent 10 MiB cases), streamed callbacks, connection recycling, independent
@@ -215,7 +219,7 @@ auto response = co_await client.get("/stream", {}, {
     consume(bytes);
     return true;
   },
-  .on_progress = [](std::uint64_t now, std::uint64_t total) {
+  .on_download_progress = [](const chhttp::TransferProgress& progress) {
     return true;
   }
 });
@@ -269,6 +273,64 @@ upload.set_stream_body([](chhttp::StreamWriter& writer)
 });
 auto response = co_await client.request(std::move(upload));
 ```
+
+## Application-managed resumable transfers
+
+`chhttp` exposes the stateless building blocks for resume logic. It does not
+store checkpoints, infer a server-committed upload offset, retry side-effecting
+requests, or implement provider-specific upload sessions.
+
+Send an exact interval from a file without buffering it:
+
+```cpp
+chhttp::Request part;
+part.method = "PUT";
+part.target = "/uploads/session/chunk";
+part.headers.set("Content-Range", "bytes 8388608-12582911/67108864");
+auto configured = part.set_file_body(
+    source, {.offset = 8388608, .length = 4 * 1024 * 1024});
+if (!configured) co_return configured.error();
+
+auto response = co_await client.request(std::move(part), {
+  .on_upload_progress = [](const chhttp::TransferProgress& progress) {
+    update_upload_ui(progress.transferred, progress.total);
+    return true;
+  }
+});
+```
+
+Compose validated Range responses with an asynchronous file sink:
+
+```cpp
+auto sink_result = chhttp::AsyncFileSink::open(
+    partial_path, {.mode = chhttp::FileSinkMode::append});
+if (!sink_result) co_return sink_result.error();
+auto sink = std::move(*sink_result);
+
+chhttp::Headers headers;
+auto ranged = chhttp::set_byte_range(headers, durable_size,
+                                     std::nullopt, saved_etag);
+if (!ranged) co_return ranged.error();
+headers.set("Accept-Encoding", "identity");
+
+auto response = co_await client.get(target, std::move(headers), {
+  .on_response_head = [&](const chhttp::ResponseHead& head) {
+    auto range = chhttp::parse_content_range(
+        head.headers.get("Content-Range"));
+    return head.status == 206 && range && range->unit == "bytes" &&
+           range->first == durable_size;
+  },
+  .on_data_async = [&](std::string_view bytes) -> chhttp::Task<bool> {
+    co_return !(co_await sink.write(bytes));
+  },
+  .auto_decompress = false
+});
+```
+
+After a failure, `ErrorInfo::transfer` identifies the phase, uploaded and
+downloaded payload counts, and whether a final response head was received.
+These counters are observability data—not proof that the server durably
+accepted the same upload offset.
 
 ## Server request-body streaming
 

@@ -1,7 +1,7 @@
 #pragma once
 
-#include <atomic>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <coroutine>
@@ -15,8 +15,8 @@
 #include <mutex>
 #include <optional>
 #include <span>
-#include <stop_token>
 #include <stdexcept>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -289,11 +289,37 @@ enum class Error {
   internal
 };
 
+enum class TransferPhase {
+  none,
+  resolve,
+  connect,
+  tls_handshake,
+  request_head,
+  request_body,
+  response_head,
+  response_body
+};
+
+struct TransferProgress {
+  std::uint64_t transferred{0};
+  std::optional<std::uint64_t> total;
+};
+
+using ProgressHandler = std::function<bool(const TransferProgress &)>;
+
+struct TransferContext {
+  TransferPhase phase{TransferPhase::none};
+  std::uint64_t uploaded{0};
+  std::uint64_t downloaded{0};
+  bool response_started{false};
+};
+
 struct ErrorInfo {
   Error code{Error::none};
   std::string message;
   int system_code{0};
   long tls_code{0};
+  std::optional<TransferContext> transfer;
 
   explicit operator bool() const noexcept { return code != Error::none; }
 };
@@ -322,8 +348,30 @@ private:
   ErrorInfo error_;
 };
 
+template <> class Result<void> {
+public:
+  Result() = default;
+  Result(ErrorInfo error) : error_(std::move(error)) {}
+
+  [[nodiscard]] explicit operator bool() const noexcept { return !error_; }
+  [[nodiscard]] bool has_value() const noexcept { return !error_; }
+  void value() const {
+    if (error_)
+      throw std::logic_error("chhttp::Result<void> has no value");
+  }
+  [[nodiscard]] const ErrorInfo &error() const noexcept { return error_; }
+
+private:
+  ErrorInfo error_;
+};
+
 class StreamWriter;
 using StreamHandler = std::function<Task<void>(StreamWriter &)>;
+
+struct FileBodyOptions {
+  std::uint64_t offset{0};
+  std::optional<std::uint64_t> length;
+};
 
 struct Request {
   std::string method{"GET"};
@@ -350,8 +398,11 @@ struct Request {
   [[nodiscard]] bool has_param(std::string_view name) const;
   [[nodiscard]] std::string get_param(std::string_view name,
                                       std::string_view fallback = {}) const;
-  void set_stream_body(StreamHandler handler,
-                       std::optional<std::uint64_t> content_length = std::nullopt);
+  void
+  set_stream_body(StreamHandler handler,
+                  std::optional<std::uint64_t> content_length = std::nullopt);
+  Result<void> set_file_body(std::filesystem::path path,
+                             FileBodyOptions options = {});
   [[nodiscard]] bool is_streaming_body() const noexcept;
 };
 
@@ -382,8 +433,36 @@ private:
   std::shared_ptr<Sink> sink_;
 };
 
-using AsyncBodyConsumer =
-    std::function<Task<bool>(std::string_view)>;
+enum class FileSinkMode { truncate, append, write_at };
+
+struct FileSinkOptions {
+  FileSinkMode mode{FileSinkMode::truncate};
+  std::uint64_t offset{0};
+};
+
+class AsyncFileSink {
+public:
+  static Result<AsyncFileSink> open(std::filesystem::path path,
+                                    FileSinkOptions options = {});
+  ~AsyncFileSink();
+  AsyncFileSink(AsyncFileSink &&) noexcept;
+  AsyncFileSink &operator=(AsyncFileSink &&) noexcept;
+  AsyncFileSink(const AsyncFileSink &) = delete;
+  AsyncFileSink &operator=(const AsyncFileSink &) = delete;
+
+  Task<ErrorInfo> write(std::string_view data);
+  Task<ErrorInfo> flush();
+  Task<ErrorInfo> sync();
+  [[nodiscard]] std::uint64_t written() const noexcept;
+  [[nodiscard]] std::uint64_t position() const noexcept;
+
+private:
+  class Impl;
+  explicit AsyncFileSink(std::shared_ptr<Impl> impl) : impl_(std::move(impl)) {}
+  std::shared_ptr<Impl> impl_;
+};
+
+using AsyncBodyConsumer = std::function<Task<bool>(std::string_view)>;
 using BodyConsumer = std::function<bool(std::string_view)>;
 
 struct StoredBody {
@@ -482,9 +561,12 @@ public:
   MultipartWriter &add_file(std::string name, std::filesystem::path path,
                             std::string content_type = {},
                             std::string filename = {});
+  MultipartWriter &add_file_slice(std::string name, std::filesystem::path path,
+                                  FileBodyOptions slice,
+                                  std::string content_type = {},
+                                  std::string filename = {});
   MultipartWriter &add_stream(std::string name, std::string filename,
-                              std::string content_type,
-                              StreamHandler producer,
+                              std::string content_type, StreamHandler producer,
                               std::optional<std::uint64_t> size = std::nullopt,
                               Headers headers = {});
   [[nodiscard]] std::string content_type() const;
@@ -772,6 +854,10 @@ struct RequestOptions {
   // An awaited consumer provides real backpressure without blocking the I/O
   // thread. Configure either on_data or on_data_async, never both.
   std::function<Task<bool>(std::string_view)> on_data_async;
+  ProgressHandler on_upload_progress;
+  ProgressHandler on_download_progress;
+  // Compatibility alias for on_download_progress. A total of zero means the
+  // response length is unknown. Configure only one download progress callback.
   std::function<bool(std::uint64_t current, std::uint64_t total)> on_progress;
   // Kept for source compatibility. It is observed at protocol boundaries but
   // cannot wake a blocked socket read; prefer stop_token for active cancel.
@@ -937,12 +1023,32 @@ Result<std::string> url_decode(std::string_view value,
 Params parse_query(std::string_view query);
 std::string make_query(const Params &params);
 Result<MultipartForm> parse_multipart(std::string_view body,
-                                     std::string_view content_type,
-                                     std::size_t max_parts = 1024);
-std::pair<std::string, std::string>
-make_multipart(const MultipartForm &parts, std::string boundary = {});
+                                      std::string_view content_type,
+                                      std::size_t max_parts = 1024);
+std::pair<std::string, std::string> make_multipart(const MultipartForm &parts,
+                                                   std::string boundary = {});
 std::string mime_type(const std::filesystem::path &path);
 std::string status_reason(int status);
+struct ContentRange {
+  std::string unit;
+  std::optional<std::uint64_t> first;
+  std::optional<std::uint64_t> last;
+  std::optional<std::uint64_t> total;
+
+  [[nodiscard]] bool satisfied() const noexcept {
+    return first.has_value() && last.has_value();
+  }
+};
+Result<ContentRange> parse_content_range(std::string_view value);
+Result<std::string>
+format_byte_range(std::uint64_t first,
+                  std::optional<std::uint64_t> last = std::nullopt);
+Result<std::string>
+format_content_range(std::uint64_t first, std::uint64_t last,
+                     std::optional<std::uint64_t> total = std::nullopt);
+Result<void> set_byte_range(Headers &headers, std::uint64_t first,
+                            std::optional<std::uint64_t> last = std::nullopt,
+                            std::string_view if_range = {});
 std::string basic_auth(std::string_view username, std::string_view password);
 std::string bearer_auth(std::string_view token);
 struct DigestChallenge {

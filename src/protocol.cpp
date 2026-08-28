@@ -400,13 +400,15 @@ Task<Result<std::string>> read_body(
     return received == 0 ? first_body_deadline : idle_deadline;
   };
   const auto read_more = [&]() -> Task<Result<Connection::ReadChunk>> {
-    co_return co_await timed_read(
-        connection, options, body_deadline(),
-        received == 0 ? "First response body byte" : "Response body idle");
+    co_return co_await timed_read(connection, options, body_deadline(),
+                                  received == 0 ? "First response body byte"
+                                                : "Response body idle");
   };
-  const auto deliver = [&](std::string_view data,
-                           std::uint64_t total) -> Task<ErrorInfo> {
-    if (data.empty()) co_return ErrorInfo{};
+  const auto deliver =
+      [&](std::string_view data,
+          std::optional<std::uint64_t> total) -> Task<ErrorInfo> {
+    if (data.empty())
+      co_return ErrorInfo{};
     if (options.cancelled && options.cancelled())
       co_return ErrorInfo{Error::cancelled, "Request cancelled"};
     if (options.deadline &&
@@ -424,12 +426,14 @@ Task<Result<std::string>> read_body(
                               "HTTP body callback cancelled the transfer"};
       } else if (options.on_data_async) {
         if (!co_await options.on_data_async(data))
-          co_return ErrorInfo{Error::cancelled,
-                              "HTTP async body callback cancelled the transfer"};
+          co_return ErrorInfo{
+              Error::cancelled,
+              "HTTP async body callback cancelled the transfer"};
       } else {
         body.append(data);
       }
-      if (options.on_progress && !options.on_progress(received, total))
+      if (options.on_progress &&
+          !options.on_progress(TransferProgress{received, total}))
         co_return ErrorInfo{Error::cancelled,
                             "HTTP progress callback cancelled the transfer"};
       if (options.deadline &&
@@ -438,25 +442,26 @@ Task<Result<std::string>> read_body(
       // Consumer backpressure is application work, not network idleness. Start
       // the next idle interval only after the awaited consumer is ready again.
       if (options.idle_timeout)
-        idle_deadline = std::chrono::steady_clock::now() + *options.idle_timeout;
+        idle_deadline =
+            std::chrono::steady_clock::now() + *options.idle_timeout;
     } catch (const std::exception &exception) {
-      co_return ErrorInfo{Error::internal,
-                          "HTTP body callback failed: " +
-                              std::string(exception.what())};
+      co_return ErrorInfo{Error::internal, "HTTP body callback failed: " +
+                                               std::string(exception.what())};
     } catch (...) {
       co_return ErrorInfo{Error::internal, "HTTP body callback failed"};
     }
     co_return ErrorInfo{};
   };
-  if (no_body) co_return body;
+  if (no_body)
+    co_return body;
 
   if (head.chunked) {
     for (;;) {
-      auto line = co_await read_line(connection, buffer, 16 * 1024, options,
-                                     body_deadline(),
-                                     received == 0 ? "First response body byte"
-                                                   : "Response body idle");
-      if (!line) co_return line.error();
+      auto line = co_await read_line(
+          connection, buffer, 16 * 1024, options, body_deadline(),
+          received == 0 ? "First response body byte" : "Response body idle");
+      if (!line)
+        co_return line.error();
       auto size_text = std::string_view(*line);
       const auto extension = size_text.find(';');
       if (extension != std::string_view::npos) {
@@ -466,27 +471,27 @@ Task<Result<std::string>> read_body(
         size_text = size_text.substr(0, extension);
       }
       std::uint64_t size = 0;
-      const auto conversion = std::from_chars(size_text.data(),
-                                               size_text.data() + size_text.size(),
-                                               size, 16);
+      const auto conversion = std::from_chars(
+          size_text.data(), size_text.data() + size_text.size(), size, 16);
       if (size_text.empty() || conversion.ec != std::errc{} ||
           conversion.ptr != size_text.data() + size_text.size())
         co_return ErrorInfo{Error::protocol, "Invalid chunk size"};
       if (size == 0) {
         std::size_t trailer_bytes = 0;
         for (;;) {
-          auto trailer = co_await read_line(connection, buffer,
-                                            options.max_header_size,
-                                            options, std::nullopt,
-                                            "Response trailer");
-          if (!trailer) co_return trailer.error();
+          auto trailer =
+              co_await read_line(connection, buffer, options.max_header_size,
+                                 options, std::nullopt, "Response trailer");
+          if (!trailer)
+            co_return trailer.error();
           if (trailer->size() > options.max_header_size ||
               trailer_bytes > options.max_header_size - trailer->size() ||
               options.max_header_size - trailer_bytes - trailer->size() < 2)
             co_return ErrorInfo{Error::protocol,
                                 "HTTP trailers exceed configured limit"};
           trailer_bytes += trailer->size() + 2;
-          if (trailer->empty()) break;
+          if (trailer->empty())
+            break;
           const auto colon = trailer->find(':');
           if (colon == std::string::npos)
             co_return ErrorInfo{Error::protocol, "Malformed HTTP trailer"};
@@ -502,7 +507,8 @@ Task<Result<std::string>> read_body(
         }
         break;
       }
-      if (size > options.max_body_size || received > options.max_body_size - size)
+      if (size > options.max_body_size ||
+          received > options.max_body_size - size)
         co_return ErrorInfo{Error::body_too_large,
                             "Chunked HTTP body exceeds configured limit"};
       if (size > std::numeric_limits<std::size_t>::max())
@@ -512,7 +518,8 @@ Task<Result<std::string>> read_body(
       while (remaining > 0) {
         if (buffer.empty()) {
           auto chunk = co_await read_more();
-          if (!chunk) co_return chunk.error();
+          if (!chunk)
+            co_return chunk.error();
           if (chunk->eof)
             co_return ErrorInfo{Error::protocol,
                                 "Unexpected end of HTTP chunk"};
@@ -520,15 +527,17 @@ Task<Result<std::string>> read_body(
         }
         const auto count = static_cast<std::size_t>(
             std::min<std::uint64_t>(remaining, buffer.size()));
-        auto error = co_await deliver(
-            std::string_view(buffer).substr(0, count), 0);
-        if (error) co_return error;
+        auto error = co_await deliver(std::string_view(buffer).substr(0, count),
+                                      std::nullopt);
+        if (error)
+          co_return error;
         buffer.erase(0, count);
         remaining -= count;
       }
       while (buffer.size() < 2) {
         auto chunk = co_await read_more();
-        if (!chunk) co_return chunk.error();
+        if (!chunk)
+          co_return chunk.error();
         if (chunk->eof)
           co_return ErrorInfo{Error::protocol,
                               "Unexpected end after HTTP chunk"};
@@ -550,16 +559,18 @@ Task<Result<std::string>> read_body(
     while (remaining > 0) {
       if (buffer.empty()) {
         auto chunk = co_await read_more();
-        if (!chunk) co_return chunk.error();
+        if (!chunk)
+          co_return chunk.error();
         if (chunk->eof)
           co_return ErrorInfo{Error::protocol, "Truncated HTTP body"};
         buffer += chunk->data;
       }
       const auto count = static_cast<std::size_t>(
           std::min<std::uint64_t>(remaining, buffer.size()));
-      auto error = co_await deliver(
-          std::string_view(buffer).substr(0, count), total);
-      if (error) co_return error;
+      auto error =
+          co_await deliver(std::string_view(buffer).substr(0, count), total);
+      if (error)
+        co_return error;
       buffer.erase(0, count);
       remaining -= count;
     }
@@ -568,16 +579,20 @@ Task<Result<std::string>> read_body(
 
   if (body_until_eof) {
     if (!buffer.empty()) {
-      auto error = co_await deliver(buffer, 0);
+      auto error = co_await deliver(buffer, std::nullopt);
       buffer.clear();
-      if (error) co_return error;
+      if (error)
+        co_return error;
     }
     for (;;) {
       auto chunk = co_await read_more();
-      if (!chunk) co_return chunk.error();
-      if (chunk->eof) break;
-      auto error = co_await deliver(chunk->data, 0);
-      if (error) co_return error;
+      if (!chunk)
+        co_return chunk.error();
+      if (chunk->eof)
+        break;
+      auto error = co_await deliver(chunk->data, std::nullopt);
+      if (error)
+        co_return error;
     }
   }
   co_return body;
@@ -1000,14 +1015,13 @@ read_request_body(const std::shared_ptr<Connection> &connection,
       } else {
         decoded_body.append(data);
       }
-      if (options.on_progress &&
-          !options.on_progress(decoded_received, 0))
+      if (options.on_progress && !options.on_progress(TransferProgress{
+                                     decoded_received, std::nullopt}))
         co_return ErrorInfo{Error::cancelled,
                             "Request progress callback cancelled the transfer"};
     } catch (const std::exception &exception) {
-      co_return ErrorInfo{Error::internal,
-                          "Request body callback failed: " +
-                              std::string(exception.what())};
+      co_return ErrorInfo{Error::internal, "Request body callback failed: " +
+                                               std::string(exception.what())};
     } catch (...) {
       co_return ErrorInfo{Error::internal, "Request body callback failed"};
     }
@@ -1146,18 +1160,16 @@ Task<ResponseResult> read_response(
         } else {
           decoded_body.append(data);
         }
-        if (options.on_progress &&
-            !options.on_progress(decoded_received, 0))
-          co_return ErrorInfo{
-              Error::cancelled,
-              "HTTP progress callback cancelled the transfer"};
+        if (options.on_progress && !options.on_progress(TransferProgress{
+                                       decoded_received, std::nullopt}))
+          co_return ErrorInfo{Error::cancelled,
+                              "HTTP progress callback cancelled the transfer"};
         if (options.deadline &&
             std::chrono::steady_clock::now() >= *options.deadline)
           co_return ErrorInfo{Error::timeout, "Request deadline exceeded"};
       } catch (const std::exception &exception) {
-        co_return ErrorInfo{Error::internal,
-                            "HTTP body callback failed: " +
-                                std::string(exception.what())};
+        co_return ErrorInfo{Error::internal, "HTTP body callback failed: " +
+                                                 std::string(exception.what())};
       } catch (...) {
         co_return ErrorInfo{Error::internal, "HTTP body callback failed"};
       }
@@ -1213,16 +1225,21 @@ class RequestBodySink final : public StreamWriter::Sink {
 public:
   RequestBodySink(std::shared_ptr<Connection> connection, bool chunked,
                   std::optional<std::uint64_t> length,
-                  std::chrono::milliseconds timeout)
-      : connection_(std::move(connection)), chunked_(chunked),
-        remaining_(length), timeout_(timeout) {}
+                  std::chrono::milliseconds timeout,
+                  ProgressHandler on_progress)
+      : connection_(std::move(connection)), chunked_(chunked), total_(length),
+        remaining_(length), timeout_(timeout),
+        on_progress_(std::move(on_progress)) {}
 
   Task<bool> write(std::string data) override {
-    if (error_ || finished_ || !connection_->open()) co_return false;
-    if (data.empty()) co_return true;
+    if (error_ || finished_ || !connection_->open())
+      co_return false;
+    if (data.empty())
+      co_return true;
     if (remaining_ && data.size() > *remaining_) {
       error_ = {Error::protocol,
                 "Streamed request body exceeds declared Content-Length"};
+      attach_context(error_);
       co_return false;
     }
     const auto size = data.size();
@@ -1231,9 +1248,29 @@ public:
                      : co_await connection_->write(std::move(data), timeout_);
     if (error) {
       error_ = std::move(error);
+      attach_context(error_);
       co_return false;
     }
-    if (remaining_) *remaining_ -= size;
+    if (remaining_)
+      *remaining_ -= size;
+    uploaded_ += size;
+    try {
+      if (on_progress_ && !on_progress_(TransferProgress{uploaded_, total_})) {
+        error_ = {Error::cancelled,
+                  "HTTP upload progress callback cancelled the transfer"};
+        attach_context(error_);
+        co_return false;
+      }
+    } catch (const std::exception &exception) {
+      error_ = {Error::internal, "HTTP upload progress callback failed: " +
+                                     std::string(exception.what())};
+      attach_context(error_);
+      co_return false;
+    } catch (...) {
+      error_ = {Error::internal, "HTTP upload progress callback failed"};
+      attach_context(error_);
+      co_return false;
+    }
     co_return true;
   }
 
@@ -1244,22 +1281,42 @@ public:
   }
 
   Task<ErrorInfo> finish() {
-    if (finished_) co_return error_;
+    if (finished_)
+      co_return error_;
     finished_ = true;
-    if (error_) co_return error_;
-    if (remaining_ && *remaining_ != 0)
-      co_return ErrorInfo{
-          Error::protocol,
-          "Streamed request body is shorter than declared Content-Length"};
-    if (chunked_) co_return co_await write_last_chunk(connection_, timeout_);
+    if (error_)
+      co_return error_;
+    if (remaining_ && *remaining_ != 0) {
+      ErrorInfo error{Error::protocol,
+                      "Streamed request body is shorter than declared "
+                      "Content-Length"};
+      attach_context(error);
+      co_return error;
+    }
+    if (chunked_) {
+      auto error = co_await write_last_chunk(connection_, timeout_);
+      if (error)
+        attach_context(error);
+      co_return error;
+    }
     co_return ErrorInfo{};
+  }
+
+  [[nodiscard]] std::uint64_t uploaded() const noexcept { return uploaded_; }
+
+  void attach_context(ErrorInfo &error) const {
+    error.transfer = TransferContext{.phase = TransferPhase::request_body,
+                                     .uploaded = uploaded_};
   }
 
 private:
   std::shared_ptr<Connection> connection_;
   bool chunked_{false};
+  std::optional<std::uint64_t> total_;
   std::optional<std::uint64_t> remaining_;
   std::chrono::milliseconds timeout_;
+  ProgressHandler on_progress_;
+  std::uint64_t uploaded_{0};
   ErrorInfo error_;
   bool finished_{false};
 };
@@ -1269,7 +1326,8 @@ private:
 Task<ErrorInfo> write_request(const std::shared_ptr<Connection> &connection,
                               const Request &request,
                               std::string_view wire_target,
-                              std::chrono::milliseconds timeout) {
+                              std::chrono::milliseconds timeout,
+                              ProgressHandler on_upload_progress) {
   const bool invalid_target = std::ranges::any_of(
       wire_target, [](unsigned char ch) { return ch <= 0x20 || ch == 0x7f; });
   if (!valid_header_name(request.method) || wire_target.empty() ||
@@ -1297,32 +1355,79 @@ Task<ErrorInfo> write_request(const std::shared_ptr<Connection> &connection,
   }
   if (!headers.contains("Connection"))
     headers.set("Connection", request.keep_alive ? "keep-alive" : "close");
-  if (!headers.contains("User-Agent")) headers.set("User-Agent", "chhttp/0.4");
-  auto output = serialize_head(request.method + " " + std::string(wire_target) +
-                                   (request.version == 10 ? " HTTP/1.0" : " HTTP/1.1"),
-                               headers);
-  if (!output) co_return output.error();
+  if (!headers.contains("User-Agent"))
+    headers.set("User-Agent", "chhttp/0.4");
+  auto output =
+      serialize_head(request.method + " " + std::string(wire_target) +
+                         (request.version == 10 ? " HTTP/1.0" : " HTTP/1.1"),
+                     headers);
+  if (!output)
+    co_return output.error();
   if (streaming) {
     if (auto error = co_await connection->write(std::move(*output), timeout);
-        error)
+        error) {
+      error.transfer = TransferContext{.phase = TransferPhase::request_head};
       co_return error;
+    }
     auto sink = std::make_shared<RequestBodySink>(
-        connection, chunked, request.body_stream_length, timeout);
+        connection, chunked, request.body_stream_length, timeout,
+        std::move(on_upload_progress));
     StreamWriter writer(sink);
     try {
       co_await request.body_stream(writer);
+    } catch (const StreamError &exception) {
+      auto error = exception.error();
+      error.transfer = TransferContext{.phase = TransferPhase::request_body,
+                                       .uploaded = sink->uploaded()};
+      co_return error;
     } catch (const std::exception &exception) {
-      co_return ErrorInfo{Error::internal,
-                          "Streamed request producer failed: " +
-                              std::string(exception.what())};
+      ErrorInfo error{Error::internal, "Streamed request producer failed: " +
+                                           std::string(exception.what())};
+      error.transfer = TransferContext{.phase = TransferPhase::request_body,
+                                       .uploaded = sink->uploaded()};
+      co_return error;
     } catch (...) {
-      co_return ErrorInfo{Error::internal,
-                          "Streamed request producer failed"};
+      ErrorInfo error{Error::internal, "Streamed request producer failed"};
+      error.transfer = TransferContext{.phase = TransferPhase::request_body,
+                                       .uploaded = sink->uploaded()};
+      co_return error;
     }
     co_return co_await sink->finish();
   }
   *output += request.body;
-  co_return co_await connection->write(std::move(*output), timeout);
+  if (auto error = co_await connection->write(std::move(*output), timeout);
+      error) {
+    error.transfer = TransferContext{
+        .phase = request.body.empty() ? TransferPhase::request_head
+                                      : TransferPhase::request_body};
+    co_return error;
+  }
+  if (!request.body.empty()) {
+    try {
+      if (on_upload_progress &&
+          !on_upload_progress(
+              TransferProgress{request.body.size(), request.body.size()})) {
+        ErrorInfo error{Error::cancelled,
+                        "HTTP upload progress callback cancelled the transfer"};
+        error.transfer = TransferContext{.phase = TransferPhase::request_body,
+                                         .uploaded = request.body.size()};
+        co_return error;
+      }
+    } catch (const std::exception &exception) {
+      ErrorInfo error{Error::internal,
+                      "HTTP upload progress callback failed: " +
+                          std::string(exception.what())};
+      error.transfer = TransferContext{.phase = TransferPhase::request_body,
+                                       .uploaded = request.body.size()};
+      co_return error;
+    } catch (...) {
+      ErrorInfo error{Error::internal, "HTTP upload progress callback failed"};
+      error.transfer = TransferContext{.phase = TransferPhase::request_body,
+                                       .uploaded = request.body.size()};
+      co_return error;
+    }
+  }
+  co_return ErrorInfo{};
 }
 
 Task<ErrorInfo> write_response_head(

@@ -29,6 +29,7 @@
 #include <fstream>
 #include <future>
 #include <iostream>
+#include <limits>
 #include <mutex>
 #include <set>
 #include <stdexcept>
@@ -3753,7 +3754,8 @@ TEST(server_stream_route_decompresses_request_chunks) {
 }
 #endif
 
-// Verifies declared and chunked request bodies are rejected at a stream route's independent size limit.
+// Verifies declared and chunked request bodies are rejected at a stream route's
+// independent size limit.
 TEST(server_stream_route_enforces_declared_and_runtime_body_limits) {
   chhttp::Server server;
   server.post_stream(
@@ -3784,7 +3786,8 @@ TEST(server_stream_route_enforces_declared_and_runtime_body_limits) {
   server.stop();
 }
 
-// Verifies a server consumer can cancel one request without poisoning a subsequent client operation.
+// Verifies a server consumer can cancel one request without poisoning a
+// subsequent client operation.
 TEST(server_stream_consumer_cancellation_is_request_scoped) {
   chhttp::Server server;
   std::atomic_bool observed_cancellation{false};
@@ -3817,7 +3820,8 @@ TEST(server_stream_consumer_cancellation_is_request_scoped) {
   server.stop();
 }
 
-// Verifies RequestBodyStream::cancel actively closes the selected upload while the server stays available.
+// Verifies RequestBodyStream::cancel actively closes the selected upload while
+// the server stays available.
 TEST(server_stream_active_cancel_interrupts_the_connection) {
   chhttp::Server server;
   std::atomic_uint64_t received{0};
@@ -3858,7 +3862,8 @@ TEST(server_stream_active_cancel_interrupts_the_connection) {
   server.stop();
 }
 
-// Verifies total request-body deadlines include time spent in an awaited slow consumer.
+// Verifies total request-body deadlines include time spent in an awaited slow
+// consumer.
 TEST(server_stream_total_deadline_covers_consumer_backpressure) {
   chhttp::Server server;
   std::atomic_bool observed_timeout{false};
@@ -3890,7 +3895,8 @@ TEST(server_stream_total_deadline_covers_consumer_backpressure) {
   server.stop();
 }
 
-// Verifies server request bodies can be spooled to a unique temporary file with exact binary contents.
+// Verifies server request bodies can be spooled to a unique temporary file with
+// exact binary contents.
 TEST(server_stream_body_spools_to_temporary_file) {
   const auto root = unique_test_directory("chhttp-stream-temp");
   chhttp::Server server;
@@ -3919,7 +3925,8 @@ TEST(server_stream_body_spools_to_temporary_file) {
   std::filesystem::remove_all(root, ignored);
 }
 
-// Verifies MultipartWriter mixes fields and a large file while the server parses every part incrementally.
+// Verifies MultipartWriter mixes fields and a large file while the server
+// parses every part incrementally.
 TEST(streaming_multipart_writer_and_server_parser_round_trip) {
   const auto root = unique_test_directory("chhttp-multipart-writer");
   const auto file = root / "image.bin";
@@ -3974,7 +3981,8 @@ TEST(streaming_multipart_writer_and_server_parser_round_trip) {
   std::filesystem::remove_all(root, ignored);
 }
 
-// Verifies an unknown-size multipart producer automatically uses chunked transfer coding and remains parseable.
+// Verifies an unknown-size multipart producer automatically uses chunked
+// transfer coding and remains parseable.
 TEST(streaming_multipart_writer_supports_unknown_length_parts) {
   chhttp::Server server;
   server.post_stream(
@@ -4014,7 +4022,8 @@ TEST(streaming_multipart_writer_supports_unknown_length_parts) {
   server.stop();
 }
 
-// Verifies malformed streamed multipart input reports a multipart error instead of accepting a truncated part.
+// Verifies malformed streamed multipart input reports a multipart error instead
+// of accepting a truncated part.
 TEST(server_incremental_multipart_rejects_missing_closing_boundary) {
   chhttp::Server server;
   server.post_stream(
@@ -4038,7 +4047,8 @@ TEST(server_incremental_multipart_rejects_missing_closing_boundary) {
   server.stop();
 }
 
-// Exercises one 100 MiB chunked upload while keeping both producer and server memory bounded to one chunk.
+// Exercises one 100 MiB chunked upload while keeping both producer and server
+// memory bounded to one chunk.
 TEST(stress_server_streams_one_hundred_megabyte_upload) {
   constexpr std::uint64_t total_size = 100ull * 1024 * 1024;
   constexpr std::size_t chunk_size = 64 * 1024;
@@ -4076,7 +4086,8 @@ TEST(stress_server_streams_one_hundred_megabyte_upload) {
   server.stop();
 }
 
-// Exercises eight concurrent 10 MiB uploads through a four-connection pool and verifies isolation plus limits.
+// Exercises eight concurrent 10 MiB uploads through a four-connection pool and
+// verifies isolation plus limits.
 TEST(stress_concurrent_ten_megabyte_server_streams) {
   constexpr int count = 8;
   constexpr std::size_t total_size = 10 * 1024 * 1024;
@@ -4132,7 +4143,8 @@ TEST(stress_concurrent_ten_megabyte_server_streams) {
   server.stop();
 }
 
-// Exercises concurrent multipart file readers, network backpressure, parser isolation, and a bounded connection pool.
+// Exercises concurrent multipart file readers, network backpressure, parser
+// isolation, and a bounded connection pool.
 TEST(stress_concurrent_streaming_multipart_files) {
   constexpr int count = 12;
   constexpr std::size_t file_size = 4 * 1024 * 1024;
@@ -4180,6 +4192,471 @@ TEST(stress_concurrent_streaming_multipart_files) {
     CHECK(response && response->body == std::to_string(file_size));
   }
   server.stop();
+  std::error_code ignored;
+  std::filesystem::remove_all(root, ignored);
+}
+
+// Verifies strict public Range and Content-Range helpers, including overflow
+// and validator boundaries used by resumable transfer callers.
+TEST(resumable_range_helpers_validate_wire_boundaries) {
+  auto complete = chhttp::parse_content_range("bytes 10-19/100");
+  CHECK(complete && complete->unit == "bytes" && complete->satisfied());
+  CHECK(complete->first == 10 && complete->last == 19 &&
+        complete->total == 100);
+
+  auto unknown_total = chhttp::parse_content_range("bytes 20-29/*");
+  CHECK(unknown_total && unknown_total->satisfied() && !unknown_total->total);
+  auto unsatisfied = chhttp::parse_content_range("bytes */100");
+  CHECK(unsatisfied && !unsatisfied->satisfied() && unsatisfied->total == 100);
+
+  for (const auto value : {"", "bytes", "bytes 1-0/10", "bytes 0-10/10",
+                           "bytes */*", "bytes 0 -1/10", "bytes 0-1 /10",
+                           "bytes 18446744073709551616-18446744073709551616/*",
+                           "bytes 0-1/18446744073709551616", "bytes 0-1/10/20"})
+    CHECK(!chhttp::parse_content_range(value));
+
+  auto bounded = chhttp::format_byte_range(5, 9);
+  auto open = chhttp::format_byte_range(5);
+  auto content = chhttp::format_content_range(5, 9, 20);
+  CHECK(bounded && *bounded == "bytes=5-9");
+  CHECK(open && *open == "bytes=5-");
+  CHECK(content && *content == "bytes 5-9/20");
+  CHECK(!chhttp::format_byte_range(9, 5));
+  CHECK(!chhttp::format_content_range(9, 5, 20));
+  CHECK(!chhttp::format_content_range(5, 20, 20));
+
+  chhttp::Headers headers;
+  auto configured = chhttp::set_byte_range(headers, 8, 12, "\"strong\"");
+  CHECK(configured && headers.get("Range") == "bytes=8-12" &&
+        headers.get("If-Range") == "\"strong\"");
+  CHECK(!chhttp::set_byte_range(headers, 8, 12, "W/\"weak\""));
+  CHECK(!chhttp::set_byte_range(headers, 8, 12, "bad\r\nvalue"));
+  CHECK(chhttp::set_byte_range(headers, 20));
+  CHECK(headers.get("Range") == "bytes=20-" &&
+        !headers.contains("If-Range"));
+}
+
+// Verifies ordered non-blocking file writes, all placement modes, move safety,
+// explicit flush, and durable sync.
+TEST(async_file_sink_modes_ordering_and_boundaries) {
+  const auto root = unique_test_directory("chhttp-async-file-sink");
+  const auto file = root / "output.bin";
+
+  {
+
+    auto opened = chhttp::AsyncFileSink::open(file);
+    CHECK(opened);
+    auto sink = std::move(*opened);
+    std::vector<chhttp::Task<chhttp::ErrorInfo>> writes;
+    for (const auto part : {"abc", "DEF", "123", "xyz"})
+      writes.push_back(sink.write(part));
+    for (auto &write : writes)
+      CHECK(!write.get());
+    CHECK(!sink.flush().get());
+    CHECK(!sink.sync().get());
+    CHECK(sink.written() == 12 && sink.position() == 12);
+
+    auto append = chhttp::AsyncFileSink::open(
+        file, {.mode = chhttp::FileSinkMode::append});
+    CHECK(append && append->position() == 12);
+    CHECK(!append->write("++").get());
+    CHECK(!append->flush().get());
+
+    auto overwrite = chhttp::AsyncFileSink::open(
+        file, {.mode = chhttp::FileSinkMode::write_at, .offset = 3});
+    CHECK(overwrite && overwrite->position() == 3);
+    CHECK(!overwrite->write("--").get());
+    CHECK(!overwrite->sync().get());
+    CHECK(overwrite->written() == 2 && overwrite->position() == 5);
+
+    std::ifstream input(file, std::ios::binary);
+    const std::string body{std::istreambuf_iterator<char>(input),
+                           std::istreambuf_iterator<char>()};
+    CHECK(body == "abc--F123xyz++");
+
+    auto moved = std::move(*overwrite);
+    auto moved_from_error = overwrite->write("ignored").get();
+    CHECK(moved_from_error.code == chhttp::Error::invalid_argument);
+    CHECK(!moved.write({}).get());
+    CHECK(!chhttp::AsyncFileSink::open(root / "missing" / "file.bin"));
+    CHECK(!chhttp::AsyncFileSink::open(
+        file, {.mode = chhttp::FileSinkMode::write_at,
+               .offset = (std::numeric_limits<std::uint64_t>::max)()}));
+  }
+
+  std::error_code ignored;
+  std::filesystem::remove_all(root, ignored);
+}
+
+// Verifies file-backed request slices, exact Content-Length, monotonic upload
+// progress, cancellation context, truncation races, and invalid bounds.
+TEST(file_body_slices_progress_errors_and_edge_cases) {
+  const auto root = unique_test_directory("chhttp-file-body");
+  const auto file = root / "source.bin";
+  std::string content(256 * 1024, '\0');
+  for (std::size_t index = 0; index < content.size(); ++index)
+    content[index] = static_cast<char>(index % 251);
+  std::ofstream(file, std::ios::binary)
+      .write(content.data(), static_cast<std::streamsize>(content.size()));
+
+  chhttp::Server server;
+  server.post("/slice",
+              [](const chhttp::Request &request, chhttp::Response &response) {
+                response.set_content(request.get_header("Content-Length") +
+                                     "|" + request.body);
+              });
+  CHECK(server.start("127.0.0.1", 0));
+  chhttp::Client client("http://127.0.0.1:" + std::to_string(server.port()));
+
+  constexpr std::uint64_t offset = 123;
+  constexpr std::uint64_t length = 130 * 1024;
+  chhttp::Request request;
+  request.method = "POST";
+  request.target = "/slice";
+  CHECK(request.set_file_body(file, {.offset = offset, .length = length}));
+  std::vector<std::uint64_t> progress;
+  auto response = client.request(
+      std::move(request),
+      {.on_upload_progress = [&](const chhttp::TransferProgress &value) {
+        CHECK(value.total == length);
+        progress.push_back(value.transferred);
+        return true;
+      }});
+  CHECK(response);
+  CHECK(response->body.substr(0, response->body.find('|')) ==
+        std::to_string(length));
+  CHECK(response->body.substr(response->body.find('|') + 1) ==
+        content.substr(offset, length));
+  CHECK(!progress.empty() && progress.back() == length &&
+        std::ranges::is_sorted(progress));
+
+  chhttp::Request to_eof;
+  to_eof.method = "POST";
+  to_eof.target = "/slice";
+  CHECK(to_eof.set_file_body(file, {.offset = content.size() - 7}));
+  auto eof_response = client.request(std::move(to_eof));
+  CHECK(eof_response &&
+        eof_response->body == "7|" + content.substr(content.size() - 7));
+
+  chhttp::Request empty;
+  empty.method = "POST";
+  empty.target = "/slice";
+  CHECK(empty.set_file_body(
+      file, {.offset = content.size(), .length = std::uint64_t{0}}));
+  auto empty_response = client.request(std::move(empty));
+  CHECK(empty_response && empty_response->body == "0|");
+
+  chhttp::Request invalid;
+  CHECK(!invalid.set_file_body(root / "missing.bin"));
+  CHECK(!invalid.set_file_body(root));
+  CHECK(!invalid.set_file_body(file, {.offset = content.size() + 1}));
+  CHECK(!invalid.set_file_body(file,
+                               {.offset = content.size() - 1, .length = 2}));
+
+  chhttp::Request cancelled;
+  cancelled.method = "POST";
+  cancelled.target = "/slice";
+  CHECK(cancelled.set_file_body(file));
+  auto cancelled_result = client.request(
+      std::move(cancelled),
+      {.on_upload_progress = [](const chhttp::TransferProgress &) {
+        return false;
+      }});
+  CHECK(!cancelled_result &&
+        cancelled_result.error().code == chhttp::Error::cancelled);
+  CHECK(cancelled_result.error().transfer &&
+        cancelled_result.error().transfer->phase ==
+            chhttp::TransferPhase::request_body &&
+        cancelled_result.error().transfer->uploaded > 0 &&
+        !cancelled_result.error().transfer->response_started);
+
+  const auto shrinking = root / "shrinking.bin";
+  std::ofstream(shrinking, std::ios::binary) << std::string(128 * 1024, 's');
+  chhttp::Request truncated;
+  truncated.method = "POST";
+  truncated.target = "/slice";
+  CHECK(truncated.set_file_body(shrinking));
+  std::filesystem::resize_file(shrinking, 1024);
+  auto truncated_result = client.request(std::move(truncated));
+  CHECK(!truncated_result &&
+        truncated_result.error().code == chhttp::Error::read);
+  CHECK(truncated_result.error().transfer &&
+        truncated_result.error().transfer->phase ==
+            chhttp::TransferPhase::request_body &&
+        truncated_result.error().transfer->uploaded == 1024);
+
+  server.stop();
+  std::error_code ignored;
+  std::filesystem::remove_all(root, ignored);
+}
+
+// Verifies multipart can stream only a requested file interval and rejects
+// invalid slice metadata before any network operation.
+TEST(multipart_file_slices_preserve_exact_payload) {
+  const auto root = unique_test_directory("chhttp-multipart-slice");
+  const auto file = root / "artifact.bin";
+  const std::string content = "prefix--the-selected-payload--suffix";
+  std::ofstream(file, std::ios::binary) << content;
+  const auto offset = content.find("the-selected");
+  const std::string expected = "the-selected-payload";
+
+  chhttp::MultipartWriter multipart;
+  multipart.add_field("meta", "ok")
+      .add_file_slice("artifact", file,
+                      {.offset = offset, .length = expected.size()},
+                      "application/octet-stream", "slice.bin");
+  CHECK(multipart.content_length());
+  chhttp::Request request;
+  request.method = "POST";
+  request.target = "/multipart";
+  multipart.apply(request);
+  chhttp::Client client(fixture().base_url);
+  auto response = client.request(std::move(request));
+  CHECK(response && response->body == "meta=ok;artifact=" + expected + ";");
+
+  bool rejected = false;
+  try {
+    chhttp::MultipartWriter invalid;
+    invalid.add_file_slice("bad", file,
+                           {.offset = content.size(), .length = 1});
+  } catch (const std::invalid_argument &) {
+    rejected = true;
+  }
+  CHECK(rejected);
+
+  std::error_code ignored;
+  std::filesystem::remove_all(root, ignored);
+}
+
+// Composes two validated 206 responses into one file without blocking the
+// network callback, exercising the intended download-resume primitives.
+TEST(range_downloads_resume_into_async_file_sink) {
+  const auto root = unique_test_directory("chhttp-range-resume");
+  const auto file = root / "asset.part";
+  {
+    auto opened = chhttp::AsyncFileSink::open(file);
+    CHECK(opened);
+    auto sink = std::move(*opened);
+    chhttp::Client client(fixture().base_url);
+
+    const auto receive = [&](std::uint64_t first,
+                             std::optional<std::uint64_t> last) {
+      chhttp::Headers headers;
+      CHECK(chhttp::set_byte_range(headers, first, last));
+      std::optional<chhttp::ContentRange> observed;
+      std::vector<std::uint64_t> progress;
+      auto response = client.get(
+          "/static/asset.txt", std::move(headers),
+          {.on_response_head =
+               [&](const chhttp::ResponseHead &head) {
+                 CHECK(head.status == 206);
+                 auto parsed = chhttp::parse_content_range(
+                     head.headers.get("Content-Range"));
+                 CHECK(parsed);
+                 observed = *parsed;
+                 return true;
+               },
+           .on_data_async = [&](std::string_view data) -> chhttp::Task<bool> {
+             co_return !co_await sink.write(data);
+           },
+           .on_download_progress =
+               [&](const chhttp::TransferProgress &value) {
+                 CHECK(value.total);
+                 progress.push_back(value.transferred);
+                 return true;
+               }});
+      CHECK(response && response->body.empty() && observed &&
+            observed->first == first && observed->total == 10);
+      CHECK(!progress.empty() && std::ranges::is_sorted(progress));
+    };
+
+    receive(0, 3);
+    receive(4, std::nullopt);
+    CHECK(!sink.sync().get());
+    std::ifstream input(file, std::ios::binary);
+    const std::string body{std::istreambuf_iterator<char>(input),
+                           std::istreambuf_iterator<char>()};
+    CHECK(body == "0123456789");
+  }
+
+  std::error_code ignored;
+  std::filesystem::remove_all(root, ignored);
+}
+
+// Verifies independent download progress, unknown totals, compatibility
+// callback exclusivity, and response-side failure context.
+TEST(transfer_progress_and_error_context_are_directional) {
+  chhttp::Client client(fixture().base_url);
+  std::uint64_t downloaded = 0;
+  bool unknown_total = false;
+  auto streamed = client.get(
+      "/stream", {},
+      {.on_download_progress = [&](const chhttp::TransferProgress &progress) {
+        downloaded = progress.transferred;
+        unknown_total = !progress.total;
+        return true;
+      }});
+  CHECK(streamed && downloaded == 6 && unknown_total);
+
+  auto conflicting = client.get(
+      "/hello", {},
+      {.on_download_progress =
+           [](const chhttp::TransferProgress &) { return true; },
+       .on_progress = [](std::uint64_t, std::uint64_t) { return true; }});
+  CHECK(!conflicting &&
+        conflicting.error().code == chhttp::Error::invalid_argument);
+
+  RawResponseServer raw("HTTP/1.1 200 OK\r\nContent-Length: 12\r\n"
+                        "Connection: close\r\n\r\nshort",
+                        true);
+  chhttp::Client broken("http://127.0.0.1:" + std::to_string(raw.port()));
+  std::uint64_t partial = 0;
+  auto result = broken.get(
+      "/", {},
+      {.on_download_progress = [&](const chhttp::TransferProgress &progress) {
+        partial = progress.transferred;
+        return true;
+      }});
+  CHECK(!result && result.error().code == chhttp::Error::protocol);
+  CHECK(partial == 5 && result.error().transfer &&
+        result.error().transfer->phase ==
+            chhttp::TransferPhase::response_body &&
+        result.error().transfer->downloaded == 5 &&
+        result.error().transfer->response_started);
+}
+
+// Exercises many simultaneous file-slice producers through a bounded pool.
+TEST(stress_concurrent_file_slice_uploads) {
+  constexpr int count = 16;
+  constexpr std::size_t slice_size = 1024 * 1024;
+  const auto root = unique_test_directory("chhttp-file-slice-stress");
+  const auto file = root / "segments.bin";
+  std::string content(count * slice_size, '\0');
+  for (int index = 0; index != count; ++index)
+    std::fill_n(content.begin() + index * slice_size, slice_size,
+                static_cast<char>('A' + index));
+  std::ofstream(file, std::ios::binary)
+      .write(content.data(), static_cast<std::streamsize>(content.size()));
+
+  chhttp::Server server;
+  server.post_stream("/slice-load",
+                     [](chhttp::Request &, chhttp::RequestBodyStream &body,
+                        chhttp::Response &response) -> chhttp::Task<void> {
+                       std::uint64_t received = 0;
+                       char marker = 0;
+                       auto error = co_await body.consume(
+                           [&](std::string_view data) -> chhttp::Task<bool> {
+                             if (marker == 0)
+                               marker = data.front();
+                             CHECK(std::ranges::all_of(data, [&](char value) {
+                               return value == marker;
+                             }));
+                             received += data.size();
+                             co_return true;
+                           });
+                       CHECK(!error);
+                       response.set_content(std::string(1, marker) + "|" +
+                                            std::to_string(received));
+                     },
+                     {.max_body_size = 2 * 1024 * 1024});
+  CHECK(server.start("127.0.0.1", 0));
+  chhttp::ClientOptions options;
+  options.connection_pool_size = 4;
+  options.max_connections_per_origin = 4;
+  chhttp::AsyncClient client(
+      "http://127.0.0.1:" + std::to_string(server.port()), std::move(options));
+  std::vector<chhttp::Task<chhttp::ResponseResult>> uploads;
+  for (int index = 0; index != count; ++index) {
+    chhttp::Request request;
+    request.method = "POST";
+    request.target = "/slice-load";
+    CHECK(request.set_file_body(
+        file, {.offset = static_cast<std::uint64_t>(index) * slice_size,
+               .length = slice_size}));
+    uploads.push_back(client.request(std::move(request)));
+  }
+  for (int index = 0; index != count; ++index) {
+    auto response = uploads[index].get();
+    CHECK(response &&
+          response->body == std::string(1, static_cast<char>('A' + index)) +
+                                "|" + std::to_string(slice_size));
+  }
+  server.stop();
+  std::error_code ignored;
+  std::filesystem::remove_all(root, ignored);
+}
+
+// Exercises a long queue of concurrent sink writes and validates exact order
+// and full 32 MiB persistence.
+TEST(stress_async_file_sink_ordered_large_write) {
+  constexpr std::size_t chunk_size = 64 * 1024;
+  constexpr int chunk_count = 512;
+  const auto root = unique_test_directory("chhttp-file-sink-stress");
+  const auto file = root / "large.bin";
+  {
+    auto opened = chhttp::AsyncFileSink::open(file);
+    CHECK(opened);
+    auto sink = std::move(*opened);
+    std::vector<chhttp::Task<chhttp::ErrorInfo>> writes;
+    writes.reserve(chunk_count);
+    for (int index = 0; index != chunk_count; ++index)
+      writes.push_back(
+          sink.write(std::string(chunk_size, static_cast<char>(index % 251))));
+    for (auto &write : writes)
+      CHECK(!write.get());
+    CHECK(!sink.sync().get());
+    CHECK(sink.written() ==
+          static_cast<std::uint64_t>(chunk_size) * chunk_count);
+
+    std::ifstream input(file, std::ios::binary);
+    std::string chunk(chunk_size, '\0');
+    for (int index = 0; index != chunk_count; ++index) {
+      input.read(chunk.data(), static_cast<std::streamsize>(chunk.size()));
+      CHECK(input.gcount() == static_cast<std::streamsize>(chunk.size()));
+      CHECK(std::ranges::all_of(chunk, [&](char value) {
+        return value == static_cast<char>(index % 251);
+      }));
+  }
+  CHECK(input.peek() == std::char_traits<char>::eof());
+
+  const auto concurrent_file = root / "concurrent.bin";
+  auto concurrent_opened = chhttp::AsyncFileSink::open(concurrent_file);
+  CHECK(concurrent_opened);
+  auto concurrent_sink = std::move(*concurrent_opened);
+  constexpr int thread_count = 8;
+  constexpr int chunks_per_thread = 64;
+  constexpr std::size_t concurrent_chunk_size = 4096;
+  std::atomic_int failures{0};
+  std::vector<std::thread> workers;
+  for (int thread = 0; thread != thread_count; ++thread) {
+    workers.emplace_back([&, thread] {
+      const std::string data(concurrent_chunk_size,
+                             static_cast<char>('a' + thread));
+      for (int chunk_index = 0; chunk_index != chunks_per_thread;
+           ++chunk_index)
+        if (concurrent_sink.write(data).get()) ++failures;
+    });
+  }
+  for (auto &worker : workers) worker.join();
+  CHECK(failures == 0);
+  CHECK(!concurrent_sink.sync().get());
+  CHECK(concurrent_sink.written() ==
+        thread_count * chunks_per_thread * concurrent_chunk_size);
+
+  std::ifstream concurrent_input(concurrent_file, std::ios::binary);
+  std::array<int, thread_count> marker_counts{};
+  std::string concurrent_chunk(concurrent_chunk_size, '\0');
+  while (concurrent_input.read(
+      concurrent_chunk.data(),
+      static_cast<std::streamsize>(concurrent_chunk.size()))) {
+    const auto marker = concurrent_chunk.front();
+    CHECK(marker >= 'a' && marker < 'a' + thread_count);
+    CHECK(std::ranges::all_of(concurrent_chunk,
+                              [&](char value) { return value == marker; }));
+    ++marker_counts[marker - 'a'];
+  }
+  for (const auto count : marker_counts) CHECK(count == chunks_per_thread);
+  }
   std::error_code ignored;
   std::filesystem::remove_all(root, ignored);
 }
@@ -4250,7 +4727,8 @@ CertificateFiles make_certificate() {
   return files;
 }
 
-// Verifies HTTPS trust modes, DNS/IP SAN checks, TLS keep-alive, rejection, and secure WebSockets.
+// Verifies HTTPS trust modes, DNS/IP SAN checks, TLS keep-alive, rejection, and
+// secure WebSockets.
 TEST(https_client_server) {
   auto certificate = make_certificate();
   chhttp::ServerOptions server_options;
@@ -4287,8 +4765,8 @@ TEST(https_client_server) {
   chhttp::ClientOptions verified_options;
   verified_options.tls.use_system_certificates = false;
   verified_options.tls.ca_file = certificate.certificate;
-  chhttp::Client verified_client(
-      "https://localhost:" + std::to_string(server.port()),
+  verified_options.tls.server_name = "localhost";
+  chhttp::Client verified_client("https://127.0.0.1:" + std::to_string(server.port()),
       std::move(verified_options));
   auto verified = verified_client.get("/secure");
   CHECK(verified && verified->body == "secure");
@@ -4302,8 +4780,11 @@ TEST(https_client_server) {
   auto verified_ip = verified_ip_client.get("/secure");
   CHECK(verified_ip && verified_ip->body == "secure");
 
-  chhttp::Client untrusted_client("https://localhost:" +
-                                  std::to_string(server.port()));
+  chhttp::ClientOptions untrusted_options;
+  untrusted_options.tls.server_name = "localhost";
+  chhttp::Client untrusted_client("https://127.0.0.1:" +
+                                  std::to_string(server.port()),
+                                  std::move(untrusted_options));
   auto untrusted = untrusted_client.get("/secure");
   CHECK(!untrusted &&
         untrusted.error().code == chhttp::Error::tls_verification);
@@ -4321,7 +4802,8 @@ TEST(https_client_server) {
   server.stop();
 }
 
-// Exercises 96 concurrent HTTPS requests with independently validated 32 KiB response bodies.
+// Exercises 96 concurrent HTTPS requests with independently validated 32 KiB
+// response bodies.
 TEST(stress_https_async_concurrency_and_large_payloads) {
   auto certificate = make_certificate();
   chhttp::ServerOptions server_options;
@@ -4360,7 +4842,8 @@ TEST(stress_https_async_concurrency_and_large_payloads) {
   server.stop();
 }
 
-// Exercises 64 independently constructed TLS clients and handshakes across eight threads.
+// Exercises 64 independently constructed TLS clients and handshakes across
+// eight threads.
 TEST(stress_tls_client_context_and_handshake_churn) {
   auto certificate = make_certificate();
   chhttp::ServerOptions server_options;
@@ -4396,7 +4879,8 @@ TEST(stress_tls_client_context_and_handshake_churn) {
   server.stop();
 }
 
-// Verifies mTLS rejection without a certificate and success with a trusted client identity.
+// Verifies mTLS rejection without a certificate and success with a trusted
+// client identity.
 TEST(mtls_requires_client_certificate) {
   auto certificate = make_certificate();
   chhttp::ServerOptions server_options;

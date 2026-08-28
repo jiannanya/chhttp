@@ -1,18 +1,26 @@
 #include "detail.hpp"
 
 #include <array>
+#include <cerrno>
 #include <fstream>
 #include <limits>
 #include <system_error>
 
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <fcntl.h>
+#include <unistd.h>
+#endif
+
 namespace chhttp {
 namespace {
 
-class FileReadPool {
+class FileIoPool {
 public:
-  FileReadPool() {
-    const auto count = std::clamp<unsigned>(std::thread::hardware_concurrency(),
-                                            2, 4);
+  FileIoPool() {
+    const auto count =
+        std::clamp<unsigned>(std::thread::hardware_concurrency(), 2, 4);
     workers_.reserve(count);
     for (unsigned index = 0; index < count; ++index) {
       workers_.emplace_back([this](std::stop_token token) {
@@ -20,9 +28,9 @@ public:
           std::function<void()> job;
           {
             std::unique_lock lock(mutex_);
-            ready_.wait(lock, token,
-                        [&] { return !jobs_.empty(); });
-            if (token.stop_requested() && jobs_.empty()) return;
+            ready_.wait(lock, token, [&] { return !jobs_.empty(); });
+            if (token.stop_requested() && jobs_.empty())
+              return;
             job = std::move(jobs_.front());
             jobs_.pop_front();
           }
@@ -32,8 +40,9 @@ public:
     }
   }
 
-  ~FileReadPool() {
-    for (auto &worker : workers_) worker.request_stop();
+  ~FileIoPool() {
+    for (auto &worker : workers_)
+      worker.request_stop();
     ready_.notify_all();
   }
 
@@ -45,8 +54,8 @@ public:
     ready_.notify_one();
   }
 
-  static FileReadPool &instance() {
-    static FileReadPool pool;
+  static FileIoPool &instance() {
+    static FileIoPool pool;
     return pool;
   }
 
@@ -74,13 +83,13 @@ struct FileReadAwaiter {
   bool await_ready() const noexcept { return false; }
   void await_suspend(std::coroutine_handle<> continuation) {
     state->continuation = continuation;
-    FileReadPool::instance().submit([state = state] {
+    FileIoPool::instance().submit([state = state] {
       state->result.data.resize(state->size);
       state->input->read(state->result.data.data(),
                          static_cast<std::streamsize>(state->size));
       const auto count = state->input->gcount();
-      state->result.data.resize(
-          count > 0 ? static_cast<std::size_t>(count) : 0);
+      state->result.data.resize(count > 0 ? static_cast<std::size_t>(count)
+                                          : 0);
       state->result.failed = state->input->bad();
       state->continuation.resume();
     });
@@ -88,11 +97,65 @@ struct FileReadAwaiter {
   FileReadResult await_resume() { return std::move(state->result); }
 };
 
-FileReadAwaiter async_file_read(std::ifstream &input,
-                                std::size_t chunk_size) {
-  return FileReadAwaiter{
-      std::make_shared<FileReadAwaiter::State>(
-          FileReadAwaiter::State{.input = &input, .size = chunk_size})};
+FileReadAwaiter async_file_read(std::ifstream &input, std::size_t chunk_size) {
+  return FileReadAwaiter{std::make_shared<FileReadAwaiter::State>(
+      FileReadAwaiter::State{.input = &input, .size = chunk_size})};
+}
+
+Result<std::uint64_t> validate_file_slice(const std::filesystem::path &path,
+                                          FileBodyOptions options) {
+  std::error_code error;
+  if (!std::filesystem::is_regular_file(path, error) || error)
+    return ErrorInfo{Error::invalid_argument,
+                     "File body path is not a readable regular file"};
+  const auto size = std::filesystem::file_size(path, error);
+  if (error)
+    return ErrorInfo{Error::read, "Unable to determine file body size"};
+  if (options.offset > size)
+    return ErrorInfo{Error::invalid_argument,
+                     "File body offset exceeds the file size"};
+  const auto available = size - options.offset;
+  const auto length = options.length.value_or(available);
+  if (length > available)
+    return ErrorInfo{Error::invalid_argument,
+                     "File body length exceeds the available file data"};
+  if (options.offset >
+      static_cast<std::uint64_t>((std::numeric_limits<std::streamoff>::max)()))
+    return ErrorInfo{Error::invalid_argument,
+                     "File body offset exceeds the stream limit"};
+  return length;
+}
+
+StreamHandler make_file_producer(std::filesystem::path path,
+                                 std::uint64_t offset, std::uint64_t length) {
+  return [path = std::move(path), offset,
+          length](StreamWriter &writer) -> Task<void> {
+    if (length == 0)
+      co_return;
+    std::ifstream input(path, std::ios::binary);
+    if (!input)
+      throw detail::StreamError(
+          {Error::read, "Unable to open file request body"});
+    input.seekg(static_cast<std::streamoff>(offset));
+    if (!input)
+      throw detail::StreamError(
+          {Error::read, "Unable to seek file request body"});
+    std::uint64_t remaining = length;
+    while (remaining != 0) {
+      const auto requested = static_cast<std::size_t>(
+          std::min<std::uint64_t>(remaining, 64 * 1024));
+      auto chunk = co_await async_file_read(input, requested);
+      if (chunk.failed)
+        throw detail::StreamError(
+            {Error::read, "Unable to read file request body"});
+      if (chunk.data.empty())
+        throw detail::StreamError(
+            {Error::read, "File request body ended before its fixed length"});
+      if (!co_await writer.write(chunk.data))
+        co_return;
+      remaining -= chunk.data.size();
+    }
+  };
 }
 
 std::vector<std::string> split_parameters(std::string_view value) {
@@ -285,6 +348,226 @@ std::string json_escape(std::string_view value) {
 }
 
 } // namespace
+
+Result<void> Request::set_file_body(std::filesystem::path path,
+                                    FileBodyOptions options) {
+  auto length = validate_file_slice(path, options);
+  if (!length)
+    return length.error();
+  set_stream_body(make_file_producer(std::move(path), options.offset, *length),
+                  *length);
+  return {};
+}
+
+class AsyncFileSink::Impl
+    : public std::enable_shared_from_this<AsyncFileSink::Impl> {
+public:
+  struct ActionState {
+    std::function<ErrorInfo(Impl &)> action;
+    std::coroutine_handle<> continuation{};
+    ErrorInfo result;
+  };
+
+  struct ActionAwaiter {
+    std::shared_ptr<Impl> impl;
+    std::shared_ptr<ActionState> state;
+
+    bool await_ready() const noexcept { return false; }
+    void await_suspend(std::coroutine_handle<> continuation) {
+      state->continuation = continuation;
+      impl->submit(state);
+    }
+    ErrorInfo await_resume() { return std::move(state->result); }
+  };
+
+  ActionAwaiter enqueue(std::function<ErrorInfo(Impl &)> action) {
+    return ActionAwaiter{
+        shared_from_this(),
+        std::make_shared<ActionState>(ActionState{.action = std::move(action)})};
+  }
+
+  void submit(std::shared_ptr<ActionState> state) {
+    bool start_worker = false;
+    {
+      std::lock_guard lock(queue_mutex);
+      pending.push_back(std::move(state));
+      if (!worker_running) {
+        worker_running = true;
+        start_worker = true;
+      }
+    }
+    if (start_worker) {
+      auto self = shared_from_this();
+      FileIoPool::instance().submit(
+          [self = std::move(self)] { self->process(); });
+    }
+  }
+
+  void process() {
+    for (;;) {
+      std::shared_ptr<ActionState> state;
+      {
+        std::lock_guard lock(queue_mutex);
+        if (pending.empty()) {
+          worker_running = false;
+          return;
+        }
+        state = std::move(pending.front());
+        pending.pop_front();
+      }
+
+      try {
+        state->result = state->action(*this);
+      } catch (const std::exception &exception) {
+        state->result = {Error::internal,
+                         "Asynchronous file operation failed: " +
+                             std::string(exception.what())};
+      } catch (...) {
+        state->result = {Error::internal,
+                         "Asynchronous file operation failed"};
+      }
+      state->continuation.resume();
+    }
+  }
+
+  std::fstream output;
+  std::filesystem::path path;
+  std::atomic<std::uint64_t> written{0};
+  std::atomic<std::uint64_t> position{0};
+
+private:
+  std::mutex queue_mutex;
+  std::deque<std::shared_ptr<ActionState>> pending;
+  bool worker_running{false};
+};
+
+Result<AsyncFileSink> AsyncFileSink::open(std::filesystem::path path,
+                                          FileSinkOptions options) {
+  if (path.empty())
+    return ErrorInfo{Error::invalid_argument,
+                     "Asynchronous file sink path is empty"};
+  if (options.offset >
+      static_cast<std::uint64_t>((std::numeric_limits<std::streamoff>::max)()))
+    return ErrorInfo{Error::invalid_argument,
+                     "Asynchronous file sink offset exceeds the stream limit"};
+  if (options.mode != FileSinkMode::write_at && options.offset != 0)
+    return ErrorInfo{Error::invalid_argument,
+                     "File sink offset is only valid in write_at mode"};
+
+  auto impl = std::make_shared<Impl>();
+  impl->path = std::move(path);
+  const auto read_write = std::ios::binary | std::ios::in | std::ios::out;
+  if (options.mode == FileSinkMode::truncate) {
+    impl->output.open(impl->path, read_write | std::ios::trunc);
+  } else {
+    impl->output.open(impl->path, read_write);
+    if (!impl->output) {
+      impl->output.clear();
+      std::ofstream create(impl->path, std::ios::binary | std::ios::trunc);
+      create.close();
+      impl->output.open(impl->path, read_write);
+    }
+  }
+  if (!impl->output)
+    return ErrorInfo{Error::write, "Unable to open asynchronous file sink"};
+
+  std::uint64_t position = options.offset;
+  if (options.mode == FileSinkMode::append) {
+    impl->output.seekp(0, std::ios::end);
+    const auto end = impl->output.tellp();
+    if (end < 0)
+      return ErrorInfo{Error::write,
+                       "Unable to determine asynchronous file sink size"};
+    position = static_cast<std::uint64_t>(end);
+  } else {
+    impl->output.seekp(static_cast<std::streamoff>(position));
+  }
+  if (!impl->output)
+    return ErrorInfo{Error::write, "Unable to seek asynchronous file sink"};
+  impl->position.store(position, std::memory_order_relaxed);
+  return AsyncFileSink(std::move(impl));
+}
+
+AsyncFileSink::~AsyncFileSink() = default;
+AsyncFileSink::AsyncFileSink(AsyncFileSink &&) noexcept = default;
+AsyncFileSink &AsyncFileSink::operator=(AsyncFileSink &&) noexcept = default;
+
+Task<ErrorInfo> AsyncFileSink::write(std::string_view data) {
+  if (!impl_)
+    co_return ErrorInfo{Error::invalid_argument,
+                        "Asynchronous file sink is not open"};
+  std::string owned(data);
+  co_return co_await impl_->enqueue([owned = std::move(owned)](
+                                        Impl &impl) -> ErrorInfo {
+    if (owned.empty())
+      return {};
+    if (owned.size() >
+        static_cast<std::size_t>((std::numeric_limits<std::streamsize>::max)()))
+      return {Error::invalid_argument,
+              "Asynchronous file write exceeds the stream limit"};
+    impl.output.write(owned.data(), static_cast<std::streamsize>(owned.size()));
+    if (!impl.output)
+      return {Error::write, "Unable to write asynchronous file sink"};
+    impl.written.fetch_add(owned.size(), std::memory_order_relaxed);
+    impl.position.fetch_add(owned.size(), std::memory_order_relaxed);
+    return {};
+  });
+}
+
+Task<ErrorInfo> AsyncFileSink::flush() {
+  if (!impl_)
+    co_return ErrorInfo{Error::invalid_argument,
+                        "Asynchronous file sink is not open"};
+  co_return co_await impl_->enqueue([](Impl &impl) -> ErrorInfo {
+    impl.output.flush();
+    if (!impl.output)
+      return {Error::write, "Unable to flush asynchronous file sink"};
+    return {};
+  });
+}
+
+Task<ErrorInfo> AsyncFileSink::sync() {
+  if (!impl_)
+    co_return ErrorInfo{Error::invalid_argument,
+                        "Asynchronous file sink is not open"};
+  co_return co_await impl_->enqueue([](Impl &impl) -> ErrorInfo {
+    impl.output.flush();
+    if (!impl.output)
+      return {Error::write, "Unable to flush asynchronous file sink"};
+#ifdef _WIN32
+    const auto handle =
+        CreateFileW(impl.path.c_str(), GENERIC_WRITE,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (handle == INVALID_HANDLE_VALUE)
+      return {Error::write, "Unable to open file for durable sync",
+              static_cast<int>(GetLastError())};
+    const auto synced = FlushFileBuffers(handle);
+    const auto system_code = synced ? 0 : static_cast<int>(GetLastError());
+    CloseHandle(handle);
+    if (!synced)
+      return {Error::write, "Unable to durably sync file", system_code};
+#else
+    const auto descriptor = ::open(impl.path.c_str(), O_WRONLY);
+    if (descriptor == -1)
+      return {Error::write, "Unable to open file for durable sync", errno};
+    const auto synced = ::fsync(descriptor);
+    const auto system_code = synced == 0 ? 0 : errno;
+    ::close(descriptor);
+    if (synced != 0)
+      return {Error::write, "Unable to durably sync file", system_code};
+#endif
+    return {};
+  });
+}
+
+std::uint64_t AsyncFileSink::written() const noexcept {
+  return impl_ ? impl_->written.load(std::memory_order_relaxed) : 0;
+}
+
+std::uint64_t AsyncFileSink::position() const noexcept {
+  return impl_ ? impl_->position.load(std::memory_order_relaxed) : 0;
+}
 
 Task<ErrorInfo> RequestBodyStream::consume(AsyncBodyConsumer consumer) {
   if (!source_)
@@ -624,13 +907,13 @@ public:
 
 MultipartWriter::MultipartWriter(std::string boundary)
     : impl_(std::make_shared<Impl>()) {
-  if (!valid_boundary(boundary)) boundary = detail::random_boundary();
+  if (!valid_boundary(boundary))
+    boundary = detail::random_boundary();
   impl_->boundary = std::move(boundary);
 }
 
-MultipartWriter &MultipartWriter::add_field(std::string name,
-                                             std::string value,
-                                             std::string content_type) {
+MultipartWriter &MultipartWriter::add_field(std::string name, std::string value,
+                                            std::string content_type) {
   Impl::Part part;
   part.metadata.name = std::move(name);
   part.metadata.content_type = std::move(content_type);
@@ -642,35 +925,38 @@ MultipartWriter &MultipartWriter::add_field(std::string name,
 }
 
 MultipartWriter &MultipartWriter::add_file(std::string name,
-                                            std::filesystem::path path,
-                                            std::string content_type,
-                                            std::string filename) {
-  std::error_code error;
-  const auto size = std::filesystem::file_size(path, error);
-  if (error || !std::filesystem::is_regular_file(path, error))
-    throw std::invalid_argument("Multipart file is not a readable regular file");
-  if (content_type.empty()) content_type = mime_type(path);
-  if (filename.empty()) filename = path.filename().string();
-  return add_stream(
-      std::move(name), std::move(filename), std::move(content_type),
-      [path = std::move(path)](StreamWriter &writer) -> Task<void> {
-        std::ifstream input(path, std::ios::binary);
-        if (!input) co_return;
-        for (;;) {
-          auto chunk = co_await async_file_read(input, 64 * 1024);
-          if (chunk.failed) co_return;
-          if (chunk.data.empty()) break;
-          if (!co_await writer.write(chunk.data)) co_return;
-        }
-      },
-      size);
+                                           std::filesystem::path path,
+                                           std::string content_type,
+                                           std::string filename) {
+  return add_file_slice(std::move(name), std::move(path), {},
+                        std::move(content_type), std::move(filename));
 }
 
-MultipartWriter &MultipartWriter::add_stream(
-    std::string name, std::string filename, std::string content_type,
-    StreamHandler producer, std::optional<std::uint64_t> size,
-    Headers headers) {
-  if (!producer) throw std::invalid_argument("Multipart producer is empty");
+MultipartWriter &MultipartWriter::add_file_slice(std::string name,
+                                                 std::filesystem::path path,
+                                                 FileBodyOptions options,
+                                                 std::string content_type,
+                                                 std::string filename) {
+  auto size = validate_file_slice(path, options);
+  if (!size)
+    throw std::invalid_argument(size.error().message);
+  if (content_type.empty())
+    content_type = mime_type(path);
+  if (filename.empty())
+    filename = path.filename().string();
+  return add_stream(
+      std::move(name), std::move(filename), std::move(content_type),
+      make_file_producer(std::move(path), options.offset, *size), *size);
+}
+
+MultipartWriter &MultipartWriter::add_stream(std::string name,
+                                             std::string filename,
+                                             std::string content_type,
+                                             StreamHandler producer,
+                                             std::optional<std::uint64_t> size,
+                                             Headers headers) {
+  if (!producer)
+    throw std::invalid_argument("Multipart producer is empty");
   Impl::Part part;
   part.metadata.name = std::move(name);
   part.metadata.filename = std::move(filename);
