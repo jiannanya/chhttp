@@ -98,20 +98,10 @@ ctest --test-dir build -L property --output-on-failure
 ctest --test-dir build -L stress --repeat until-fail:30 --output-on-failure
 ```
 
-Running `chhttp_tests` without an argument executes all 229 registered groups:
-188 functional/boundary groups, 32 load/lifecycle groups, and 9 randomized
-property groups (with TLS and compression enabled). The stress
-group covers concurrent sync/async HTTP, thousands of keep-alive requests,
-large buffered and streamed uploads (including bounded-memory 100 MiB and
-concurrent 10 MiB cases), streamed callbacks, connection recycling, independent
-and global cancellation, client/server churn, parallel servers, graceful
-draining, SSE fan-out, WebSocket connection/message load, malformed-request
-floods, concurrent file spooling/download cancellation, file-slice uploads,
-ordered file-sink writes and HTTPS/TLS handshake concurrency. Integration
-regressions check bounded buffered uploads with progress/cancellation, file
-producer loop affinity, and file-sink completion during runtime shutdown.
-Request and callback ownership is also checked after the caller's scope ends
-and across repeated redirects.
+Running `chhttp_tests` without an argument executes all enabled test groups.
+Tests cover HTTP, TLS, SSE, WebSocket, multipart, file transfers, cancellation,
+timeouts, connection reuse, concurrent requests and graceful shutdown. TLS and
+compression tests depend on the corresponding build options.
 
 Randomized tests cover URL/query and Base64 binary round trips, an ordered
 header reference model, receive-buffer moves, SSE and multipart fragmentation,
@@ -123,35 +113,6 @@ Pass an unsigned decimal seed as the second argument to reproduce a run:
 .\build-msvc\tests\chhttp_tests.exe --property 13
 .\build-msvc\tests\chhttp_tests.exe property_multipart 13
 ```
-
-Optional benchmarks report elapsed time, throughput, process peak resident
-memory and maximum decoded callback size. Each invocation runs one case in a
-fresh process; compare repeated runs using the same compiler and configuration:
-
-```powershell
-cmake --preset windows-msvc -DCHHTTP_BUILD_BENCHMARKS=ON
-cmake --build --preset windows-msvc --target chhttp_benchmarks
-.\build-msvc\chhttp_benchmarks.exe sse
-.\build-msvc\chhttp_benchmarks.exe upload
-.\build-msvc\chhttp_benchmarks.exe gzip
-.\build-msvc\chhttp_benchmarks.exe keepalive
-.\build-msvc\chhttp_benchmarks.exe queue
-.\build-msvc\chhttp_benchmarks.exe multipart
-.\build-msvc\chhttp_benchmarks.exe multipart-retained
-.\build-msvc\chhttp_benchmarks.exe negotiation
-.\build-msvc\chhttp_benchmarks.exe queue-burst
-```
-
-The `windows-clang-asan` presets compile with AddressSanitizer and its dynamic
-runtime. CTest locates that runtime through the configured compiler. These
-presets require an ASan runtime compatible with the installed Windows version;
-the local Clang 17 runtime currently fails during system-function interception,
-before the test program starts. See [the optimization and verification report](docs/OPTIMIZATION_REPORT.md)
-for measurements, commands and the exact validation limits. The
-[second-round report](docs/OPTIMIZATION_ROUND2.md) covers multipart buffering,
-file I/O and compression scheduling. The [third-round report](docs/OPTIMIZATION_ROUND3.md)
-covers cancellation registration, URL resolution, negotiation, protocol regressions,
-random seeds and the latest verification results, including benchmark tradeoffs.
 
 Consumers link the installed package as follows:
 
@@ -423,9 +384,8 @@ response must be reliable.
 Stream routes run on the server libuv thread. Do not perform long blocking file
 or database operations in callbacks. Await an asynchronous sink or a bounded
 queue instead. The `string_view` is valid only until its callback returns.
-`save_to_file()` and `save_to_temp()` use synchronous incremental file writes;
-they bound memory but an async file sink is preferable on latency-sensitive
-servers.
+`save_to_file()` and `save_to_temp()` perform file I/O asynchronously and resume
+on the originating I/O loop.
 
 ## Streaming multipart and model payloads
 
@@ -548,67 +508,38 @@ is intended only for controlled tests.
 
 ## Resource and safety defaults
 
-The defaults cap buffered request bodies at 64 MiB, response bodies at 128 MiB, headers
-at 64 KiB, each client origin at 64 total connections and keep-alive sessions
-at 1000 requests. A stream route can raise or lower its body limit independently
-without allocating that amount. Streaming callbacks avoid a second body allocation.
-Decoded gzip/deflate/Brotli/Zstd callbacks receive at most 32 KiB at a time and
-awaited consumers finish before the decoder produces the next block.
-Synchronous decoded consumers avoid a coroutine allocation per output block.
-Concatenated gzip members and Zstd frames are supported. Buffered HTTP bodies and large
-WebSocket writes use transport copies of at most 64 KiB; the caller's buffered
-body still occupies its original memory. TLS output is flushed after bounded
-plaintext writes. Network allocation callbacks share a 64 KiB scratch buffer per
-event loop with an owned fallback for overlapping reads.
+The defaults cap buffered request bodies at 64 MiB, response bodies at 128 MiB,
+headers at 64 KiB, each client origin at 64 total connections and keep-alive
+sessions at 1000 requests. A stream route can set its body limit independently.
+Configure `ServerOptions` and `ClientOptions` for the expected payload sizes and
+connection counts.
 
-Connection-pool waits are signalled by lease release, cancellation or deadline.
-Active cancellation registrations are inserted and removed directly without
-scanning the entire pending-request list or retaining expired entries.
-Requests waiting for a saturated origin defer allocation of the full exchange
-coroutine frame until a connection becomes available. They use the same pool
-wakeups, stop tokens and deadlines as connection acquisition.
-The legacy shared atomic cancellation flag still requires polling while queued;
-`stop_token` does not. Async body consumers may resume on another executor;
-protocol processing returns to the owning I/O loop before continuing.
+Requests waiting for a connection respect cancellation and deadlines.
+Async body consumers may resume on another executor; protocol processing returns
+to the owning I/O loop before continuing. Decoded responses respect the configured
+body limit and consumer backpressure. Concatenated gzip members and Zstd frames
+are supported.
 
-`MultipartParser::feed()` processes input in blocks of at most 64 KiB and
-retains only incomplete headers/boundaries between calls. Returned events own
-their data, so keeping all events still retains their payload. Preamble and
-header limits are enforced across input fragments and false boundary markers.
+Events returned by `MultipartParser::feed()` own their data. Preamble and header
+limits apply across input fragments.
 `MultipartWriter::add_file()` sends at most the size recorded when the file was
 added; missing or truncated files fail the producer instead of silently ending it.
 
-File open/read/write/close operations and static-path checks run on libuv's
-worker pool when called from an I/O loop; standalone body streams use a bounded
-fallback pool. Awaited file operations preserve body backpressure and resume on
-the originating loop. Pending filesystem calls finish before runtime shutdown
-completes; slow filesystem calls can extend shutdown beyond the HTTP grace period.
-`AsyncFileSink` serializes writes on its bounded disk pool and resumes callers
-on their originating I/O loop, including during shutdown. Completed writes
-release their owned input buffer before notifying callers. Its `open()` and
-file-slice metadata validation are synchronous; prepare them outside I/O callbacks.
-Buffered uploads larger than 64 KiB report progress after each bounded write,
-so callback cancellation stops the remaining upload and retains partial counts.
-File responses open the file before sending a success header, suppress body
-bytes for HEAD/204/205/304, and apply Range only to otherwise successful GETs.
-HEAD with Range now returns the full representation's length and status 200.
-Range units are case-insensitive; unknown units are ignored. When If-Range is
-present, a partial response requires a matching explicitly supplied strong ETag;
-stale, weak, unrecognized and date validators fall back to a full response.
+`AsyncFileSink` preserves write order and resumes callers on their originating
+I/O loop. Its `open()` and file-slice metadata validation are synchronous;
+prepare them outside I/O callbacks. Pending filesystem calls finish before
+runtime shutdown completes, so slow filesystem calls can extend shutdown beyond
+the HTTP grace period.
 
-Relative URL resolution preserves repeated slashes, trailing directory slashes,
-escaped path bytes and query contents while removing dot segments. HTTP trailer
-fields that can alter framing, routing, authentication or response controls are
-rejected. Compression negotiation parses q-values as HTTP decimals from 0 to 1
-with at most three fractional digits, without temporary token allocations.
+File responses apply Range only to otherwise successful GETs. HEAD with Range
+returns the full representation's length and status 200. Range units are
+case-insensitive; unknown units are ignored. When If-Range is present, a partial
+response requires a matching explicitly supplied strong ETag; stale, weak,
+unrecognized and date validators fall back to a full response.
 
-Incremental compression output is bounded by the configured body limit, route
-matching is performed before file access, percent-decoded static paths are
-canonicalized, and credentials are removed on cross-origin redirects.
+Static-file paths are canonicalized, credentials are removed on cross-origin
+redirects, and trailer fields that can alter framing, routing, authentication
+or response controls are rejected.
 
-Tune `ServerOptions` and `ClientOptions` for model payload sizes and expected
-connection counts. The async server does not create a thread per connection;
-one libuv loop handles network I/O and `worker_threads` controls the pool used
-for synchronous route handlers and automatic response compression. Compression
-therefore shares that pool's capacity; asynchronous lightweight routes can
-continue responding while those workers are busy.
+`worker_threads` controls the pool shared by synchronous route handlers and
+automatic response compression. Network I/O runs on the server's libuv loop.
