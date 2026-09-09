@@ -26,11 +26,23 @@
         "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
         "VCPKG_TARGET_TRIPLET": "x64-windows"
       }
+    },
+    {
+      "name": "windows-clang-asan",
+      "displayName": "Windows Clang AddressSanitizer (vcpkg)",
+      "inherits": "windows-clang",
+      "binaryDir": "${sourceDir}/build-asan",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "CMAKE_CXX_FLAGS": "-fsanitize=address -shared-libasan",
+        "CMAKE_CXX_FLAGS_RELWITHDEBINFO": "-O1 -g -DNDEBUG"
+      }
     }
   ],
   "buildPresets": [
     { "name": "windows-msvc", "configurePreset": "windows-msvc" },
-    { "name": "windows-clang", "configurePreset": "windows-clang" }
+    { "name": "windows-clang", "configurePreset": "windows-clang" },
+    { "name": "windows-clang-asan", "configurePreset": "windows-clang-asan" }
   ],
   "testPresets": [
     {
@@ -41,6 +53,11 @@
     {
       "name": "windows-clang",
       "configurePreset": "windows-clang",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "windows-clang-asan",
+      "configurePreset": "windows-clang-asan",
       "output": { "outputOnFailure": true }
     }
   ]

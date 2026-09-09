@@ -83,24 +83,66 @@ cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
 
-The test executable separates protocol/feature checks from load and lifecycle
-checks. Run either group independently, or repeat the stress group until the
-first failure:
+The test executable separates protocol/feature checks, load/lifecycle checks,
+and deterministic randomized properties. Run a group independently, or repeat
+the stress group until the first failure:
 
 ```sh
 ctest --test-dir build -L functional --output-on-failure
 ctest --test-dir build -L stress --output-on-failure
+ctest --test-dir build -L property --output-on-failure
 ctest --test-dir build -L stress --repeat until-fail:30 --output-on-failure
 ```
 
-Running `chhttp_tests` without an argument executes all 149 registered groups:
-123 focused functional/boundary groups and 26 load/lifecycle groups. The stress
+Running `chhttp_tests` without an argument executes all 215 registered groups:
+176 functional/boundary groups, 30 load/lifecycle groups, and 9 randomized
+property groups (with TLS and compression enabled). The stress
 group covers concurrent sync/async HTTP, thousands of keep-alive requests,
 large buffered and streamed uploads (including bounded-memory 100 MiB and
 concurrent 10 MiB cases), streamed callbacks, connection recycling, independent
 and global cancellation, client/server churn, parallel servers, graceful
 draining, SSE fan-out, WebSocket connection/message load, malformed-request
-floods and HTTPS/TLS handshake concurrency.
+floods, concurrent file spooling/download cancellation and HTTPS/TLS handshake concurrency.
+
+Randomized tests cover URL/query and Base64 binary round trips, an ordered
+header reference model, receive-buffer moves, SSE and multipart fragmentation,
+HTTP chunk extensions/trailers/pipelining, compressed binary responses and
+WebSocket frame-length boundaries. Failures print the seed and case index.
+Pass an unsigned decimal seed as the second argument to reproduce a run:
+
+```powershell
+.\build-msvc\tests\chhttp_tests.exe --property 13
+.\build-msvc\tests\chhttp_tests.exe property_multipart 13
+```
+
+Optional benchmarks report elapsed time, throughput, process peak resident
+memory and maximum decoded callback size. Each invocation runs one case in a
+fresh process; compare repeated runs using the same compiler and configuration:
+
+```powershell
+cmake --preset windows-msvc -DCHHTTP_BUILD_BENCHMARKS=ON
+cmake --build --preset windows-msvc --target chhttp_benchmarks
+.\build-msvc\chhttp_benchmarks.exe sse
+.\build-msvc\chhttp_benchmarks.exe upload
+.\build-msvc\chhttp_benchmarks.exe gzip
+.\build-msvc\chhttp_benchmarks.exe keepalive
+.\build-msvc\chhttp_benchmarks.exe queue
+.\build-msvc\chhttp_benchmarks.exe multipart
+.\build-msvc\chhttp_benchmarks.exe multipart-retained
+.\build-msvc\chhttp_benchmarks.exe negotiation
+.\build-msvc\chhttp_benchmarks.exe queue-burst
+```
+
+The `windows-clang-asan` presets compile with AddressSanitizer and its dynamic
+runtime. CTest locates that runtime through the configured compiler. These
+presets require an ASan runtime compatible with the installed Windows version;
+the local Clang 17 runtime currently fails during system-function interception,
+before the test program starts. See [the optimization and verification report](docs/OPTIMIZATION_REPORT.md)
+for measurements, commands and the exact validation limits. The
+[second-round report](docs/OPTIMIZATION_ROUND2.md) covers multipart buffering,
+file I/O and compression scheduling. The [third-round report](docs/OPTIMIZATION_ROUND3.md)
+covers cancellation registration, URL resolution, negotiation, protocol regressions,
+random seeds and the latest verification results, including benchmark tradeoffs.
 
 Consumers link the installed package as follows:
 
@@ -374,6 +416,10 @@ The parser handles CRLF, split input chunks, multi-line `data`, comments, BOM,
 event IDs and server-provided retry delays. Reconnect is enabled by default for
 the GET convenience constructor.
 
+Events with no explicit event type use `"message"`, including dispatch through
+`on_event("message", ...)`. Repeated `id` and `event` fields replace their previous
+values when enforcing the aggregate event-size limit.
+
 POST-based model streams use the method-agnostic `Request` constructor and
 normally disable replay:
 
@@ -439,6 +485,46 @@ The defaults cap buffered request bodies at 64 MiB, response bodies at 128 MiB, 
 at 64 KiB, each client origin at 64 total connections and keep-alive sessions
 at 1000 requests. A stream route can raise or lower its body limit independently
 without allocating that amount. Streaming callbacks avoid a second body allocation.
+Decoded gzip/deflate/Brotli/Zstd callbacks receive at most 32 KiB at a time and
+awaited consumers finish before the decoder produces the next block. Concatenated
+gzip members and Zstd frames are supported. Buffered HTTP bodies and large
+WebSocket writes use transport copies of at most 64 KiB; the caller's buffered
+body still occupies its original memory. TLS output is flushed after bounded
+plaintext writes. Network allocation callbacks share a 64 KiB scratch buffer per
+event loop with an owned fallback for overlapping reads.
+
+Connection-pool waits are signalled by lease release, cancellation or deadline.
+Active cancellation registrations are inserted and removed directly without
+scanning the entire pending-request list or retaining expired entries.
+The legacy shared atomic cancellation flag still requires polling while queued;
+`stop_token` does not. Async body consumers may resume on another executor;
+protocol processing returns to the owning I/O loop before continuing.
+
+`MultipartParser::feed()` processes input in blocks of at most 64 KiB and
+retains only incomplete headers/boundaries between calls. Returned events own
+their data, so keeping all events still retains their payload. Preamble and
+header limits are enforced across input fragments and false boundary markers.
+`MultipartWriter::add_file()` sends at most the size recorded when the file was
+added; missing or truncated files fail the producer instead of silently ending it.
+
+File open/read/write/close operations and static-path checks run on libuv's
+worker pool when called from an I/O loop; standalone body streams use a bounded
+fallback pool. Awaited file operations preserve body backpressure and resume on
+the originating loop. Pending filesystem calls finish before runtime shutdown
+completes; slow filesystem calls can extend shutdown beyond the HTTP grace period.
+File responses open the file before sending a success header, suppress body
+bytes for HEAD/204/205/304, and apply Range only to otherwise successful GETs.
+HEAD with Range now returns the full representation's length and status 200.
+Range units are case-insensitive; unknown units are ignored. When If-Range is
+present, a partial response requires a matching explicitly supplied strong ETag;
+stale, weak, unrecognized and date validators fall back to a full response.
+
+Relative URL resolution preserves repeated slashes, trailing directory slashes,
+escaped path bytes and query contents while removing dot segments. HTTP trailer
+fields that can alter framing, routing, authentication or response controls are
+rejected. Compression negotiation parses q-values as HTTP decimals from 0 to 1
+with at most three fractional digits, without temporary token allocations.
+
 Incremental compression output is bounded by the configured body limit, route
 matching is performed before file access, percent-decoded static paths are
 canonicalized, and credentials are removed on cross-origin redirects.
@@ -446,4 +532,6 @@ canonicalized, and credentials are removed on cross-origin redirects.
 Tune `ServerOptions` and `ClientOptions` for model payload sizes and expected
 connection counts. The async server does not create a thread per connection;
 one libuv loop handles network I/O and `worker_threads` controls the pool used
-for synchronous route handlers.
+for synchronous route handlers and automatic response compression. Compression
+therefore shares that pool's capacity; asynchronous lightweight routes can
+continue responding while those workers are busy.

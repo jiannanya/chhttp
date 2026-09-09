@@ -74,6 +74,7 @@ public:
     const auto normalized = lower(encoding);
     if (normalized == "gzip" || normalized == "deflate") {
       decoder->kind_ = Kind::zlib;
+      decoder->gzip_ = normalized == "gzip";
       const int window_bits = normalized == "gzip" ? MAX_WBITS + 16 : MAX_WBITS;
       if (inflateInit2(&decoder->zlib_, window_bits) != Z_OK)
         return ErrorInfo{Error::compression,
@@ -110,86 +111,93 @@ public:
 #endif
   }
 
-  Result<std::string> feed(std::string_view input, bool finish) {
+  template <class Consumer>
+  Task<ErrorInfo> feed(std::string_view input, bool finish,
+                       const Consumer &consume) {
 #ifdef CHHTTP_HAS_COMPRESSION
-    if (finished_) {
-      if (!input.empty())
-        return ErrorInfo{Error::compression,
-                         "Compressed stream contains trailing data"};
-      return std::string{};
-    }
-    std::string output;
-    std::array<char, 32 * 1024> buffer{};
-    if (kind_ == Kind::zlib) {
-      zlib_.next_in = reinterpret_cast<Bytef *>(
-          const_cast<char *>(input.data()));
-      zlib_.avail_in = static_cast<uInt>(input.size());
-      for (;;) {
+    // This is the only expanded-data buffer. Await the consumer before
+    // decoding another block, even if one input packet expands to many MiB.
+    std::array<char, 32 * 1024> buffer;
+    for (;;) {
+      if (finished_) {
+        if (input.empty()) break;
+        if (kind_ == Kind::zlib && gzip_) {
+          if (inflateReset(&zlib_) != Z_OK)
+            co_return ErrorInfo{Error::compression, "Unable to reset gzip member"};
+        } else if (kind_ != Kind::zstd) {
+          co_return ErrorInfo{Error::compression,
+                              "Compressed stream contains trailing data"};
+        }
+        // gzip members and Zstd frames may be concatenated, including across
+        // socket reads. The next member must itself finish successfully.
+        finished_ = false;
+      }
+      const auto before = input.size();
+      std::size_t produced = 0;
+      bool needs_output = false;
+      if (kind_ == Kind::zlib) {
+        const auto count = std::min<std::size_t>(input.size(),
+                                                std::numeric_limits<uInt>::max());
+        zlib_.next_in = reinterpret_cast<Bytef *>(const_cast<char *>(input.data()));
+        zlib_.avail_in = static_cast<uInt>(count);
         zlib_.next_out = reinterpret_cast<Bytef *>(buffer.data());
         zlib_.avail_out = static_cast<uInt>(buffer.size());
-        const int status = inflate(&zlib_, finish ? Z_FINISH : Z_NO_FLUSH);
-        if (auto error = append(output, buffer.data(),
-                                buffer.size() - zlib_.avail_out); error)
-          return error;
-        if (status == Z_STREAM_END) {
-          if (zlib_.avail_in != 0)
-            return ErrorInfo{Error::compression,
-                             "Compressed stream contains trailing data"};
-          finished_ = true;
-          break;
-        }
-        if (status == Z_BUF_ERROR && zlib_.avail_in == 0) break;
-        if (status != Z_OK)
-          return ErrorInfo{Error::compression,
-                           zlib_.msg ? zlib_.msg : "Invalid zlib stream"};
-        if (zlib_.avail_in == 0 && zlib_.avail_out != 0) break;
-      }
-    } else if (kind_ == Kind::brotli) {
-      const auto *next_input =
-          reinterpret_cast<const std::uint8_t *>(input.data());
-      std::size_t available_input = input.size();
-      for (;;) {
+        const int status = inflate(&zlib_, Z_NO_FLUSH);
+        input.remove_prefix(count - zlib_.avail_in);
+        produced = buffer.size() - zlib_.avail_out;
+        finished_ = status == Z_STREAM_END;
+        if (status != Z_OK && status != Z_BUF_ERROR && status != Z_STREAM_END)
+          co_return ErrorInfo{Error::compression,
+                              zlib_.msg ? zlib_.msg : "Invalid zlib stream"};
+        needs_output = zlib_.avail_out == 0;
+      } else if (kind_ == Kind::brotli) {
+        const auto *next_input = reinterpret_cast<const std::uint8_t *>(input.data());
+        std::size_t available_input = input.size();
         auto *next_output = reinterpret_cast<std::uint8_t *>(buffer.data());
         std::size_t available_output = buffer.size();
         const auto status = BrotliDecoderDecompressStream(
             brotli_, &available_input, &next_input, &available_output,
             &next_output, nullptr);
-        if (auto error = append(output, buffer.data(),
-                                buffer.size() - available_output); error)
-          return error;
-        if (status == BROTLI_DECODER_RESULT_SUCCESS) {
-          if (available_input != 0)
-            return ErrorInfo{Error::compression,
-                             "Compressed stream contains trailing data"};
-          finished_ = true;
-          break;
-        }
+        input.remove_prefix(input.size() - available_input);
+        produced = buffer.size() - available_output;
         if (status == BROTLI_DECODER_RESULT_ERROR)
-          return ErrorInfo{Error::compression, "Invalid Brotli stream"};
-        if (status == BROTLI_DECODER_RESULT_NEEDS_MORE_INPUT &&
-            available_input == 0)
-          break;
-      }
-    } else if (kind_ == Kind::zstd) {
-      ZSTD_inBuffer source{input.data(), input.size(), 0};
-      std::size_t remaining = 1;
-      do {
+          co_return ErrorInfo{Error::compression, "Invalid Brotli stream"};
+        finished_ = status == BROTLI_DECODER_RESULT_SUCCESS;
+        needs_output = status == BROTLI_DECODER_RESULT_NEEDS_MORE_OUTPUT;
+      } else if (kind_ == Kind::zstd) {
+        ZSTD_inBuffer source{input.data(), input.size(), 0};
         ZSTD_outBuffer target{buffer.data(), buffer.size(), 0};
-        remaining = ZSTD_decompressStream(zstd_, &target, &source);
+        const auto remaining = ZSTD_decompressStream(zstd_, &target, &source);
         if (ZSTD_isError(remaining))
-          return ErrorInfo{Error::compression, ZSTD_getErrorName(remaining)};
-        if (auto error = append(output, buffer.data(), target.pos); error)
-          return error;
-        if (remaining == 0) finished_ = true;
-      } while (source.pos < source.size);
+          co_return ErrorInfo{Error::compression, ZSTD_getErrorName(remaining)};
+        input.remove_prefix(source.pos);
+        produced = target.pos;
+        finished_ = remaining == 0;
+        needs_output = target.pos == target.size;
+      }
+      if (produced > max_output_ || total_output_ > max_output_ - produced)
+        co_return ErrorInfo{Error::body_too_large, "Decompressed body exceeds limit"};
+      total_output_ += produced;
+      if (produced != 0) {
+        if (auto error = co_await consume(std::string_view(buffer.data(), produced)); error)
+          co_return error;
+      }
+      if (finished_) {
+        if (input.empty()) break;
+        continue;
+      }
+      if (input.empty() && !needs_output) break;
+      if (input.size() == before && produced == 0)
+        co_return ErrorInfo{Error::compression, "Compressed decoder made no progress"};
     }
     if (finish && !finished_)
-      return ErrorInfo{Error::compression, "Truncated compressed stream"};
-    return output;
+      co_return ErrorInfo{Error::compression, "Truncated compressed stream"};
+    co_return ErrorInfo{};
 #else
     (void)input;
     (void)finish;
-    return ErrorInfo{Error::compression, "Compression support is disabled"};
+    (void)consume;
+    co_return ErrorInfo{Error::compression, "Compression support is disabled"};
 #endif
   }
 
@@ -200,19 +208,12 @@ private:
   explicit StreamingDecoder(std::size_t max_output)
       : max_output_(max_output) {}
 
-  ErrorInfo append(std::string &output, const char *data, std::size_t count) {
-    if (count > max_output_ || total_output_ > max_output_ - count)
-      return {Error::body_too_large, "Decompressed body exceeds limit"};
-    output.append(data, count);
-    total_output_ += count;
-    return {};
-  }
-
   std::size_t max_output_{0};
   std::size_t total_output_{0};
 #ifdef CHHTTP_HAS_COMPRESSION
   Kind kind_{Kind::none};
   bool finished_{false};
+  bool gzip_{false};
   z_stream zlib_{};
   bool zlib_initialized_{false};
   BrotliDecoderState *brotli_{nullptr};
@@ -240,29 +241,31 @@ Result<std::vector<std::string>> framing_values(std::string_view input,
 }
 
 Task<Result<std::string>> read_head_bytes(
-    const std::shared_ptr<Connection> &connection, std::string &buffer,
+    const std::shared_ptr<Connection> &connection, ReadBuffer &buffer,
     const HttpReadOptions &options) {
   const auto header_deadline = options.header_timeout
       ? std::optional<TimePoint>{std::chrono::steady_clock::now() +
                                  *options.header_timeout}
       : std::nullopt;
+  std::size_t search_from = 0;
   for (;;) {
-    const auto end = buffer.find("\r\n\r\n");
+    const auto end = buffer.find("\r\n\r\n", search_from);
     if (end != std::string::npos) {
       if (end + 4 > options.max_header_size)
         co_return ErrorInfo{Error::protocol, "HTTP headers exceed configured limit"};
       std::string head = buffer.substr(0, end + 2);
-      buffer.erase(0, end + 4);
+      buffer.consume(end + 4);
       co_return head;
     }
     if (buffer.size() >= options.max_header_size)
       co_return ErrorInfo{Error::protocol, "HTTP headers exceed configured limit"};
+    search_from = buffer.size() > 3 ? buffer.size() - 3 : 0;
     auto chunk = co_await timed_read(connection, options, header_deadline,
                                      "Response header");
     if (!chunk) co_return chunk.error();
     if (chunk->eof)
       co_return ErrorInfo{Error::protocol, "Connection closed during HTTP headers"};
-    buffer += chunk->data;
+    buffer.append(std::move(chunk->data));
   }
 }
 
@@ -359,33 +362,36 @@ bool keep_alive(unsigned version, const Headers &headers) {
 }
 
 Task<Result<std::string>> read_line(
-    const std::shared_ptr<Connection> &connection, std::string &buffer,
+    const std::shared_ptr<Connection> &connection, ReadBuffer &buffer,
     std::size_t max_length, const HttpReadOptions &options,
     std::optional<TimePoint> phase_deadline,
     std::string_view phase) {
+  std::size_t search_from = 0;
   for (;;) {
-    const auto end = buffer.find("\r\n");
+    const auto end = buffer.find("\r\n", search_from);
     if (end != std::string::npos) {
       if (end > max_length)
         co_return ErrorInfo{Error::protocol, "HTTP line exceeds configured limit"};
       std::string line = buffer.substr(0, end);
-      buffer.erase(0, end + 2);
+      buffer.consume(end + 2);
       co_return line;
     }
-    if (buffer.find('\n') != std::string::npos)
+    if (buffer.find('\n', search_from) != std::string::npos)
       co_return ErrorInfo{Error::protocol, "Bare LF in HTTP message"};
-    if (buffer.size() > max_length)
+    if (buffer.size() > max_length &&
+        (buffer.size() - max_length != 1 || buffer[buffer.size() - 1] != '\r'))
       co_return ErrorInfo{Error::protocol, "HTTP line exceeds configured limit"};
+    search_from = buffer.empty() ? 0 : buffer.size() - 1;
     auto chunk = co_await timed_read(connection, options, phase_deadline, phase);
     if (!chunk) co_return chunk.error();
     if (chunk->eof)
       co_return ErrorInfo{Error::protocol, "Unexpected end of HTTP line"};
-    buffer += chunk->data;
+    buffer.append(std::move(chunk->data));
   }
 }
 
 Task<Result<std::string>> read_body(
-    const std::shared_ptr<Connection> &connection, std::string &buffer,
+    const std::shared_ptr<Connection> &connection, ReadBuffer &buffer,
     ParsedHead &head, const HttpReadOptions &options, bool body_until_eof,
     bool no_body) {
   std::string body;
@@ -423,7 +429,10 @@ Task<Result<std::string>> read_body(
           co_return ErrorInfo{Error::cancelled,
                               "HTTP body callback cancelled the transfer"};
       } else if (options.on_data_async) {
-        if (!co_await options.on_data_async(data))
+        const bool accepted = co_await options.on_data_async(data);
+        if (!connection->runtime()->on_loop_thread())
+          co_await resume_on(connection->runtime());
+        if (!accepted)
           co_return ErrorInfo{Error::cancelled,
                               "HTTP async body callback cancelled the transfer"};
       } else {
@@ -477,7 +486,7 @@ Task<Result<std::string>> read_body(
         for (;;) {
           auto trailer = co_await read_line(connection, buffer,
                                             options.max_header_size,
-                                            options, std::nullopt,
+                                            options, body_deadline(),
                                             "Response trailer");
           if (!trailer) co_return trailer.error();
           if (trailer->size() > options.max_header_size ||
@@ -494,10 +503,16 @@ Task<Result<std::string>> read_body(
           auto value = trim(std::string_view(*trailer).substr(colon + 1));
           if (!valid_header_name(name) || !valid_header_value(value))
             co_return ErrorInfo{Error::protocol, "Invalid HTTP trailer"};
-          if (iequals(name, "Content-Length") ||
-              iequals(name, "Transfer-Encoding") || iequals(name, "Host"))
+          constexpr std::array<std::string_view, 23> forbidden_trailers{
+              "Content-Length", "Transfer-Encoding", "Host", "Connection", "Trailer",
+              "TE", "Upgrade", "Content-Encoding", "Content-Type", "Content-Range",
+              "Authorization", "Proxy-Authorization", "WWW-Authenticate", "Proxy-Authenticate",
+              "Cookie", "Set-Cookie", "Range", "If-Range", "Location", "If-Match",
+              "If-None-Match", "If-Modified-Since", "If-Unmodified-Since"};
+          if (std::ranges::any_of(forbidden_trailers,
+                                 [&](auto forbidden) { return iequals(name, forbidden); }))
             co_return ErrorInfo{Error::protocol,
-                                "Forbidden framing field in HTTP trailer"};
+                                "Forbidden control field in HTTP trailer"};
           head.headers.add(std::string(name), std::move(value));
         }
         break;
@@ -516,14 +531,14 @@ Task<Result<std::string>> read_body(
           if (chunk->eof)
             co_return ErrorInfo{Error::protocol,
                                 "Unexpected end of HTTP chunk"};
-          buffer += chunk->data;
+          buffer.append(std::move(chunk->data));
         }
         const auto count = static_cast<std::size_t>(
             std::min<std::uint64_t>(remaining, buffer.size()));
         auto error = co_await deliver(
-            std::string_view(buffer).substr(0, count), 0);
+            buffer.view().substr(0, count), 0);
         if (error) co_return error;
-        buffer.erase(0, count);
+        buffer.consume(count);
         remaining -= count;
       }
       while (buffer.size() < 2) {
@@ -532,11 +547,11 @@ Task<Result<std::string>> read_body(
         if (chunk->eof)
           co_return ErrorInfo{Error::protocol,
                               "Unexpected end after HTTP chunk"};
-        buffer += chunk->data;
+        buffer.append(std::move(chunk->data));
       }
       if (buffer[0] != '\r' || buffer[1] != '\n')
         co_return ErrorInfo{Error::protocol, "Chunk payload lacks CRLF"};
-      buffer.erase(0, 2);
+      buffer.consume(2);
     }
     co_return body;
   }
@@ -553,14 +568,14 @@ Task<Result<std::string>> read_body(
         if (!chunk) co_return chunk.error();
         if (chunk->eof)
           co_return ErrorInfo{Error::protocol, "Truncated HTTP body"};
-        buffer += chunk->data;
+        buffer.append(std::move(chunk->data));
       }
       const auto count = static_cast<std::size_t>(
           std::min<std::uint64_t>(remaining, buffer.size()));
       auto error = co_await deliver(
-          std::string_view(buffer).substr(0, count), total);
+          buffer.view().substr(0, count), total);
       if (error) co_return error;
-      buffer.erase(0, count);
+      buffer.consume(count);
       remaining -= count;
     }
     co_return body;
@@ -568,7 +583,7 @@ Task<Result<std::string>> read_body(
 
   if (body_until_eof) {
     if (!buffer.empty()) {
-      auto error = co_await deliver(buffer, 0);
+      auto error = co_await deliver(buffer.view(), 0);
       buffer.clear();
       if (error) co_return error;
     }
@@ -603,6 +618,26 @@ Result<std::string> serialize_head(std::string start_line,
 bool status_has_no_body(int status) {
   return (status >= 100 && status < 200) || status == 204 || status == 205 ||
          status == 304;
+}
+
+Task<ErrorInfo> write_body_bytes(const std::shared_ptr<Connection> &connection,
+                                  std::string_view body,
+                                  std::chrono::milliseconds timeout) {
+  // The caller owns the body until this awaited operation completes. Only
+  // transport-sized copies are needed, including when a write is cancelled.
+  const auto deadline = std::chrono::steady_clock::now() + std::max(timeout, 1ms);
+  while (!body.empty()) {
+    const auto remaining = std::chrono::ceil<std::chrono::milliseconds>(
+        deadline - std::chrono::steady_clock::now());
+    if (remaining <= 0ms)
+      co_return ErrorInfo{Error::timeout, "Body write timed out"};
+    const auto count = std::min<std::size_t>(body.size(), 64 * 1024);
+    if (auto error = co_await connection->write(std::string(body.substr(0, count)),
+                                                remaining); error)
+      co_return error;
+    body.remove_prefix(count);
+  }
+  co_return ErrorInfo{};
 }
 
 bool valid_utf8(std::string_view value) noexcept {
@@ -656,7 +691,7 @@ std::string random_websocket_key() {
 class UvWebSocketChannel final : public WebSocket::Channel {
 public:
   UvWebSocketChannel(std::shared_ptr<Connection> connection,
-                     std::string buffered, bool client_side,
+                     ReadBuffer buffered, bool client_side,
                      std::string protocol, std::chrono::milliseconds timeout)
       : connection_(std::move(connection)), buffer_(std::move(buffered)),
         client_side_(client_side), protocol_(std::move(protocol)),
@@ -726,7 +761,7 @@ public:
       ready = co_await need(cursor + static_cast<std::size_t>(length));
       if (ready) co_return ready;
       std::string payload = buffer_.substr(cursor, static_cast<std::size_t>(length));
-      buffer_.erase(0, cursor + static_cast<std::size_t>(length));
+      buffer_.consume(cursor + static_cast<std::size_t>(length));
       if (masked) {
         for (std::size_t index = 0; index < payload.size(); ++index)
           payload[index] ^= static_cast<char>(mask[index % 4]);
@@ -837,7 +872,7 @@ private:
         open_ = false;
         co_return ErrorInfo{Error::websocket_closed, "WebSocket transport closed"};
       }
-      buffer_ += chunk->data;
+      buffer_.append(std::move(chunk->data));
     }
     co_return ErrorInfo{};
   }
@@ -873,12 +908,17 @@ private:
       for (std::size_t index = 0; index < payload.size(); ++index)
         payload[index] ^= static_cast<char>(mask[index % 4]);
     }
-    frame += payload;
-    co_return co_await connection_->write(std::move(frame), timeout_);
+    if (payload.size() <= 64 * 1024) {
+      frame += payload;
+      co_return co_await connection_->write(std::move(frame), timeout_);
+    }
+    if (auto error = co_await connection_->write(std::move(frame), timeout_); error)
+      co_return error;
+    co_return co_await write_body_bytes(connection_, payload, timeout_);
   }
 
   std::shared_ptr<Connection> connection_;
-  std::string buffer_;
+  ReadBuffer buffer_;
   bool client_side_{false};
   std::string protocol_;
   std::chrono::milliseconds timeout_;
@@ -894,7 +934,7 @@ private:
 
 Task<Result<RequestHeadResult>>
 read_request_head(const std::shared_ptr<Connection> &connection,
-                  std::string &buffer, const HttpReadOptions &options) {
+                  ReadBuffer &buffer, const HttpReadOptions &options) {
   auto bytes = co_await read_head_bytes(connection, buffer, options);
   if (!bytes) co_return bytes.error();
   auto head = parse_head(*bytes);
@@ -925,7 +965,7 @@ read_request_head(const std::shared_ptr<Connection> &connection,
   request.headers = head->headers;
   request.keep_alive = keep_alive(request.version, request.headers);
   std::string routing_target = request.target;
-  if (routing_target.find("://") != std::string::npos) {
+  if (!routing_target.starts_with('/') && routing_target.find("://") != std::string::npos) {
     auto absolute = parse_url(routing_target);
     if (!absolute)
       co_return ErrorInfo{Error::protocol,
@@ -961,7 +1001,7 @@ read_request_head(const std::shared_ptr<Connection> &connection,
 
 Task<Result<std::string>>
 read_request_body(const std::shared_ptr<Connection> &connection,
-                  std::string &buffer, RequestBodyState &state,
+                  ReadBuffer &buffer, RequestBodyState &state,
                   const HttpReadOptions &options) {
   if (state.expect_continue && !state.continue_sent) {
     auto continued = co_await connection->write("HTTP/1.1 100 Continue\r\n\r\n",
@@ -975,13 +1015,18 @@ read_request_body(const std::shared_ptr<Connection> &connection,
       .chunked = state.chunked};
   HttpReadOptions body_options = options;
   const auto encoding = state.headers.get("Content-Encoding");
-  const bool decode = options.auto_decompress && !encoding.empty();
+  const bool decode = options.auto_decompress && !encoding.empty() &&
+                      !iequals(encoding, "identity");
   std::unique_ptr<StreamingDecoder> decoder;
   std::string decoded_body;
   std::uint64_t decoded_received = 0;
   ErrorInfo decode_error;
   const auto consume_decoded = [&](std::string_view data) -> Task<ErrorInfo> {
     if (data.empty()) co_return ErrorInfo{};
+    if (options.cancelled && options.cancelled())
+      co_return ErrorInfo{Error::cancelled, "Request cancelled"};
+    if (options.deadline && std::chrono::steady_clock::now() >= *options.deadline)
+      co_return ErrorInfo{Error::timeout, "Request deadline exceeded"};
     if (data.size() > options.max_body_size ||
         decoded_received > options.max_body_size - data.size())
       co_return ErrorInfo{Error::body_too_large,
@@ -993,7 +1038,10 @@ read_request_body(const std::shared_ptr<Connection> &connection,
           co_return ErrorInfo{Error::cancelled,
                               "Request body callback cancelled the transfer"};
       } else if (options.on_data_async) {
-        if (!co_await options.on_data_async(data))
+        const bool accepted = co_await options.on_data_async(data);
+        if (!connection->runtime()->on_loop_thread())
+          co_await resume_on(connection->runtime());
+        if (!accepted)
           co_return ErrorInfo{
               Error::cancelled,
               "Request async body callback cancelled the transfer"};
@@ -1019,29 +1067,20 @@ read_request_body(const std::shared_ptr<Connection> &connection,
     decoder = std::move(*created);
     body_options.on_data = {};
     body_options.on_data_async = [&](std::string_view data) -> Task<bool> {
-      auto decoded = decoder->feed(data, false);
-      if (!decoded) {
-        decode_error = decoded.error();
-        co_return false;
-      }
-      auto consumed = co_await consume_decoded(*decoded);
-      if (consumed) {
-        decode_error = std::move(consumed);
-        co_return false;
-      }
-      co_return true;
+      decode_error = co_await decoder->feed(data, false, consume_decoded);
+      co_return !decode_error;
     };
     body_options.on_progress = {};
   }
   auto body = co_await read_body(connection, buffer, head, body_options, false,
                                  false);
+  if (!connection->runtime()->on_loop_thread())
+    co_await resume_on(connection->runtime());
   if (!body) co_return decode_error ? decode_error : body.error();
   state.headers = std::move(head.headers);
   if (decode) {
-    auto tail = decoder->feed({}, true);
-    if (!tail) co_return tail.error();
-    if (auto consumed = co_await consume_decoded(*tail); consumed)
-      co_return consumed;
+    if (auto error = co_await decoder->feed({}, true, consume_decoded); error)
+      co_return error;
     state.headers.erase("Content-Encoding");
     state.headers.erase("Content-Length");
     co_return decoded_body;
@@ -1050,7 +1089,7 @@ read_request_body(const std::shared_ptr<Connection> &connection,
 }
 
 Task<Result<Request>> read_request(const std::shared_ptr<Connection> &connection,
-                                   std::string &buffer,
+                                   ReadBuffer &buffer,
                                    const HttpReadOptions &options) {
   auto head = co_await read_request_head(connection, buffer, options);
   if (!head) co_return head.error();
@@ -1063,7 +1102,7 @@ Task<Result<Request>> read_request(const std::shared_ptr<Connection> &connection
 }
 
 Task<ResponseResult> read_response(
-    const std::shared_ptr<Connection> &connection, std::string &buffer,
+    const std::shared_ptr<Connection> &connection, ReadBuffer &buffer,
     std::string_view request_method, const HttpReadOptions &options) {
   for (;;) {
     auto bytes = co_await read_head_bytes(connection, buffer, options);
@@ -1122,13 +1161,16 @@ Task<ResponseResult> read_response(
     }
     HttpReadOptions body_options = options;
     const auto encoding = response.headers.get("Content-Encoding");
-    const bool decode = options.auto_decompress && !encoding.empty();
+    const bool decode = !no_body && options.auto_decompress && !encoding.empty() &&
+                        !iequals(encoding, "identity");
     std::unique_ptr<StreamingDecoder> decoder;
     std::string decoded_body;
     std::uint64_t decoded_received = 0;
     ErrorInfo decode_error;
     const auto consume_decoded = [&](std::string_view data) -> Task<ErrorInfo> {
       if (data.empty()) co_return ErrorInfo{};
+      if (options.cancelled && options.cancelled())
+        co_return ErrorInfo{Error::cancelled, "Request cancelled"};
       if (options.deadline &&
           std::chrono::steady_clock::now() >= *options.deadline)
         co_return ErrorInfo{Error::timeout, "Request deadline exceeded"};
@@ -1139,7 +1181,10 @@ Task<ResponseResult> read_response(
             co_return ErrorInfo{Error::cancelled,
                                 "HTTP body callback cancelled the transfer"};
         } else if (options.on_data_async) {
-          if (!co_await options.on_data_async(data))
+          const bool accepted = co_await options.on_data_async(data);
+          if (!connection->runtime()->on_loop_thread())
+            co_await resume_on(connection->runtime());
+          if (!accepted)
             co_return ErrorInfo{
                 Error::cancelled,
                 "HTTP async body callback cancelled the transfer"};
@@ -1170,30 +1215,21 @@ Task<ResponseResult> read_response(
       body_options.on_data = {};
       body_options.on_data_async =
           [&](std::string_view data) -> Task<bool> {
-        auto decoded = decoder->feed(data, false);
-        if (!decoded) {
-          decode_error = decoded.error();
-          co_return false;
-        }
-        auto consumed = co_await consume_decoded(*decoded);
-        if (consumed) {
-          decode_error = std::move(consumed);
-          co_return false;
-        }
-        co_return true;
+        decode_error = co_await decoder->feed(data, false, consume_decoded);
+        co_return !decode_error;
       };
       body_options.on_progress = {};
     }
     auto body = co_await read_body(connection, buffer, *head, body_options,
                                    until_eof, no_body);
+    if (!connection->runtime()->on_loop_thread())
+      co_await resume_on(connection->runtime());
     if (!body) co_return decode_error ? decode_error : body.error();
     response.body = std::move(*body);
     response.headers = std::move(head->headers);
     if (decode) {
-      auto tail = decoder->feed({}, true);
-      if (!tail) co_return tail.error();
-      if (auto consumed = co_await consume_decoded(*tail); consumed)
-        co_return consumed;
+      if (auto error = co_await decoder->feed({}, true, consume_decoded); error)
+        co_return error;
       response.body = std::move(decoded_body);
       response.headers.erase("Content-Encoding");
       if (options.on_data || options.on_data_async)
@@ -1321,8 +1357,13 @@ Task<ErrorInfo> write_request(const std::shared_ptr<Connection> &connection,
     }
     co_return co_await sink->finish();
   }
-  *output += request.body;
-  co_return co_await connection->write(std::move(*output), timeout);
+  if (request.body.size() <= 64 * 1024) {
+    *output += request.body;
+    co_return co_await connection->write(std::move(*output), timeout);
+  }
+  if (auto error = co_await connection->write(std::move(*output), timeout); error)
+    co_return error;
+  co_return co_await write_body_bytes(connection, request.body, timeout);
 }
 
 Task<ErrorInfo> write_response_head(
@@ -1370,17 +1411,36 @@ Task<ErrorInfo> write_response(const std::shared_ptr<Connection> &connection,
   auto error = co_await write_response_head(connection, request, response, false,
                                              response.body.size(), timeout);
   if (error || omit || response.body.empty()) co_return error;
-  co_return co_await connection->write(response.body, timeout);
+  co_return co_await write_body_bytes(connection, response.body, timeout);
 }
 
 Task<ErrorInfo> write_chunk(const std::shared_ptr<Connection> &connection,
                             std::string_view data,
                             std::chrono::milliseconds timeout) {
-  std::ostringstream size;
-  size << std::hex << data.size();
-  co_return co_await connection->write(size.str() + "\r\n" + std::string(data) +
-                                            "\r\n",
-                                        timeout);
+  if (data.empty()) co_return ErrorInfo{};
+  // A large producer write is legal, but must not require a second body-sized
+  // allocation just to prepend chunk framing.
+  const auto deadline = std::chrono::steady_clock::now() + std::max(timeout, 1ms);
+  while (!data.empty()) {
+    const auto remaining = std::chrono::ceil<std::chrono::milliseconds>(
+        deadline - std::chrono::steady_clock::now());
+    if (remaining <= 0ms)
+      co_return ErrorInfo{Error::timeout, "Chunk write timed out"};
+    const auto count = std::min<std::size_t>(data.size(), 64 * 1024);
+    std::array<char, 2 * sizeof(std::size_t)> size;
+    const auto converted = std::to_chars(size.data(), size.data() + size.size(),
+                                          count, 16);
+    std::string output;
+    output.reserve(count + size.size() + 4);
+    output.append(size.data(), converted.ptr);
+    output.append("\r\n");
+    output.append(data.substr(0, count));
+    output.append("\r\n");
+    if (auto error = co_await connection->write(std::move(output), remaining); error)
+      co_return error;
+    data.remove_prefix(count);
+  }
+  co_return ErrorInfo{};
 }
 
 Task<ErrorInfo> write_last_chunk(
@@ -1418,7 +1478,7 @@ Task<ErrorInfo> websocket_server_handshake(
 }
 
 std::shared_ptr<WebSocket::Channel> make_websocket_channel(
-    std::shared_ptr<Connection> connection, std::string buffered,
+    std::shared_ptr<Connection> connection, ReadBuffer buffered,
     bool client_side, std::string subprotocol,
     std::chrono::milliseconds timeout) {
   return std::make_shared<UvWebSocketChannel>(
@@ -1496,7 +1556,7 @@ Task<Result<std::shared_ptr<WebSocket>>> websocket_client_connect(
     connection->close();
     co_return written;
   }
-  std::string buffered;
+  ReadBuffer buffered;
   auto response = co_await read_response(
       connection, buffered, "GET",
       {.max_header_size = 64 * 1024,

@@ -8,9 +8,9 @@
 namespace chhttp {
 namespace {
 
-class FileReadPool {
+class FileIoPool {
 public:
-  FileReadPool() {
+  FileIoPool() {
     const auto count = std::clamp<unsigned>(std::thread::hardware_concurrency(),
                                             2, 4);
     workers_.reserve(count);
@@ -32,7 +32,7 @@ public:
     }
   }
 
-  ~FileReadPool() {
+  ~FileIoPool() {
     for (auto &worker : workers_) worker.request_stop();
     ready_.notify_all();
   }
@@ -45,8 +45,8 @@ public:
     ready_.notify_one();
   }
 
-  static FileReadPool &instance() {
-    static FileReadPool pool;
+  static FileIoPool &instance() {
+    static FileIoPool pool;
     return pool;
   }
 
@@ -57,43 +57,56 @@ private:
   std::vector<std::jthread> workers_;
 };
 
-struct FileReadResult {
-  std::string data;
-  bool failed{false};
-};
-
-struct FileReadAwaiter {
+struct FileIoAwaiter {
   struct State {
-    std::ifstream *input{nullptr};
-    std::size_t size{0};
+    uv_work_t request{};
     std::coroutine_handle<> continuation{};
-    FileReadResult result;
+    std::shared_ptr<detail::Runtime> runtime;
+    std::shared_ptr<State> self_keep;
+    std::function<void()> operation;
+    std::exception_ptr exception;
+    void execute() noexcept {
+      try {
+        operation();
+      } catch (...) {
+        exception = std::current_exception();
+      }
+    }
   };
 
   std::shared_ptr<State> state;
   bool await_ready() const noexcept { return false; }
-  void await_suspend(std::coroutine_handle<> continuation) {
+  bool await_suspend(std::coroutine_handle<> continuation) {
     state->continuation = continuation;
-    FileReadPool::instance().submit([state = state] {
-      state->result.data.resize(state->size);
-      state->input->read(state->result.data.data(),
-                         static_cast<std::streamsize>(state->size));
-      const auto count = state->input->gcount();
-      state->result.data.resize(
-          count > 0 ? static_cast<std::size_t>(count) : 0);
-      state->result.failed = state->input->bad();
-      state->continuation.resume();
-    });
+    if (state->runtime) {
+      // A uv request keeps the loop alive until its completion callback runs,
+      // including while Runtime::stop closes the general-purpose post queue.
+      state->request.data = state.get();
+      state->self_keep = state;
+      const int status = uv_queue_work(state->runtime->loop(), &state->request,
+          [](uv_work_t *request) {
+            static_cast<State *>(request->data)->execute();
+          }, [](uv_work_t *request, int) {
+            auto completed = std::move(static_cast<State *>(request->data)->self_keep);
+            completed->continuation.resume();
+          });
+      if (status != 0) {
+        state->self_keep.reset();
+        state->exception = std::make_exception_ptr(std::runtime_error(uv_strerror(status)));
+        return false;
+      }
+    } else {
+      FileIoPool::instance().submit([state = state] {
+        state->execute();
+        state->continuation.resume();
+      });
+    }
+    return true;
   }
-  FileReadResult await_resume() { return std::move(state->result); }
+  void await_resume() {
+    if (state->exception) std::rethrow_exception(state->exception);
+  }
 };
-
-FileReadAwaiter async_file_read(std::ifstream &input,
-                                std::size_t chunk_size) {
-  return FileReadAwaiter{
-      std::make_shared<FileReadAwaiter::State>(
-          FileReadAwaiter::State{.input = &input, .size = chunk_size})};
-}
 
 std::vector<std::string> split_parameters(std::string_view value) {
   std::vector<std::string> output;
@@ -286,6 +299,14 @@ std::string json_escape(std::string_view value) {
 
 } // namespace
 
+Task<void> detail::run_file_io(std::function<void()> operation) {
+  auto state = std::make_shared<FileIoAwaiter::State>();
+  state->operation = std::move(operation);
+  if (auto *runtime = current_runtime())
+    state->runtime = runtime->shared_from_this();
+  co_await FileIoAwaiter{std::move(state)};
+}
+
 Task<ErrorInfo> RequestBodyStream::consume(AsyncBodyConsumer consumer) {
   if (!source_)
     co_return ErrorInfo{Error::invalid_argument,
@@ -313,14 +334,22 @@ Task<ErrorInfo> RequestBodyStream::discard() {
 
 Task<Result<StoredBody>>
 RequestBodyStream::save_to_file(std::filesystem::path path) {
-  std::ofstream output(path, std::ios::binary | std::ios::trunc);
+  std::ofstream output;
+  co_await detail::run_file_io([&] {
+    output.open(path, std::ios::binary | std::ios::trunc);
+  });
   if (!output)
     co_return ErrorInfo{Error::write, "Unable to open request body file"};
   std::uint64_t size = 0;
   bool write_failed = false;
-  auto error = co_await consume(
+  ErrorInfo error;
+  std::exception_ptr exception;
+  try {
+    error = co_await consume(
       [&](std::string_view data) -> Task<bool> {
-        output.write(data.data(), static_cast<std::streamsize>(data.size()));
+        co_await detail::run_file_io([&] {
+          output.write(data.data(), static_cast<std::streamsize>(data.size()));
+        });
         if (!output) {
           write_failed = true;
           co_return false;
@@ -328,8 +357,14 @@ RequestBodyStream::save_to_file(std::filesystem::path path) {
         size += data.size();
         co_return true;
       });
-  output.flush();
-  if (!output) write_failed = true;
+  } catch (...) {
+    exception = std::current_exception();
+  }
+  co_await detail::run_file_io([&] {
+    output.close(); // close flushes and reports errors, too.
+    if (!output) write_failed = true;
+  });
+  if (exception) std::rethrow_exception(exception);
   if (write_failed)
     co_return ErrorInfo{Error::write, "Unable to write request body file"};
   if (error) co_return error;
@@ -339,24 +374,39 @@ RequestBodyStream::save_to_file(std::filesystem::path path) {
 Task<Result<StoredBody>>
 RequestBodyStream::save_to_temp(std::filesystem::path directory) {
   std::error_code filesystem_error;
-  if (directory.empty())
-    directory = std::filesystem::temp_directory_path(filesystem_error);
+  if (directory.empty()) {
+    co_await detail::run_file_io([&] {
+      directory = std::filesystem::temp_directory_path(filesystem_error);
+    });
+  }
   if (filesystem_error)
     co_return ErrorInfo{Error::write,
                         "Unable to locate the temporary directory"};
   std::filesystem::path owner;
-  for (unsigned attempt = 0; attempt != 100; ++attempt) {
-    owner = directory / ("chhttp-upload-" + detail::random_boundary());
-    filesystem_error.clear();
-    if (std::filesystem::create_directory(owner, filesystem_error)) break;
-    owner.clear();
-  }
+  co_await detail::run_file_io([&] {
+    for (unsigned attempt = 0; attempt != 100; ++attempt) {
+      owner = directory / ("chhttp-upload-" + detail::random_boundary());
+      filesystem_error.clear();
+      if (std::filesystem::create_directory(owner, filesystem_error)) break;
+      owner.clear();
+      if (filesystem_error) break;
+    }
+  });
   if (owner.empty())
     co_return ErrorInfo{Error::write,
                         "Unable to create a temporary upload directory"};
-  auto stored = co_await save_to_file(owner / "body.bin");
-  if (!stored) {
-    std::filesystem::remove_all(owner, filesystem_error);
+  Result<StoredBody> stored{ErrorInfo{Error::write, "Temporary upload did not complete"}};
+  std::exception_ptr exception;
+  try {
+    stored = co_await save_to_file(owner / "body.bin");
+  } catch (...) {
+    exception = std::current_exception();
+  }
+  if (!stored || exception) {
+    co_await detail::run_file_io([&] {
+      std::filesystem::remove_all(owner, filesystem_error);
+    });
+    if (exception) std::rethrow_exception(exception);
     co_return stored.error();
   }
   co_return stored;
@@ -401,56 +451,76 @@ public:
 
   Result<std::vector<MultipartEvent>> feed(std::string_view input) {
     if (error) return error;
-    if (state == State::complete) return std::vector<MultipartEvent>{};
-    buffer.append(input);
     std::vector<MultipartEvent> events;
+    // Bound parser storage independently of the caller's input size. Events
+    // own their payload; only incomplete headers/boundaries remain buffered.
+    while (!input.empty() && state != State::complete) {
+      const auto count = std::min<std::size_t>(input.size(), 64 * 1024);
+      buffer.append_view(input.substr(0, count));
+      input.remove_prefix(count);
+      if (auto failed = parse_available(events)) return failed;
+    }
+    return events;
+  }
+
+  ErrorInfo parse_available(std::vector<MultipartEvent> &events) {
     for (;;) {
       const auto previous_size = buffer.size();
       const auto previous_state = state;
       if (state == State::first_boundary) {
-        auto position = buffer.find(first_marker);
+        auto position = buffer.find(first_marker, search_from);
         while (position != std::string::npos && position != 0 &&
-               (position < 2 || buffer.substr(position - 2, 2) != "\r\n"))
+               (position < 2 || buffer.view().substr(position - 2, 2) != "\r\n"))
           position = buffer.find(first_marker, position + 1);
         if (position == std::string::npos) {
           const auto keep = first_marker.size() + 2;
-          if (buffer.size() > options.max_header_size + keep)
+          if (buffer.size() > options.max_header_size &&
+              buffer.size() - options.max_header_size > keep)
             return fail("Multipart preamble exceeds configured limit");
+          search_from = buffer.size() >= first_marker.size()
+                            ? buffer.size() - first_marker.size() + 1 : 0;
           break;
         }
+        if (position > options.max_header_size)
+          return fail("Multipart preamble exceeds configured limit");
         const auto suffix = position + first_marker.size();
         if (buffer.size() < suffix + 2) {
-          if (position > 0) buffer.erase(0, position);
+          search_from = position;
           break;
         }
-        const auto ending = std::string_view(buffer).substr(suffix, 2);
+        const auto ending = buffer.view().substr(suffix, 2);
         if (ending != "\r\n" && ending != "--") {
-          buffer.erase(0, position + 1);
+          // Keep the original preamble origin for both line-start validation
+          // and its cumulative size limit, even across false candidates.
+          search_from = position + 1;
           continue;
         }
-        buffer.erase(0, suffix);
+        buffer.consume(suffix);
+        search_from = 0;
         state = State::boundary_suffix;
       } else if (state == State::boundary_suffix) {
         if (buffer.size() < 2) break;
-        if (buffer.starts_with("--")) {
-          buffer.erase(0, 2);
+        if (buffer.view().starts_with("--")) {
+          buffer.consume(2);
           state = State::complete;
-        } else if (buffer.starts_with("\r\n")) {
-          buffer.erase(0, 2);
+        } else if (buffer.view().starts_with("\r\n")) {
+          buffer.consume(2);
           state = State::headers;
         } else {
           return fail("Malformed multipart delimiter suffix");
         }
       } else if (state == State::headers) {
-        const auto end = buffer.find("\r\n\r\n");
+        const auto end = buffer.find("\r\n\r\n", search_from);
         if (end == std::string::npos) {
-          if (buffer.size() > options.max_header_size)
+          if (buffer.size() > options.max_header_size &&
+              buffer.size() - options.max_header_size > 3)
             return fail("Multipart part headers exceed configured limit");
+          search_from = buffer.size() > 3 ? buffer.size() - 3 : 0;
           break;
         }
         if (end > options.max_header_size)
           return fail("Multipart part headers exceed configured limit");
-        auto parsed = parse_part_head(std::string_view(buffer).substr(0, end));
+        auto parsed = parse_part_head(buffer.view().substr(0, end));
         if (!parsed) return fail(parsed.error().message);
         if (part_count >= options.max_parts)
           return fail("Too many multipart parts");
@@ -459,7 +529,8 @@ public:
         events.push_back({MultipartEventType::part_begin, part_count,
                           current, {}});
         ++part_count;
-        buffer.erase(0, end + 4);
+        buffer.consume(end + 4);
+        search_from = 0;
         state = State::body;
       } else if (state == State::body) {
         auto position = buffer.find(delimiter);
@@ -467,26 +538,26 @@ public:
           const auto suffix = position + delimiter.size();
           if (buffer.size() < suffix + 2) {
             if (!emit_data(events, position)) return error;
-            buffer.erase(0, position);
+            buffer.consume(position);
             break;
           }
-          const auto ending = std::string_view(buffer).substr(suffix, 2);
+          const auto ending = buffer.view().substr(suffix, 2);
           if (ending != "\r\n" && ending != "--") {
             if (!emit_data(events, position + 2)) return error;
-            buffer.erase(0, position + 2);
+            buffer.consume(position + 2);
             continue;
           }
           if (!emit_data(events, position)) return error;
           events.push_back({MultipartEventType::part_end, part_count - 1,
                             current, {}});
-          buffer.erase(0, suffix);
+          buffer.consume(suffix);
           state = State::boundary_suffix;
         } else {
           const auto keep = delimiter.size() + 1;
           if (buffer.size() <= keep) break;
           const auto count = buffer.size() - keep;
           if (!emit_data(events, count)) return error;
-          buffer.erase(0, count);
+          buffer.consume(count);
         }
       } else {
         buffer.clear();
@@ -494,7 +565,7 @@ public:
       }
       if (previous_size == buffer.size() && previous_state == state) break;
     }
-    return events;
+    return {};
   }
 
   Result<std::vector<MultipartEvent>> finish() {
@@ -505,8 +576,9 @@ public:
     return events;
   }
 
-  Result<std::vector<MultipartEvent>> fail(std::string message) {
+  ErrorInfo fail(std::string message) {
     error = ErrorInfo{Error::multipart, std::move(message)};
+    buffer.clear();
     return error;
   }
 
@@ -537,7 +609,8 @@ public:
   std::string boundary;
   std::string first_marker;
   std::string delimiter;
-  std::string buffer;
+  detail::ReadBuffer buffer;
+  std::size_t search_from{0};
   MultipartPart current;
   std::size_t part_count{0};
   std::uint64_t current_size{0};
@@ -653,15 +726,30 @@ MultipartWriter &MultipartWriter::add_file(std::string name,
   if (filename.empty()) filename = path.filename().string();
   return add_stream(
       std::move(name), std::move(filename), std::move(content_type),
-      [path = std::move(path)](StreamWriter &writer) -> Task<void> {
-        std::ifstream input(path, std::ios::binary);
-        if (!input) co_return;
-        for (;;) {
-          auto chunk = co_await async_file_read(input, 64 * 1024);
-          if (chunk.failed) co_return;
-          if (chunk.data.empty()) break;
-          if (!co_await writer.write(chunk.data)) co_return;
+      [path = std::move(path), size](StreamWriter &writer) -> Task<void> {
+        std::ifstream input;
+        co_await detail::run_file_io([&] { input.open(path, std::ios::binary); });
+        if (!input) throw std::runtime_error("Unable to open multipart file");
+        std::string chunk;
+        std::uint64_t remaining = size;
+        std::exception_ptr exception;
+        try {
+          while (remaining != 0 && writer.open()) {
+            co_await detail::run_file_io([&] {
+              chunk.resize(static_cast<std::size_t>(
+                  std::min<std::uint64_t>(remaining, 64 * 1024)));
+              input.read(chunk.data(), static_cast<std::streamsize>(chunk.size()));
+              if (input.bad() || input.gcount() != static_cast<std::streamsize>(chunk.size()))
+                throw std::runtime_error("Multipart file read was truncated");
+            });
+            remaining -= chunk.size();
+            if (!co_await writer.write(chunk)) break;
+          }
+        } catch (...) {
+          exception = std::current_exception();
         }
+        co_await detail::run_file_io([&] { input.close(); });
+        if (exception) std::rethrow_exception(exception);
       },
       size);
 }

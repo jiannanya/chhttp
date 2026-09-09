@@ -1,4 +1,5 @@
 #include <chhttp/chhttp.hpp>
+#include "../src/detail.hpp"
 
 #ifdef _WIN32
 #include <process.h>
@@ -24,6 +25,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <charconv>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -67,6 +69,16 @@ constexpr raw_socket_t invalid_raw_socket = -1;
 void close_raw_socket(raw_socket_t socket) { close(socket); }
 #endif
 
+void initialize_raw_sockets() {
+#ifdef _WIN32
+  static const bool winsock_ready = [] {
+    WSADATA data{};
+    return WSAStartup(MAKEWORD(2, 2), &data) == 0;
+  }();
+  if (!winsock_ready) throw std::runtime_error("WSAStartup failed");
+#endif
+}
+
 std::string masked_websocket_frame(unsigned char first_byte,
                                    std::string payload) {
   if (payload.size() > 125)
@@ -83,13 +95,7 @@ std::string masked_websocket_frame(unsigned char first_byte,
 
 std::string raw_http_exchange(std::uint16_t port, std::string_view request,
                               std::size_t send_chunk_size = 0) {
-#ifdef _WIN32
-  static const bool winsock_ready = [] {
-    WSADATA data{};
-    return WSAStartup(MAKEWORD(2, 2), &data) == 0;
-  }();
-  if (!winsock_ready) throw std::runtime_error("WSAStartup failed");
-#endif
+  initialize_raw_sockets();
   raw_socket_t socket = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
   if (socket == invalid_raw_socket)
     throw std::runtime_error("Unable to allocate raw test socket");
@@ -135,6 +141,7 @@ std::string raw_http_exchange(std::uint16_t port, std::string_view request,
 class RawResponseServer {
 public:
   explicit RawResponseServer(std::string response, bool bytewise = false) {
+    initialize_raw_sockets();
     listener_ = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (listener_ == invalid_raw_socket)
       throw std::runtime_error("Unable to allocate raw response socket");
@@ -1806,7 +1813,7 @@ TEST(compression_negotiation_honors_quality_and_request_errors) {
 #endif
 }
 
-// Verifies directory indexes, unknown MIME fallback, and ranged HEAD metadata without body bytes.
+// RFC 9110 section 14.2 requires Range to be ignored on HEAD; retain the full representation length.
 TEST(static_index_unknown_mime_head_and_range_boundaries) {
   std::ofstream(fixture().root / "index.html", std::ios::binary) << "index";
   std::ofstream(fixture().root / "blob.agentdata", std::ios::binary) << "blob";
@@ -1818,9 +1825,9 @@ TEST(static_index_unknown_mime_head_and_range_boundaries) {
   CHECK(unknown && unknown->body == "blob" &&
         unknown->headers.get("Content-Type") == "application/octet-stream");
   auto head = client.head("/static/asset.txt", {{"Range", "bytes=2-4"}});
-  CHECK(head && head->status == 206 && head->body.empty());
-  CHECK(head->headers.get("Content-Length") == "3");
-  CHECK(head->headers.get("Content-Range") == "bytes 2-4/10");
+  CHECK(head && head->status == 200 && head->body.empty());
+  CHECK(head->headers.get("Content-Length") == "10");
+  CHECK(!head->headers.contains("Content-Range"));
 }
 
 // Verifies SSE rejection of incorrect Content-Type and non-success endpoint status.
@@ -3014,21 +3021,34 @@ TEST(stop_token_cancels_exactly_one_active_request) {
 // Verifies an awaited data consumer preserves order and applies coroutine backpressure.
 TEST(async_data_callbacks_apply_backpressure_without_blocking_contracts) {
   chhttp::Client client(fixture().base_url);
-  std::string assembled;
-  std::size_t calls = 0;
-  const auto started = std::chrono::steady_clock::now();
+  struct ConsumerState {
+    std::mutex mutex;
+    std::string assembled;
+    std::size_t calls = 0;
+    std::size_t completed = 0;
+  };
+  auto state = std::make_shared<ConsumerState>();
   auto response = client.get(
       "/stream", {},
-      {.on_data_async = [&](std::string_view bytes) -> chhttp::Task<bool> {
-         assembled.append(bytes);
-         ++calls;
+      {.on_data_async = [state](std::string_view bytes) -> chhttp::Task<bool> {
+         {
+           std::lock_guard lock(state->mutex);
+           // The next chunk must wait until the previous consumer completes.
+           CHECK(state->calls == state->completed);
+           state->assembled.append(bytes);
+           ++state->calls;
+         }
          co_await chhttp::sleep_for(std::chrono::milliseconds(8));
+         {
+           std::lock_guard lock(state->mutex);
+           ++state->completed;
+         }
          co_return true;
        }});
-  const auto elapsed = std::chrono::steady_clock::now() - started;
   CHECK(response && response->body.empty());
-  CHECK(assembled == "onetwo" && calls == 2);
-  CHECK(elapsed >= std::chrono::milliseconds(16));
+  std::lock_guard lock(state->mutex);
+  CHECK(state->assembled == "onetwo" && state->calls == 2);
+  CHECK(state->completed == state->calls);
 }
 
 // Verifies network-idle time excludes time intentionally spent awaiting consumer backpressure.
@@ -4434,6 +4454,850 @@ TEST(mtls_requires_client_certificate) {
 }
 #endif
 
+TEST(sse_default_message_and_all_split_boundaries) {
+  const std::string wire = "\xEF\xBB\xBFid: 8\r\ndata: one\rdata: two\n\n";
+  for (std::size_t split = 0; split <= wire.size(); ++split) {
+    chhttp::SseParser parser;
+    std::vector<chhttp::SseEvent> events;
+    parser.on_event("message", [&](const auto &event) { events.push_back(event); });
+    CHECK(!parser.feed(std::string_view(wire).substr(0, split)));
+    CHECK(!parser.feed({}));
+    CHECK(!parser.feed(std::string_view(wire).substr(split)));
+    CHECK(!parser.finish());
+    CHECK(events.size() == 1);
+    CHECK(events[0].event == "message" && events[0].id == "8");
+    CHECK(events[0].data == "one\ntwo");
+  }
+}
+
+TEST(sse_replaced_fields_and_aggregate_limits) {
+  chhttp::SseParser parser({.max_line_size = 100, .max_event_size = 6});
+  std::size_t events = 0;
+  parser.on_message([&](const auto &) { ++events; });
+  CHECK(!parser.feed("event: abcdef\nevent: a\ndata: 12\n\n"));
+  CHECK(events == 1);
+  for (const auto *wire : {"data: 12\nid: 1234\n\n", "id: 1234\ndata: 12\n\n"}) {
+    parser.reset();
+    CHECK(parser.feed(wire).code == chhttp::Error::body_too_large);
+    CHECK(parser.feed("\n").code == chhttp::Error::body_too_large);
+  }
+  parser.reset();
+  CHECK(!parser.feed("id: 123456\nid: 1\ndata: 12\n\n"));
+  CHECK(events == 2);
+}
+
+TEST(sse_exact_line_limit_with_split_crlf_and_reused_events) {
+  chhttp::SseParser parser({.max_line_size = 6, .max_event_size = 16});
+  std::vector<std::string> events;
+  parser.on_message([&](const auto &event) { events.push_back(event.data); });
+  for (int i = 0; i < 100; ++i) {
+    CHECK(!parser.feed("data:a\r"));
+    CHECK(!parser.feed("\n\r"));
+    CHECK(!parser.feed("\n"));
+  }
+  CHECK(events == std::vector<std::string>(100, "a"));
+  CHECK(parser.feed("data:ab").code == chhttp::Error::body_too_large);
+}
+
+TEST(header_tokens_use_ascii_and_preserve_duplicate_values) {
+  chhttp::Headers headers{{"CONNECTION", "upgrade,\tKeep-Alive  "},
+                          {"connection", "close"}};
+  CHECK(chhttp::detail::has_token(headers, "Connection", "keep-alive"));
+  CHECK(chhttp::detail::has_token(headers, "Connection", "CLOSE"));
+  CHECK(!chhttp::detail::has_token(headers, "Connection", "keep"));
+  CHECK(!chhttp::detail::has_token(headers, "Connection", ""));
+  CHECK(headers.get_all("connection").size() == 2);
+  for (unsigned i = 0; i < 256; ++i) {
+    const char input = static_cast<char>(i);
+    const char expected = static_cast<char>(i >= 'A' && i <= 'Z' ? i + 32 : i);
+    CHECK(chhttp::detail::lower(std::string_view(&input, 1)) == std::string(1, expected));
+  }
+}
+
+TEST(literal_routes_keep_special_characters_and_registration_order) {
+  chhttp::Server server;
+  server.get("/literal.+(x)[y]$", [](const auto &, auto &response) {
+    response.body = "literal";
+  });
+  server.get("/items/{id}", [](const auto &request, auto &response) {
+    response.body = request.path_params.at("id");
+  });
+  server.get("/items/fixed", [](const auto &, auto &response) {
+    response.body = "later";
+  });
+  CHECK(server.start("127.0.0.1", 0));
+  chhttp::Client client("http://127.0.0.1:" + std::to_string(server.port()));
+  auto literal = client.get("/literal.+(x)[y]$");
+  CHECK(literal && literal->body == "literal");
+  auto ordered = client.get("/items/fixed");
+  CHECK(ordered && ordered->body == "fixed");
+  auto missing = client.get("/literalZxxxxy");
+  CHECK(missing && missing->status == 404);
+}
+
+TEST(tiny_chunks_trailers_and_pipeline_preserve_unread_bytes) {
+  chhttp::Server server;
+  server.post("/", [](const auto &request, auto &response) {
+    response.body = std::to_string(request.body.size()) + ":" +
+                    request.get_header("X-Trailer");
+  });
+  server.get("/next", [](const auto &, auto &response) { response.body = "next-response"; });
+  CHECK(server.start("127.0.0.1", 0));
+  std::string wire = "POST / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n";
+  for (int i = 0; i < 10000; ++i) wire += "1\r\nx\r\n";
+  wire += "0\r\nX-Trailer: done\r\n\r\nGET /next HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+  const auto response = raw_http_exchange(server.port(), wire, 137);
+  CHECK(response.find("10000:done") != std::string::npos);
+  CHECK(response.ends_with("next-response"));
+  CHECK(response.find("HTTP/1.1 200", response.find("HTTP/1.1 200") + 1) != std::string::npos);
+}
+
+TEST(bodyless_responses_preserve_representation_encoding) {
+  for (int status : {204, 205, 304}) {
+    auto response = fetch_raw_response("HTTP/1.1 " + std::to_string(status) +
+        " Test\r\nContent-Encoding: gzip\r\nConnection: close\r\n\r\n");
+    CHECK(response && response->status == status && response->body.empty());
+    CHECK(response->headers.get("Content-Encoding") == "gzip");
+  }
+  RawResponseServer server("HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\n"
+                            "Content-Length: 1000\r\nConnection: close\r\n\r\n", true);
+  chhttp::Client client("http://127.0.0.1:" + std::to_string(server.port()));
+  auto response = client.head("/");
+  CHECK(response && response->body.empty());
+  CHECK(response->headers.get("Content-Length") == "1000");
+  CHECK(response->headers.get("Content-Encoding") == "gzip");
+}
+
+TEST(informational_and_identity_responses_skip_decompression) {
+  auto response = fetch_raw_response(
+      "HTTP/1.1 103 Early Hints\r\nContent-Encoding: gzip\r\n\r\n"
+      "HTTP/1.1 200 OK\r\nContent-Encoding: identity\r\nContent-Length: 2\r\n\r\nok", true);
+  CHECK(response && response->body == "ok");
+}
+
+TEST(cross_origin_redirect_drops_default_and_explicit_credentials) {
+  chhttp::Server target;
+  target.get("/target", [](const auto &request, auto &response) {
+    response.body = request.get_header("Authorization") + "|" +
+                    request.get_header("Cookie") + "|" + request.get_header("X-Public");
+  });
+  CHECK(target.start("127.0.0.1", 0));
+  chhttp::Server origin;
+  origin.get("/", [&](const auto &, auto &response) {
+    response.set_redirect("http://127.0.0.1:" + std::to_string(target.port()) + "/target");
+  });
+  CHECK(origin.start("127.0.0.1", 0));
+  chhttp::ClientOptions options;
+  options.default_headers = {{"aUtHoRiZaTiOn", "Bearer private"},
+                             {"cOoKiE", "session=private"}, {"X-Public", "public"}};
+  chhttp::Client client("http://127.0.0.1:" + std::to_string(origin.port()), options);
+  auto response = client.get("/");
+  CHECK(response && response->body == "||public");
+  response = client.get("/", {{"Authorization", "Basic secret"}, {"Cookie", "another=secret"}});
+  CHECK(response && response->body == "||public");
+}
+
+TEST(redirect_303_preserves_head_method) {
+  chhttp::Server server;
+  server.get("/", [](const auto &, auto &response) { response.set_redirect("/target", 303); });
+  server.get("/target", [](const auto &request, auto &response) {
+    response.headers.set("X-Method", request.method);
+    response.body = "representation";
+  });
+  CHECK(server.start("127.0.0.1", 0));
+  chhttp::Client client("http://127.0.0.1:" + std::to_string(server.port()));
+  auto response = client.head("/");
+  CHECK(response && response->body.empty());
+  CHECK(response->headers.get("X-Method") == "HEAD");
+}
+
+#ifdef CHHTTP_HAS_COMPRESSION
+TEST(compressed_decoders_bound_callbacks_and_await_consumers) {
+  const std::string plain(2 * 1024 * 1024, 'z');
+  for (const auto *encoding : {"gzip", "deflate", "br", "zstd"}) {
+    auto encoded = chhttp::detail::compress(plain, encoding);
+    CHECK(encoded);
+    RawResponseServer server("HTTP/1.1 200 OK\r\nContent-Encoding: " + std::string(encoding) +
+        "\r\nContent-Length: " + std::to_string(encoded->size()) + "\r\n\r\n" + *encoded);
+    chhttp::Client client("http://127.0.0.1:" + std::to_string(server.port()));
+    std::size_t received = 0;
+    auto response = client.get("/", {}, {.on_data_async = [&](std::string_view data) -> chhttp::Task<bool> {
+      CHECK(data.size() <= 32 * 1024);
+      if (received == 0) co_await chhttp::sleep_for(std::chrono::milliseconds(2));
+      CHECK(data.find_first_not_of('z') == std::string_view::npos);
+      received += data.size();
+      co_return true;
+    }});
+    CHECK(response && response->body.empty() && received == plain.size());
+  }
+}
+
+TEST(compressed_decoders_reject_truncation_and_limit_expansion) {
+  for (const auto *encoding : {"gzip", "deflate", "br", "zstd"}) {
+    auto encoded = chhttp::detail::compress(std::string(1024 * 1024, 'z'), encoding);
+    CHECK(encoded);
+    const auto wire = [&](std::string_view body) {
+      return "HTTP/1.1 200 OK\r\nContent-Encoding: " + std::string(encoding) +
+          "\r\nContent-Length: " + std::to_string(body.size()) + "\r\n\r\n" + std::string(body);
+    };
+    chhttp::ClientOptions options;
+    options.max_response_body_size = 100 * 1024;
+    auto limited = fetch_raw_response(wire(*encoded), false, options);
+    CHECK(!limited && limited.error().code == chhttp::Error::body_too_large);
+    encoded->pop_back();
+    auto truncated = fetch_raw_response(wire(*encoded));
+    CHECK(!truncated && truncated.error().code == chhttp::Error::compression);
+  }
+}
+
+TEST(concatenated_gzip_members_and_zstd_frames_decode_completely) {
+  for (const auto *encoding : {"gzip", "zstd"}) {
+    auto first = chhttp::detail::compress(std::string(65536, 'a'), encoding);
+    auto second = chhttp::detail::compress(std::string(65536, 'b'), encoding);
+    CHECK(first && second);
+    const auto wire = "HTTP/1.1 200 OK\r\nContent-Encoding: " + std::string(encoding) +
+        "\r\nContent-Length: " + std::to_string(first->size() + second->size()) +
+        "\r\n\r\n" + *first + *second;
+    for (bool bytewise : {false, true}) {
+      auto response = fetch_raw_response(wire, bytewise);
+      CHECK(response && response->body == std::string(65536, 'a') + std::string(65536, 'b'));
+    }
+  }
+}
+
+TEST(compressed_stream_cancellation_stops_before_full_expansion) {
+  auto encoded = chhttp::detail::compress(std::string(4 * 1024 * 1024, 'z'), "gzip");
+  CHECK(encoded);
+  RawResponseServer server("HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: " +
+      std::to_string(encoded->size()) + "\r\n\r\n" + *encoded);
+  chhttp::Client client("http://127.0.0.1:" + std::to_string(server.port()));
+  std::size_t received = 0;
+  auto response = client.get("/", {}, {.on_data = [&](std::string_view data) {
+    received += data.size();
+    return false;
+  }});
+  CHECK(!response && response.error().code == chhttp::Error::cancelled);
+  CHECK(received > 0 && received <= 32 * 1024);
+}
+
+TEST(compressed_request_streams_have_bounded_expansion) {
+  chhttp::Server server;
+  server.post_stream("/", [](auto &, chhttp::RequestBodyStream &body, auto &response) -> chhttp::Task<void> {
+    std::size_t received = 0;
+    auto error = co_await body.consume([&](std::string_view data) -> chhttp::Task<bool> {
+      CHECK(data.size() <= 32 * 1024);
+      CHECK(data.find_first_not_of('z') == std::string_view::npos);
+      received += data.size();
+      co_return true;
+    });
+    CHECK(!error);
+    response.body = std::to_string(received);
+  });
+  CHECK(server.start("127.0.0.1", 0));
+  chhttp::Client client("http://127.0.0.1:" + std::to_string(server.port()));
+  for (const auto *encoding : {"gzip", "deflate", "br", "zstd"}) {
+    auto encoded = chhttp::detail::compress(std::string(1024 * 1024, 'z'), encoding);
+    CHECK(encoded);
+    auto response = client.post("/", *encoded, "application/octet-stream", {{"Content-Encoding", encoding}});
+    CHECK(response && response->body == "1048576");
+  }
+}
+
+TEST(automatic_compression_preserves_vary_fields) {
+  chhttp::Server server;
+  server.get("/", [](const auto &, auto &response) {
+    response.body.assign(10000, 'a');
+    response.headers.set("Vary", "Origin");
+  });
+  CHECK(server.start("127.0.0.1", 0));
+  chhttp::Client client("http://127.0.0.1:" + std::to_string(server.port()));
+  auto response = client.get("/");
+  CHECK(response && response->body == std::string(10000, 'a'));
+  CHECK(chhttp::detail::has_token(response->headers, "Vary", "Origin"));
+  CHECK(chhttp::detail::has_token(response->headers, "Vary", "Accept-Encoding"));
+}
+#endif
+
+TEST(pool_waiters_wake_on_release_cancel_and_zero_idle_capacity) {
+  chhttp::Server server;
+  server.get_async("/", [](const auto &, auto &response) -> chhttp::Task<void> {
+    co_await chhttp::sleep_for(std::chrono::milliseconds(3));
+    response.body = "ok";
+  });
+  CHECK(server.start("127.0.0.1", 0));
+  for (const std::size_t idle : {std::size_t{0}, std::size_t{1}}) {
+    chhttp::ClientOptions options;
+    options.max_connections_per_origin = 1;
+    options.connection_pool_size = idle;
+    chhttp::AsyncClient client("http://127.0.0.1:" + std::to_string(server.port()), options);
+    auto first = client.get("/");
+    std::stop_source stop;
+    auto cancelled = client.get("/", {}, {.stop_token = stop.get_token()});
+    auto last = client.get("/");
+    stop.request_stop();
+    CHECK(first.get());
+    auto rejected = cancelled.get();
+    CHECK(!rejected && rejected.error().code == chhttp::Error::cancelled);
+    auto response = last.get();
+    CHECK(response && response->body == "ok");
+  }
+}
+
+TEST(pool_legacy_cancel_and_connection_failure_release_waiters) {
+  chhttp::Server server;
+  server.get_async("/", [](const auto &, auto &response) -> chhttp::Task<void> {
+    co_await chhttp::sleep_for(std::chrono::milliseconds(15));
+    response.body = "ok";
+  });
+  CHECK(server.start("127.0.0.1", 0));
+  chhttp::ClientOptions options;
+  options.max_connections_per_origin = 1;
+  chhttp::AsyncClient client("http://127.0.0.1:" + std::to_string(server.port()), options);
+  auto active = client.get("/");
+  auto flag = std::make_shared<std::atomic_bool>(false);
+  auto queued = client.get("/", {}, {.cancellation = flag});
+  *flag = true;
+  auto rejected = queued.get();
+  CHECK(!rejected && rejected.error().code == chhttp::Error::cancelled);
+  CHECK(active.get());
+  const auto port = server.port();
+  server.stop();
+  chhttp::AsyncClient unavailable("http://127.0.0.1:" + std::to_string(port), options);
+  std::vector<chhttp::Task<chhttp::ResponseResult>> requests;
+  for (int i = 0; i < 8; ++i)
+    requests.push_back(unavailable.get("/", {}, {.total_timeout = std::chrono::seconds(2)}));
+  for (auto &request : requests) {
+    auto result = request.get();
+    CHECK(!result && result.error().code == chhttp::Error::connect);
+  }
+}
+
+TEST(stress_pool_queue_cancellation_and_recovery) {
+  chhttp::Server server;
+  server.get_async("/", [](const auto &, auto &response) -> chhttp::Task<void> {
+    co_await chhttp::sleep_for(std::chrono::milliseconds(1));
+    response.body = "ok";
+  });
+  CHECK(server.start("127.0.0.1", 0));
+  chhttp::ClientOptions options;
+  options.max_connections_per_origin = 2;
+  chhttp::AsyncClient client("http://127.0.0.1:" + std::to_string(server.port()), options);
+  std::vector<std::stop_source> stops(200);
+  std::vector<chhttp::Task<chhttp::ResponseResult>> requests;
+  for (auto &stop : stops) requests.push_back(client.get("/", {}, {.stop_token = stop.get_token()}));
+  for (std::size_t i = 0; i < stops.size(); i += 2) stops[i].request_stop();
+  for (std::size_t i = 0; i < requests.size(); ++i) {
+    auto response = requests[i].get();
+    if (i % 2 == 0) CHECK(response || response.error().code == chhttp::Error::cancelled);
+    else CHECK(response && response->body == "ok");
+  }
+  CHECK(client.get("/").get());
+}
+
+TEST(async_consumers_resume_protocol_and_pool_on_the_io_loop) {
+  struct SwitchThread {
+    std::jthread &worker;
+    bool await_ready() const noexcept { return false; }
+    void await_suspend(std::coroutine_handle<> continuation) {
+      auto *destination = &worker;
+      *destination = std::jthread([continuation] { continuation.resume(); });
+    }
+    void await_resume() const noexcept {}
+  };
+  chhttp::ServerOptions server_options;
+  server_options.auto_compress_response = false;
+  chhttp::Server server(server_options);
+  server.get_async("/", [](const auto &, auto &response) -> chhttp::Task<void> {
+    response.body.assign(128 * 1024, 'a');
+    co_return;
+  });
+  CHECK(server.start("127.0.0.1", 0));
+  chhttp::ClientOptions options;
+  options.max_connections_per_origin = 1;
+  chhttp::AsyncClient client("http://127.0.0.1:" + std::to_string(server.port()), options);
+  for (bool reject : {false, true}) {
+    std::jthread worker;
+    std::thread::id loop_thread;
+    bool switched = false;
+    auto first = client.get("/", {}, {
+        .on_data_async = [&](std::string_view data) -> chhttp::Task<bool> {
+          if (!switched) {
+            switched = true;
+            loop_thread = std::this_thread::get_id();
+            co_await SwitchThread{worker};
+            CHECK(std::this_thread::get_id() != loop_thread);
+          } else {
+            CHECK(std::this_thread::get_id() == loop_thread);
+          }
+          CHECK(data.find_first_not_of('a') == std::string_view::npos);
+          co_return !reject;
+        },
+        .on_progress = [&](auto, auto) {
+          CHECK(std::this_thread::get_id() == loop_thread);
+          return true;
+        }});
+    auto queued = client.get("/");
+    auto response = first.get();
+    if (reject) CHECK(!response && response.error().code == chhttp::Error::cancelled);
+    else CHECK(response && response->body.empty());
+    auto next = queued.get();
+    CHECK(next && next->body == std::string(128 * 1024, 'a'));
+  }
+}
+
+TEST(large_websocket_frames_preserve_masking_and_connection_reuse) {
+  chhttp::Server server;
+  server.websocket("/", [](const auto &, chhttp::WebSocket &socket) -> chhttp::Task<void> {
+    while (auto message = co_await socket.read()) {
+      if (!co_await socket.send_binary(std::as_bytes(std::span(message->data)))) break;
+    }
+  });
+  CHECK(server.start("127.0.0.1", 0));
+  auto connected = chhttp::AsyncWebSocketClient::connect(
+      "ws://127.0.0.1:" + std::to_string(server.port()) + "/").get();
+  CHECK(connected);
+  std::string binary(1024 * 1024, '\0');
+  for (std::size_t i = 0; i < binary.size(); ++i) binary[i] = static_cast<char>(i % 256);
+  CHECK((*connected)->send_binary(std::as_bytes(std::span(binary))).get());
+  auto echoed = (*connected)->read().get();
+  CHECK(echoed && echoed->data == binary);
+  CHECK((*connected)->send_text("after-large-frame").get());
+  echoed = (*connected)->read().get();
+  CHECK(echoed && echoed->data == "after-large-frame");
+  (*connected)->close().get();
+}
+
+#ifdef CHHTTP_HAS_TLS
+TEST(large_tls_buffered_and_streamed_bodies_preserve_integrity) {
+  auto certificate = make_certificate();
+  chhttp::ServerOptions server_options;
+  server_options.auto_compress_response = false;
+  server_options.tls = chhttp::TlsServerOptions{
+      .certificate_file = certificate.certificate, .private_key_file = certificate.key};
+  chhttp::Server server(server_options);
+  server.post("/", [](const auto &request, auto &response) { response.body = request.body; });
+  CHECK(server.start("127.0.0.1", 0));
+  chhttp::ClientOptions options;
+  options.tls.ca_file = certificate.certificate;
+  chhttp::Client client("https://localhost:" + std::to_string(server.port()), options);
+  std::string payload(2 * 1024 * 1024, '\0');
+  for (std::size_t i = 0; i < payload.size(); ++i) payload[i] = static_cast<char>(i % 251);
+  auto buffered = client.post("/", payload, "application/octet-stream");
+  CHECK(buffered && buffered->body == payload);
+  chhttp::Request request;
+  request.method = "POST";
+  request.target = "/";
+  request.set_stream_body([&](chhttp::StreamWriter &writer) -> chhttp::Task<void> {
+    CHECK(co_await writer.write(payload));
+  });
+  auto streamed = client.request(std::move(request));
+  CHECK(streamed && streamed->body == payload);
+}
+#endif
+
+TEST(multipart_boundaries_preserve_payload_at_every_split_position) {
+  const std::string payload = "left\r\n--bX\r\n--b-?\r\nright";
+  const std::string wire = "junk\r\n--bX--b\r\nignored\r\n--b\r\n"
+      "Content-Disposition: form-data; name=\"x\"\r\n\r\n" + payload + "\r\n--b--\r\nepilogue";
+  for (std::size_t split = 0; split <= wire.size(); ++split) {
+    chhttp::MultipartParser parser("multipart/form-data; boundary=b");
+    std::string decoded;
+    int begins = 0, ends = 0;
+    for (auto input : {std::string_view(wire).substr(0, split),
+                       std::string_view(wire).substr(split)}) {
+      auto events = parser.feed(input);
+      CHECK(events);
+      for (const auto &event : *events) {
+        CHECK(event.part_index == 0);
+        if (event.type == chhttp::MultipartEventType::part_begin) ++begins;
+        if (event.type == chhttp::MultipartEventType::part_end) ++ends;
+        if (event.type == chhttp::MultipartEventType::part_data) decoded += event.data;
+      }
+    }
+    CHECK(parser.finish() && begins == 1 && ends == 1 && decoded == payload);
+  }
+}
+
+TEST(multipart_header_limit_is_independent_of_input_fragmentation) {
+  const std::string head = "Content-Disposition: form-data; name=\"x\"";
+  const std::string wire = "--b\r\n" + head + "\r\n\r\nx\r\n--b--";
+  for (std::size_t chunk = 1; chunk <= wire.size(); ++chunk) {
+    chhttp::MultipartParser parser("multipart/form-data; boundary=b",
+                                   {.max_header_size = head.size()});
+    for (std::size_t offset = 0; offset < wire.size(); offset += chunk)
+      CHECK(parser.feed(std::string_view(wire).substr(offset, chunk)));
+    CHECK(parser.finish());
+  }
+  chhttp::MultipartParser too_small("multipart/form-data; boundary=b",
+                                    {.max_header_size = head.size() - 1});
+  CHECK(!too_small.feed(wire));
+}
+
+TEST(multipart_preamble_limit_counts_false_and_split_candidates) {
+  for (const std::string &preamble : {std::string(80, 'p') + "\r\n",
+                                      std::string("--bX\r\n--bX\r\n--bX\r\n")}) {
+    const std::string wire = preamble + "--b--";
+    for (std::size_t chunk : {std::size_t{1}, wire.size()}) {
+      chhttp::MultipartParser parser("multipart/form-data; boundary=b", {.max_header_size = 16});
+      bool rejected = false;
+      for (std::size_t offset = 0; offset < wire.size(); offset += chunk) {
+        auto events = parser.feed(std::string_view(wire).substr(offset, chunk));
+        if (!events) { rejected = true; break; }
+      }
+      CHECK(rejected && !parser.complete() && !parser.finish());
+    }
+  }
+  chhttp::MultipartParser exact("multipart/form-data; boundary=b", {.max_header_size = 16});
+  CHECK(exact.feed(std::string(14, 'p') + "\r\n--b--") && exact.complete());
+  chhttp::MultipartParser unlimited("multipart/form-data; boundary=b",
+      {.max_header_size = (std::numeric_limits<std::size_t>::max)()});
+  CHECK(unlimited.feed("no boundary yet") && !unlimited.finish());
+}
+
+TEST(multipart_large_input_preserves_order_limits_and_ignores_epilogue) {
+  const std::string payload(1024 * 1024, 'm');
+  auto [type, wire] = chhttp::make_multipart(
+      {{.name = "one", .content = payload}, {.name = "two", .content = "tail"}}, "large");
+  wire.append(4 * 1024 * 1024, 'e');
+  chhttp::MultipartParser parser(type);
+  auto events = parser.feed(wire);
+  CHECK(events && parser.finish() && parser.complete());
+  std::array<std::string, 2> decoded;
+  std::size_t active = 0;
+  for (const auto &event : *events) {
+    CHECK(event.part_index == active);
+    if (event.type == chhttp::MultipartEventType::part_data) {
+      CHECK(event.data.size() <= 64 * 1024);
+      decoded[active] += event.data;
+    }
+    if (event.type == chhttp::MultipartEventType::part_end) ++active;
+  }
+  CHECK(active == 2 && decoded[0] == payload && decoded[1] == "tail");
+  CHECK(parser.feed("ignored")->empty());
+  chhttp::MultipartParser limited(type, {.max_total_size = payload.size() + 3});
+  auto error = limited.feed(wire);
+  CHECK(!error && error.error().code == chhttp::Error::body_too_large);
+}
+
+struct Round2TestDirectory {
+  std::filesystem::path path = unique_test_directory("chhttp-file-io");
+  ~Round2TestDirectory() {
+    std::error_code ignored;
+    std::filesystem::remove_all(path, ignored);
+  }
+};
+
+struct MultipartCaptureSink : chhttp::StreamWriter::Sink {
+  std::string bytes;
+  chhttp::Task<bool> write(std::string data) override {
+    bytes += data;
+    co_return true;
+  }
+  chhttp::Task<bool> flush() override { co_return true; }
+  bool open() const noexcept override { return true; }
+};
+
+TEST(multipart_file_growth_preserves_declared_content_length) {
+  Round2TestDirectory directory;
+  auto path = directory.path / "growing.bin";
+  std::ofstream(path, std::ios::binary) << "original";
+  chhttp::MultipartWriter multipart("growth");
+  multipart.add_file("file", path);
+  const auto length = multipart.content_length();
+  std::ofstream(path, std::ios::binary | std::ios::app) << "extra bytes";
+  auto sink = std::make_shared<MultipartCaptureSink>();
+  chhttp::StreamWriter writer(sink);
+  multipart.write(writer).get();
+  CHECK(length && sink->bytes.size() == *length);
+  auto parsed = chhttp::parse_multipart(sink->bytes, multipart.content_type());
+  CHECK(parsed && parsed->size() == 1 && parsed->front().content == "original");
+}
+
+TEST(multipart_missing_and_truncated_files_report_failure) {
+  Round2TestDirectory directory;
+  for (bool empty : {false, true}) {
+    auto path = directory.path / "changing.bin";
+    std::ofstream(path, std::ios::binary) << (empty ? "" : "original");
+    chhttp::MultipartWriter multipart("failure");
+    multipart.add_file("file", path);
+    if (empty) std::filesystem::remove(path);
+    else std::ofstream(path, std::ios::binary | std::ios::trunc) << "x";
+    auto sink = std::make_shared<MultipartCaptureSink>();
+    chhttp::StreamWriter writer(sink);
+    bool failed = false;
+    try { multipart.write(writer).get(); }
+    catch (const std::runtime_error &) { failed = true; }
+    CHECK(failed && !sink->bytes.ends_with("--failure--\r\n"));
+  }
+}
+
+TEST(file_io_preserves_loop_affinity_and_does_not_block_other_requests) {
+  std::promise<void> entered_promise, release_promise;
+  auto entered = entered_promise.get_future();
+  auto release = release_promise.get_future().share();
+  std::atomic_bool off_loop{false}, restored{false};
+  chhttp::Server server;
+  server.get_async("/blocked", [&](const auto &, auto &response) -> chhttp::Task<void> {
+    const auto loop_thread = std::this_thread::get_id();
+    co_await chhttp::detail::run_file_io([&] {
+      off_loop = std::this_thread::get_id() != loop_thread;
+      entered_promise.set_value();
+      release.wait_for(std::chrono::seconds(5));
+    });
+    restored = std::this_thread::get_id() == loop_thread;
+    response.body = "done";
+  });
+  server.get_async("/ping", [](const auto &, auto &response) -> chhttp::Task<void> {
+    response.body = "pong";
+    co_return;
+  });
+  CHECK(server.start("127.0.0.1", 0));
+  chhttp::AsyncClient client("http://127.0.0.1:" + std::to_string(server.port()));
+  auto blocked = client.get("/blocked");
+  const bool started = entered.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+  auto ping = client.get("/ping", {}, {.total_timeout = std::chrono::seconds(1)}).get();
+  release_promise.set_value();
+  auto completed = blocked.get();
+  CHECK(started && ping && ping->body == "pong" && completed && completed->body == "done");
+  CHECK(off_loop && restored);
+}
+
+TEST(file_io_propagates_exceptions_and_worker_pool_remains_usable) {
+  bool caught = false;
+  try {
+    chhttp::detail::run_file_io([] { throw std::runtime_error("file failure"); }).get();
+  } catch (const std::runtime_error &error) {
+    caught = std::string_view(error.what()) == "file failure";
+  }
+  std::atomic_bool completed{false};
+  chhttp::detail::run_file_io([&] { completed = true; }).get();
+  CHECK(caught && completed);
+}
+
+TEST(shutdown_drains_file_work_after_closing_active_connections) {
+  for (bool streaming : {false, true}) {
+    std::promise<void> entered_promise, release_promise;
+    auto entered = entered_promise.get_future();
+    auto release = release_promise.get_future().share();
+    chhttp::ServerOptions options;
+    options.shutdown_timeout = std::chrono::seconds(0);
+    chhttp::Server server(options);
+    std::atomic_bool completed{false};
+    auto work = [&] {
+      entered_promise.set_value();
+      release.wait_for(std::chrono::seconds(8));
+      completed = true;
+    };
+    if (streaming) {
+      server.post_stream("/", [&](auto &, auto &body, auto &response) -> chhttp::Task<void> {
+        co_await body.discard();
+        co_await chhttp::detail::run_file_io(work);
+        response.body.assign(4096, 'z');
+      });
+    } else {
+      server.post_async("/", [&](const auto &, auto &response) -> chhttp::Task<void> {
+        co_await chhttp::detail::run_file_io(work);
+        response.body.assign(4096, 'z');
+      });
+    }
+    CHECK(server.start("127.0.0.1", 0));
+    chhttp::AsyncClient client("http://127.0.0.1:" + std::to_string(server.port()));
+    auto request = client.post("/", "data", "text/plain");
+    const bool started = entered.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+    auto stopped = std::async(std::launch::async, [&] { server.stop(); });
+    const bool draining = stopped.wait_for(std::chrono::milliseconds(2200)) != std::future_status::ready;
+    release_promise.set_value();
+    stopped.get();
+    auto result = request.get();
+    CHECK(started && draining && completed && !result);
+  }
+}
+
+struct FileTestBodySource : chhttp::RequestBodyStream::Source {
+  std::string payload = std::string(128 * 1024, '\x7f');
+  bool fail{false};
+  bool done{false};
+  chhttp::Task<chhttp::ErrorInfo> consume(chhttp::AsyncBodyConsumer consumer) override {
+    if (!co_await consumer(payload))
+      co_return chhttp::ErrorInfo{chhttp::Error::cancelled, "Rejected"};
+    if (fail) throw std::runtime_error("source failed");
+    done = true;
+    co_return chhttp::ErrorInfo{};
+  }
+  void cancel() noexcept override {}
+  std::optional<std::uint64_t> content_length() const noexcept override { return payload.size(); }
+  std::uint64_t received() const noexcept override { return done ? payload.size() : 0; }
+  bool consumed() const noexcept override { return done; }
+  bool complete() const noexcept override { return done; }
+};
+
+TEST(file_spooling_supports_external_sources_and_cleans_up_failures) {
+  Round2TestDirectory directory;
+  auto source = std::make_shared<FileTestBodySource>();
+  chhttp::RequestBodyStream body(source);
+  auto stored = body.save_to_file(directory.path / "body.bin").get();
+  CHECK(stored && stored->size == source->payload.size());
+  {
+    std::ifstream input(stored->path, std::ios::binary);
+    const std::string received((std::istreambuf_iterator<char>(input)), {});
+    CHECK(received == source->payload);
+  }
+  source->fail = true;
+  bool failed = false;
+  try { body.save_to_temp(directory.path).get(); }
+  catch (const std::runtime_error &) { failed = true; }
+  CHECK(failed);
+  for (const auto &entry : std::filesystem::directory_iterator(directory.path))
+    CHECK(entry.path() == stored->path);
+  auto cannot_open = body.save_to_file(directory.path).get();
+  CHECK(!cannot_open && cannot_open.error().code == chhttp::Error::write);
+}
+
+TEST(file_responses_apply_ranges_only_to_successful_get_requests) {
+  Round2TestDirectory directory;
+  const auto path = directory.path / "file.bin";
+  std::ofstream(path, std::ios::binary) << "0123456789";
+  chhttp::Server server;
+  server.get("/file", [&](const auto &, auto &response) { response.set_file(path); });
+  server.post("/file", [&](const auto &, auto &response) { response.set_file(path); });
+  server.get("/error", [&](const auto &, auto &response) {
+    response.status = 403;
+    response.set_file(path);
+  });
+  CHECK(server.start("127.0.0.1", 0));
+  chhttp::Client client("http://127.0.0.1:" + std::to_string(server.port()));
+  auto head = client.head("/file", {{"Range", "bytes=1-2"}});
+  CHECK(head && head->status == 200 && head->body.empty());
+  CHECK(head->headers.get("Content-Length") == "10" && !head->headers.contains("Content-Range"));
+  auto post = client.post("/file", "", "text/plain", {{"Range", "bytes=1-2"}});
+  CHECK(post && post->status == 200 && post->body == "0123456789");
+  auto forbidden = client.get("/error", {{"Range", "bytes=1-2"}});
+  CHECK(forbidden && forbidden->status == 403 && forbidden->body == "0123456789");
+  auto range = client.get("/file", {{"Range", "bytes=1-2"}});
+  CHECK(range && range->status == 206 && range->body == "12");
+}
+
+TEST(file_responses_respect_bodyless_statuses_on_the_wire) {
+  Round2TestDirectory directory;
+  const auto path = directory.path / "file.bin";
+  std::ofstream(path, std::ios::binary) << "must not be transmitted";
+  chhttp::Server server;
+  for (int status : {204, 205, 304}) {
+    server.get("/" + std::to_string(status), [&, status](const auto &, auto &response) {
+      response.status = status;
+      response.set_file(path);
+    });
+  }
+  CHECK(server.start("127.0.0.1", 0));
+  for (int status : {204, 205, 304}) {
+    const auto wire = raw_http_exchange(server.port(), "GET /" + std::to_string(status) +
+        " HTTP/1.1\r\nHost: localhost\r\nRange: bytes=1-2\r\nConnection: close\r\n\r\n");
+    CHECK(wire.starts_with("HTTP/1.1 " + std::to_string(status)));
+    const auto end = wire.find("\r\n\r\n");
+    CHECK(end != std::string::npos && wire.size() == end + 4);
+  }
+}
+
+TEST(unreadable_response_file_sends_error_before_any_success_header) {
+  Round2TestDirectory directory;
+  chhttp::Server server;
+  server.get("/", [&](const auto &, auto &response) { response.set_file(directory.path / "missing"); });
+  CHECK(server.start("127.0.0.1", 0));
+  chhttp::Client client("http://127.0.0.1:" + std::to_string(server.port()));
+  auto response = client.get("/");
+  CHECK(response && response->status == 500 && !response->body.empty());
+}
+
+#ifdef CHHTTP_HAS_COMPRESSION
+TEST(compression_work_waits_for_workers_while_async_requests_remain_responsive) {
+  std::promise<void> entered_promise, release_promise;
+  auto entered = entered_promise.get_future();
+  auto release = release_promise.get_future().share();
+  chhttp::ServerOptions options;
+  options.worker_threads = 1;
+  chhttp::Server server(options);
+  server.get("/block-worker", [&](const auto &, auto &response) {
+    entered_promise.set_value();
+    release.wait_for(std::chrono::seconds(5));
+    response.body = "released";
+  });
+  server.get_async("/compress", [](const auto &, auto &response) -> chhttp::Task<void> {
+    response.body.assign(1024 * 1024, 'z');
+    co_return;
+  });
+  server.get_async("/ping", [](const auto &, auto &response) -> chhttp::Task<void> {
+    response.body = "pong";
+    co_return;
+  });
+  CHECK(server.start("127.0.0.1", 0));
+  chhttp::AsyncClient client("http://127.0.0.1:" + std::to_string(server.port()));
+  auto block = client.get("/block-worker");
+  const bool started = entered.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+  auto compressed = client.get("/compress", {{"Accept-Encoding", "gzip"}});
+  auto ping = client.get("/ping", {}, {.total_timeout = std::chrono::seconds(1)}).get();
+  const bool pending = !compressed.ready();
+  release_promise.set_value();
+  auto finished = block.get();
+  auto result = compressed.get();
+  CHECK(started && ping && ping->body == "pong" && pending && finished);
+  CHECK(result && result->body == std::string(1024 * 1024, 'z'));
+}
+
+TEST(bodyless_responses_do_not_run_automatic_compression) {
+  chhttp::Server server;
+  for (int status : {204, 205, 304}) {
+    server.get("/" + std::to_string(status), [status](const auto &, auto &response) {
+      response.status = status;
+      response.body.assign(4096, 'z');
+    });
+  }
+  CHECK(server.start("127.0.0.1", 0));
+  chhttp::Client client("http://127.0.0.1:" + std::to_string(server.port()));
+  for (int status : {204, 205, 304}) {
+    auto response = client.get("/" + std::to_string(status), {{"Accept-Encoding", "gzip"}});
+    CHECK(response && response->status == status && response->body.empty());
+    CHECK(!response->headers.contains("Content-Encoding"));
+  }
+}
+#endif
+
+TEST(stress_concurrent_file_upload_download_and_cancellation) {
+  Round2TestDirectory directory;
+  chhttp::ServerOptions options;
+  options.auto_compress_response = false;
+  chhttp::Server server(options);
+  server.post_stream("/{id}", [&](chhttp::Request &request, chhttp::RequestBodyStream &body,
+                                  chhttp::Response &response) -> chhttp::Task<void> {
+    const auto loop_thread = std::this_thread::get_id();
+    auto stored = co_await body.save_to_file(directory.path / (request.path_params.at("id") + ".bin"));
+    CHECK(std::this_thread::get_id() == loop_thread);
+    if (!stored) { response.status = 400; co_return; }
+    response.set_file(stored->path);
+  });
+  CHECK(server.start("127.0.0.1", 0));
+  chhttp::AsyncClient client("http://127.0.0.1:" + std::to_string(server.port()));
+  std::vector<chhttp::Task<chhttp::ResponseResult>> pending;
+  for (int i = 0; i < 32; ++i) {
+    const auto value = static_cast<char>('a' + i % 26);
+    chhttp::Request request;
+    request.method = "POST";
+    request.target = "/" + std::to_string(i);
+    request.body.assign(256 * 1024, value);
+    chhttp::RequestOptions request_options;
+    if (i % 4 == 0) request_options.on_data = [](std::string_view) { return false; };
+    pending.push_back(client.request(std::move(request), std::move(request_options)));
+  }
+  for (int i = 0; i < 32; ++i) {
+    auto result = pending[i].get();
+    if (i % 4 == 0) CHECK(!result && result.error().code == chhttp::Error::cancelled);
+    else CHECK(result && result->body == std::string(256 * 1024, static_cast<char>('a' + i % 26)));
+  }
+  server.stop();
+}
+
+#include "extended_tests.inc"
+#include "randomized_tests.inc"
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -4442,13 +5306,25 @@ int main(int argc, char **argv) {
   int failures = 0;
   std::size_t executed = 0;
   const std::string_view selector = argc > 1 ? argv[1] : "";
+  if (argc > 2) {
+    const std::string_view seed = argv[2];
+    const auto parsed = std::from_chars(seed.data(), seed.data() + seed.size(), property_seed);
+    if (parsed.ec != std::errc{} || parsed.ptr != seed.data() + seed.size()) {
+      std::cerr << "Seed must be an unsigned decimal integer\n";
+      return 2;
+    }
+  }
+  std::cout << "Randomized test seed: " << property_seed << '\n';
   for (const auto &[name, function] : tests()) {
     const std::string_view test_name = name;
-    if (selector == "--functional" && test_name.starts_with("stress_"))
+    if (selector == "--functional" &&
+        (test_name.starts_with("stress_") || test_name.starts_with("property_")))
       continue;
     if (selector == "--stress" && !test_name.starts_with("stress_")) continue;
+    if (selector == "--property" && !test_name.starts_with("property_")) continue;
     if (!selector.empty() && selector != "--functional" &&
-        selector != "--stress" && test_name.find(selector) == std::string_view::npos)
+        selector != "--stress" && selector != "--property" &&
+        test_name.find(selector) == std::string_view::npos)
       continue;
     ++executed;
     const auto started = std::chrono::steady_clock::now();
@@ -4459,7 +5335,8 @@ int main(int argc, char **argv) {
       std::cout << "[PASS] " << name << " (" << elapsed.count() << " ms)\n";
     } catch (const std::exception &exception) {
       ++failures;
-      std::cerr << "[FAIL] " << name << ": " << exception.what() << '\n';
+      std::cerr << "[FAIL] " << name << ": " << exception.what()
+                << " (seed " << property_seed << ", case " << property_case << ")\n";
     } catch (...) {
       ++failures;
       std::cerr << "[FAIL] " << name << ": unknown exception\n";

@@ -10,11 +10,16 @@ public:
   explicit Impl(SseParserOptions value_options)
       : options(std::move(value_options)), last_id(options.last_event_id) {}
 
+  static void clear_buffer(std::string &buffer) {
+    if (buffer.capacity() > 64 * 1024) std::string{}.swap(buffer);
+    else buffer.clear();
+  }
+
   void reset() {
-    line.clear();
-    data.clear();
-    event_type.clear();
-    last_id = options.last_event_id;
+    clear_buffer(line);
+    clear_buffer(data);
+    clear_buffer(event_type);
+    last_id = std::string(options.last_event_id);
     retry_delay.reset();
     event_retry.reset();
     first_line = true;
@@ -33,6 +38,7 @@ public:
                    .event = std::move(event_type),
                    .id = last_id,
                    .retry = event_retry};
+    if (event.event.empty()) event.event = "message";
     data.clear();
     event_type.clear();
     event_retry.reset();
@@ -45,6 +51,12 @@ public:
               "SSE callback failed: " + std::string(exception.what())};
     } catch (...) {
       return {Error::internal, "SSE callback failed"};
+    }
+    // Reuse common-sized event storage without retaining an unusually large
+    // event for the entire lifetime of a long-running stream.
+    if (event.data.capacity() <= 64 * 1024) {
+      data = std::move(event.data);
+      data.clear();
     }
     return {};
   }
@@ -63,23 +75,31 @@ public:
                            : value.substr(colon + 1);
     if (!field_value.empty() && field_value.front() == ' ')
       field_value.remove_prefix(1);
-    const auto exceeds_event_limit = [&](std::size_t additional) {
-      const auto current = data.size() + event_type.size() + last_id.size();
-      return additional > options.max_event_size ||
-             current > options.max_event_size - additional;
+    const auto exceeds_event_limit = [&](std::size_t data_size,
+                                         std::size_t type_size,
+                                         std::size_t id_size) {
+      auto remaining = options.max_event_size;
+      for (auto size : {data_size, type_size, id_size}) {
+        if (size > remaining) return true;
+        remaining -= size;
+      }
+      return false;
     };
     if (field == "data") {
-      if (exceeds_event_limit(field_value.size() + 1))
+      if (field_value.size() >= options.max_event_size ||
+          data.size() > options.max_event_size - field_value.size() - 1 ||
+          exceeds_event_limit(data.size() + field_value.size() + 1,
+                               event_type.size(), last_id.size()))
         return {Error::body_too_large, "SSE event exceeds configured limit"};
       data.append(field_value);
       data.push_back('\n');
     } else if (field == "event") {
-      if (exceeds_event_limit(field_value.size()))
+      if (exceeds_event_limit(data.size(), field_value.size(), last_id.size()))
         return {Error::body_too_large, "SSE event exceeds configured limit"};
       event_type = field_value;
     } else if (field == "id" &&
                field_value.find('\0') == std::string_view::npos) {
-      if (field_value.size() > options.max_event_size)
+      if (exceeds_event_limit(data.size(), event_type.size(), field_value.size()))
         return {Error::body_too_large,
                 "SSE event ID exceeds configured limit"};
       last_id = field_value;
@@ -101,25 +121,35 @@ public:
 
   ErrorInfo feed(std::string_view bytes) {
     if (failed) return failed;
-    for (const char ch : bytes) {
+    while (!bytes.empty()) {
       if (skip_lf) {
         skip_lf = false;
-        if (ch == '\n') continue;
+        if (bytes.front() == '\n') bytes.remove_prefix(1);
+        if (bytes.empty()) break;
       }
-      if (ch == '\r' || ch == '\n') {
-        if (auto error = process_line(line); error) {
-          failed = std::move(error);
-          return failed;
-        }
-        line.clear();
-        skip_lf = ch == '\r';
-        continue;
-      }
-      if (line.size() >= options.max_line_size) {
+      const auto end = bytes.find_first_of("\r\n");
+      const auto count = end == std::string_view::npos ? bytes.size() : end;
+      if (count > options.max_line_size ||
+          line.size() > options.max_line_size - count) {
         failed = {Error::body_too_large, "SSE line exceeds configured limit"};
         return failed;
       }
-      line.push_back(ch);
+      if (end == std::string_view::npos) {
+        line.append(bytes);
+        break;
+      }
+      const auto segment = bytes.substr(0, count);
+      // Complete lines can be parsed directly from the caller's chunk.
+      if (line.empty()) failed = process_line(segment);
+      else {
+        line.append(segment);
+        failed = process_line(line);
+      }
+      if (failed) return failed;
+      if (line.capacity() > 64 * 1024) std::string{}.swap(line);
+      else line.clear();
+      skip_lf = bytes[end] == '\r';
+      bytes.remove_prefix(end + 1);
     }
     return {};
   }
@@ -128,9 +158,9 @@ public:
     if (failed) return failed;
     // EOF is not an event delimiter. A final event is dispatched only after an
     // empty line; any partial line or accumulated data is intentionally lost.
-    line.clear();
-    data.clear();
-    event_type.clear();
+    clear_buffer(line);
+    clear_buffer(data);
+    clear_buffer(event_type);
     event_retry.reset();
     skip_lf = false;
     return {};

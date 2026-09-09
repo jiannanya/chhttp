@@ -19,6 +19,77 @@
 
 namespace chhttp::detail {
 
+// Consuming protocol bytes advances a cursor. Compact only when appending
+// requires space, so many tiny chunks/frames do not repeatedly move the tail.
+class ReadBuffer {
+public:
+  ReadBuffer() = default;
+  ReadBuffer(const ReadBuffer &) = delete;
+  ReadBuffer &operator=(const ReadBuffer &) = delete;
+  ReadBuffer(ReadBuffer &&other) noexcept
+      : storage_(std::move(other.storage_)),
+        offset_(std::exchange(other.offset_, 0)) {}
+  ReadBuffer &operator=(ReadBuffer &&other) noexcept {
+    if (this != &other) {
+      storage_ = std::move(other.storage_);
+      offset_ = std::exchange(other.offset_, 0);
+    }
+    return *this;
+  }
+  [[nodiscard]] std::string_view view() const noexcept {
+    return std::string_view(storage_).substr(offset_);
+  }
+  [[nodiscard]] std::size_t size() const noexcept { return storage_.size() - offset_; }
+  [[nodiscard]] bool empty() const noexcept { return size() == 0; }
+  [[nodiscard]] const char *data() const noexcept { return storage_.data() + offset_; }
+  char operator[](std::size_t index) const noexcept { return data()[index]; }
+  std::size_t find(std::string_view text, std::size_t start = 0) const noexcept {
+    return view().find(text, start);
+  }
+  std::size_t find(char ch, std::size_t start = 0) const noexcept {
+    return view().find(ch, start);
+  }
+  std::string substr(std::size_t start, std::size_t count) const {
+    return std::string(view().substr(start, count));
+  }
+  void consume(std::size_t count) noexcept {
+    offset_ += count;
+    if (offset_ == storage_.size()) clear();
+  }
+  void clear() noexcept {
+    offset_ = 0;
+    // Large WebSocket frames must not pin their entire allocation while idle.
+    if (storage_.capacity() > 64 * 1024) std::string{}.swap(storage_);
+    else storage_.clear();
+  }
+  void append(std::string bytes) {
+    if (empty()) {
+      storage_ = std::move(bytes);
+      offset_ = 0;
+      return;
+    }
+    if (offset_ >= storage_.size() / 2 ||
+        bytes.size() > storage_.capacity() - storage_.size()) {
+      storage_.erase(0, offset_);
+      offset_ = 0;
+    }
+    storage_.append(bytes);
+  }
+  // Copy a borrowed input directly into reusable storage (no temporary string).
+  void append_view(std::string_view bytes) {
+    if (offset_ != 0 && (offset_ >= storage_.size() / 2 ||
+        bytes.size() > storage_.capacity() - storage_.size())) {
+      storage_.erase(0, offset_);
+      offset_ = 0;
+    }
+    storage_.append(bytes);
+  }
+
+private:
+  std::string storage_;
+  std::size_t offset_{0};
+};
+
 struct ParsedUrl {
   std::string scheme;
   std::string host;
@@ -87,6 +158,11 @@ public:
   [[nodiscard]] bool on_loop_thread() const noexcept;
   [[nodiscard]] uv_loop_t *loop() noexcept { return &loop_; }
 
+  // Shared only by reads on this loop. An overlapping allocation falls back
+  // to an individually owned buffer; idle sockets retain no receive slab.
+  std::array<char, 64 * 1024> read_storage_;
+  bool read_storage_in_use_{false};
+
 private:
   static void async_callback(uv_async_t *handle);
   void drain();
@@ -104,6 +180,9 @@ private:
 Runtime *current_runtime() noexcept;
 void stop_runtime(std::shared_ptr<Runtime> runtime) noexcept;
 Task<void> resume_on(std::shared_ptr<Runtime> runtime);
+// Run blocking filesystem work on a bounded pool, then return to the caller's
+// I/O loop when invoked from one. Exceptions propagate through the Task.
+Task<void> run_file_io(std::function<void()> operation);
 
 #ifdef CHHTTP_HAS_TLS
 SSL_CTX *create_client_tls_context(const TlsClientOptions &options,
@@ -248,17 +327,17 @@ struct RequestHeadResult {
 
 Task<Result<RequestHeadResult>>
 read_request_head(const std::shared_ptr<Connection> &connection,
-                  std::string &buffer, const HttpReadOptions &options);
+                  ReadBuffer &buffer, const HttpReadOptions &options);
 Task<Result<std::string>>
 read_request_body(const std::shared_ptr<Connection> &connection,
-                  std::string &buffer, RequestBodyState &state,
+                  ReadBuffer &buffer, RequestBodyState &state,
                   const HttpReadOptions &options);
 
 Task<Result<Request>> read_request(const std::shared_ptr<Connection> &connection,
-                                   std::string &buffer,
+                                   ReadBuffer &buffer,
                                    const HttpReadOptions &options);
 Task<ResponseResult> read_response(
-    const std::shared_ptr<Connection> &connection, std::string &buffer,
+    const std::shared_ptr<Connection> &connection, ReadBuffer &buffer,
     std::string_view request_method, const HttpReadOptions &options);
 Task<ErrorInfo> write_request(const std::shared_ptr<Connection> &connection,
                               const Request &request,
@@ -287,7 +366,7 @@ Task<Result<std::shared_ptr<WebSocket>>> websocket_client_connect(
     std::shared_ptr<Runtime> runtime, std::string url, Headers headers,
     ClientOptions options);
 std::shared_ptr<WebSocket::Channel> make_websocket_channel(
-    std::shared_ptr<Connection> connection, std::string buffered,
+    std::shared_ptr<Connection> connection, ReadBuffer buffered,
     bool client_side, std::string subprotocol,
     std::chrono::milliseconds timeout);
 

@@ -6,6 +6,7 @@ include(CMakePackageConfigHelpers)
 
 option(CHHTTP_BUILD_TESTS "Build the chhttp test suite" ON)
 option(CHHTTP_BUILD_EXAMPLES "Build chhttp examples" ON)
+option(CHHTTP_BUILD_BENCHMARKS "Build repeatable performance/memory benchmarks" OFF)
 option(CHHTTP_ENABLE_TLS "Enable TLS through OpenSSL" ON)
 option(CHHTTP_ENABLE_COMPRESSION "Enable gzip/deflate, Brotli and Zstd" ON)
 
@@ -81,6 +82,15 @@ endif()
 if(CHHTTP_BUILD_TESTS)
   enable_testing()
   add_subdirectory(tests)
+endif()
+
+if(CHHTTP_BUILD_BENCHMARKS)
+  add_executable(chhttp_benchmarks benchmarks/benchmark.cpp)
+  target_link_libraries(chhttp_benchmarks PRIVATE chhttp::chhttp)
+  if(WIN32)
+    target_link_libraries(chhttp_benchmarks PRIVATE psapi)
+    target_compile_definitions(chhttp_benchmarks PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+  endif()
 endif()
 
 install(TARGETS chhttp EXPORT chhttpTargets

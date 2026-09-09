@@ -495,20 +495,37 @@ Task<ErrorInfo> Connection::raw_write(std::string data,
   co_return co_await WriteAwaiter{shared_from_this(), pending, timeout};
 }
 
-void Connection::allocate(uv_handle_t *, std::size_t suggested, uv_buf_t *buf) {
-  const auto size = std::max<std::size_t>(suggested, 16 * 1024);
-  buf->base = static_cast<char *>(std::malloc(size));
-  buf->len = static_cast<decltype(buf->len)>(size);
+void Connection::allocate(uv_handle_t *handle, std::size_t suggested, uv_buf_t *buf) {
+  auto &runtime = *static_cast<Connection *>(handle->data)->runtime_;
+  const auto size = std::clamp<std::size_t>(suggested, 16 * 1024,
+                                          runtime.read_storage_.size());
+  if (!runtime.read_storage_in_use_) {
+    runtime.read_storage_in_use_ = true;
+    buf->base = runtime.read_storage_.data();
+  } else {
+    buf->base = static_cast<char *>(std::malloc(size));
+  }
+  buf->len = buf->base ? static_cast<decltype(buf->len)>(size) : 0;
 }
 
 void Connection::read_callback(uv_stream_t *stream, ssize_t count,
                                const uv_buf_t *buffer) {
   auto *connection = static_cast<Connection *>(stream->data);
-  std::unique_ptr<char, decltype(&std::free)> storage(buffer->base, &std::free);
+  auto &runtime = *connection->runtime_;
+  const auto release_storage = [&] {
+    if (buffer->base == runtime.read_storage_.data())
+      runtime.read_storage_in_use_ = false;
+    else
+      std::free(buffer->base);
+  };
   if (count > 0) {
-    connection->finish_read(ReadChunk{
-        std::string(buffer->base, static_cast<std::size_t>(count)), false});
-  } else if (count == UV_EOF) {
+    ReadChunk chunk{std::string(buffer->base, static_cast<std::size_t>(count)), false};
+    release_storage();
+    connection->finish_read(std::move(chunk));
+    return;
+  }
+  release_storage();
+  if (count == UV_EOF) {
     connection->finish_read(ReadChunk{{}, true});
   } else if (count < 0) {
     connection->finish_read(ErrorInfo{
@@ -575,6 +592,7 @@ void Connection::write_timeout(uv_timer_t *timer) {
 
 Task<Result<Connection::ReadChunk>>
 Connection::read(std::chrono::milliseconds timeout) {
+  if (!runtime_->on_loop_thread()) co_await resume_on(runtime_);
 #ifdef CHHTTP_HAS_TLS
   if (ssl_) {
     for (;;) {
@@ -614,13 +632,15 @@ Connection::read(std::chrono::milliseconds timeout) {
 
 Task<ErrorInfo> Connection::write(std::string data,
                                   std::chrono::milliseconds timeout) {
+  if (!runtime_->on_loop_thread()) co_await resume_on(runtime_);
 #ifdef CHHTTP_HAS_TLS
   if (ssl_) {
     std::size_t offset = 0;
     while (offset < data.size()) {
       std::size_t count = 0;
       const int status = SSL_write_ex(ssl_, data.data() + offset,
-                                      data.size() - offset, &count);
+                                      std::min<std::size_t>(data.size() - offset,
+                                                            64 * 1024), &count);
       const int ssl_error =
           status == 1 ? SSL_ERROR_NONE : SSL_get_error(ssl_, status);
       const auto tls_code =

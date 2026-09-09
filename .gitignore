@@ -5,3 +5,5 @@
 *.user
 *.log
 build-msvc/
+benchmarks/
+docs/

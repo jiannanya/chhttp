@@ -15,8 +15,9 @@ namespace chhttp {
 namespace {
 
 struct CompiledPattern {
-  std::regex expression;
+  std::optional<std::regex> expression;
   std::vector<std::string> names;
+  std::string literal;
 };
 
 bool regex_special(char ch) {
@@ -26,9 +27,11 @@ bool regex_special(char ch) {
 
 CompiledPattern compile_pattern(std::string_view pattern) {
   if (pattern.starts_with("regex:"))
-    return {std::regex(std::string(pattern.substr(6))), {}};
+    return {std::regex(std::string(pattern.substr(6))), {}, {}};
   if (pattern.starts_with('^'))
-    return {std::regex(std::string(pattern)), {}};
+    return {std::regex(std::string(pattern)), {}, {}};
+  if (pattern.find_first_of("{*:") == std::string_view::npos)
+    return {std::nullopt, {}, std::string(pattern)};
   std::string expression = "^";
   std::vector<std::string> names;
   for (std::size_t index = 0; index < pattern.size();) {
@@ -60,13 +63,14 @@ CompiledPattern compile_pattern(std::string_view pattern) {
     }
   }
   expression += '$';
-  return {std::regex(expression), std::move(names)};
+  return {std::regex(expression), std::move(names), {}};
 }
 
 bool match_pattern(const CompiledPattern &pattern, std::string_view path,
                    PathParams &parameters) {
+  if (!pattern.expression) return path == pattern.literal;
   std::match_results<std::string_view::const_iterator> matches;
-  if (!std::regex_match(path.begin(), path.end(), matches, pattern.expression))
+  if (!std::regex_match(path.begin(), path.end(), matches, *pattern.expression))
     return false;
   for (std::size_t index = 0;
        index < pattern.names.size() && index + 1 < matches.size(); ++index) {
@@ -85,7 +89,7 @@ struct ByteRange {
 
 std::optional<ByteRange> parse_range(std::string_view value,
                                      std::uint64_t size) {
-  if (!value.starts_with("bytes=") || value.find(',') != std::string_view::npos ||
+  if (!detail::iequals(value.substr(0, 6), "bytes=") || value.find(',') != std::string_view::npos ||
       size == 0)
     return std::nullopt;
   value.remove_prefix(6);
@@ -234,7 +238,7 @@ private:
 class ServerRequestBodySource final : public RequestBodyStream::Source {
 public:
   ServerRequestBodySource(std::shared_ptr<detail::Connection> connection,
-                          std::shared_ptr<std::string> buffer,
+                          std::shared_ptr<detail::ReadBuffer> buffer,
                           detail::RequestBodyState state,
                           detail::HttpReadOptions options, Request *request)
       : connection_(std::move(connection)), buffer_(std::move(buffer)),
@@ -301,7 +305,7 @@ public:
 
 private:
   std::shared_ptr<detail::Connection> connection_;
-  std::shared_ptr<std::string> buffer_;
+  std::shared_ptr<detail::ReadBuffer> buffer_;
   detail::RequestBodyState state_;
   detail::HttpReadOptions options_;
   Request *request_{nullptr};
@@ -480,7 +484,7 @@ public:
       }
     }
 #endif
-    auto buffer = std::make_shared<std::string>();
+    auto buffer = std::make_shared<detail::ReadBuffer>();
     std::size_t request_count = 0;
     while (connection->open() &&
            request_count < options.keep_alive_max_requests) {
@@ -545,7 +549,9 @@ public:
         response.version = request.version;
         response.keep_alive = request.keep_alive;
         co_await dispatch_stream(entry, request, body, response);
+        if (!runtime->on_loop_thread()) co_await detail::resume_on(runtime);
         source->detach_request();
+        if (!connection->open()) break;
         request.headers = source->headers();
         if (source->error() && response.status == 200 && response.body.empty() &&
             !response.is_streaming()) {
@@ -647,6 +653,8 @@ public:
       response.version = request.version;
       response.keep_alive = request.keep_alive;
       co_await dispatch(request, response);
+      if (!runtime->on_loop_thread()) co_await detail::resume_on(runtime);
+      if (!connection->open()) break;
       if (request_count + 1 >= options.keep_alive_max_requests || stopping)
         response.keep_alive = false;
       const bool reusable = response.keep_alive && request.keep_alive;
@@ -748,9 +756,14 @@ public:
         else
           co_await workers->execute(
               [&entry, &request, &response] { entry.sync(request, response); });
-      } else if (!serve_static(request, response)) {
-        response.status = 404;
-        (error_handler ? error_handler : default_error_handler)(request, response);
+      } else {
+        bool served = false;
+        if (!mounts.empty())
+          co_await detail::run_file_io([&] { served = serve_static(request, response); });
+        if (!served) {
+          response.status = 404;
+          (error_handler ? error_handler : default_error_handler)(request, response);
+        }
       }
       if (post_routing) post_routing(request, response);
     } catch (...) {
@@ -774,52 +787,97 @@ public:
   Task<ErrorInfo> send_file(const std::shared_ptr<detail::Connection> &connection,
                             const Request &request, Response &response) {
     const auto &path = *ServerAccess::file(response);
-    std::error_code filesystem_error;
-    const auto size = std::filesystem::file_size(path, filesystem_error);
-    if (filesystem_error)
-      co_return ErrorInfo{Error::read, "Unable to stat static file"};
-    std::uint64_t first = 0;
-    std::uint64_t last = size == 0 ? 0 : size - 1;
-    if (request.headers.contains("Range")) {
-      auto range = parse_range(request.headers.get("Range"), size);
-      if (!range) {
-        response.status = 416;
-        response.headers.set("Content-Range", "bytes */" + std::to_string(size));
-        response.body.clear();
-        co_return co_await detail::write_response(connection, request, response,
-                                                   options.request_timeout);
+    std::ifstream input;
+    std::uint64_t size = 0;
+    bool opened = false;
+    co_await detail::run_file_io([&] {
+      input.open(path, std::ios::binary | std::ios::ate);
+      if (!input) return;
+      const auto end = input.tellg();
+      if (end < 0) { input.close(); return; }
+      size = static_cast<std::uint64_t>(end);
+      opened = true;
+    });
+    if (!opened) {
+      response.status = 500;
+      response.keep_alive = false;
+      response.set_content("Unable to open response file");
+      co_return co_await detail::write_response(connection, request, response,
+                                                options.request_timeout);
+    }
+    // Keep cleanup outside the transfer coroutine so every read/write failure
+    // closes the descriptor on the file pool before returning to the session.
+    auto transfer = [&]() -> Task<ErrorInfo> {
+      std::uint64_t first = 0;
+      std::uint64_t last = size == 0 ? 0 : size - 1;
+      const auto requested_range = request.headers.get("Range");
+      const auto validator = request.headers.get("If-Range");
+      // A missing/stale/weak validator must not splice bytes into an older
+      // representation. Date validators conservatively use the full response.
+      const bool validator_matches = !request.headers.contains("If-Range") ||
+          (validator.size() >= 2 && validator.front() == '"' && validator.back() == '"' &&
+           validator == response.headers.get("ETag"));
+      if (response.status == 200 && detail::iequals(request.method, "GET") &&
+          detail::iequals(std::string_view(requested_range).substr(0, 6), "bytes=") &&
+          validator_matches) {
+        auto range = parse_range(requested_range, size);
+        if (!range) {
+          response.status = 416;
+          response.headers.set("Content-Range", "bytes */" + std::to_string(size));
+          response.body.clear();
+          co_return co_await detail::write_response(connection, request, response,
+                                                     options.request_timeout);
+        }
+        first = range->first;
+        last = range->last;
+        response.status = 206;
+        response.headers.set("Content-Range",
+                             "bytes " + std::to_string(first) + "-" +
+                                 std::to_string(last) + "/" + std::to_string(size));
       }
-      first = range->first;
-      last = range->last;
-      response.status = 206;
-      response.headers.set("Content-Range",
-                           "bytes " + std::to_string(first) + "-" +
-                               std::to_string(last) + "/" + std::to_string(size));
+      const auto length = size == 0 ? 0 : last - first + 1;
+      auto error = co_await detail::write_response_head(
+          connection, request, response, false, length, options.request_timeout);
+      if (error || detail::iequals(request.method, "HEAD") || length == 0 ||
+          (response.status >= 100 && response.status < 200) ||
+          response.status == 204 || response.status == 205 || response.status == 304)
+        co_return error;
+      std::uint64_t remaining = length;
+      bool seek = true;
+      while (remaining > 0) {
+        if (!connection->open())
+          co_return ErrorInfo{Error::write, "File transfer connection closed"};
+        std::string chunk;
+        bool read_failed = false;
+        co_await detail::run_file_io([&] {
+          if (seek) {
+            input.seekg(static_cast<std::streamoff>(first));
+            seek = false;
+          }
+          chunk.resize(static_cast<std::size_t>(
+              std::min<std::uint64_t>(remaining, 64 * 1024)));
+          input.read(chunk.data(), static_cast<std::streamsize>(chunk.size()));
+          read_failed = input.bad() ||
+              input.gcount() != static_cast<std::streamsize>(chunk.size());
+        });
+        if (read_failed)
+          co_return ErrorInfo{Error::read, "Static file read was truncated"};
+        remaining -= chunk.size();
+        error = co_await connection->write(std::move(chunk), options.request_timeout);
+        if (error) co_return error;
+      }
+      co_return ErrorInfo{};
+    };
+    ErrorInfo error;
+    std::exception_ptr exception;
+    try {
+      error = co_await transfer();
+    } catch (...) {
+      exception = std::current_exception();
     }
-    const auto length = size == 0 ? 0 : last - first + 1;
-    auto error = co_await detail::write_response_head(
-        connection, request, response, false, length, options.request_timeout);
-    if (error || detail::iequals(request.method, "HEAD") || length == 0)
-      co_return error;
-    std::ifstream input(path, std::ios::binary);
-    if (!input) co_return ErrorInfo{Error::read, "Unable to open static file"};
-    input.seekg(static_cast<std::streamoff>(first));
-    std::array<char, 64 * 1024> buffer{};
-    std::uint64_t remaining = length;
-    while (remaining > 0) {
-      const auto count = static_cast<std::streamsize>(
-          std::min<std::uint64_t>(remaining, buffer.size()));
-      input.read(buffer.data(), count);
-      const auto received = input.gcount();
-      if (received <= 0)
-        co_return ErrorInfo{Error::read, "Static file read was truncated"};
-      error = co_await connection->write(
-          std::string(buffer.data(), static_cast<std::size_t>(received)),
-          options.request_timeout);
-      if (error) co_return error;
-      remaining -= static_cast<std::uint64_t>(received);
-    }
-    co_return ErrorInfo{};
+    co_await detail::run_file_io([&] { input.close(); });
+    if (exception) std::rethrow_exception(exception);
+    co_return error;
   }
 
   Task<ErrorInfo> send_response(
@@ -859,15 +917,22 @@ public:
     if (options.auto_compress_response &&
         response.body.size() >= options.compression_threshold &&
         !response.headers.contains("Content-Encoding") &&
-        !detail::iequals(request.method, "HEAD")) {
+        !detail::iequals(request.method, "HEAD") &&
+        !(response.status >= 100 && response.status < 200) &&
+        response.status != 204 && response.status != 205 && response.status != 304) {
       const auto encoding =
           detail::select_encoding(request.headers.get("Accept-Encoding"));
       if (!encoding.empty()) {
-        auto compressed = detail::compress(response.body, encoding);
+        Result<std::string> compressed{ErrorInfo{Error::internal, "Compression pending"}};
+        co_await workers->execute([&] {
+          compressed = detail::compress(response.body, encoding);
+        });
         if (compressed) {
           response.body = std::move(*compressed);
           response.headers.set("Content-Encoding", encoding);
-          response.headers.set("Vary", "Accept-Encoding");
+          if (!detail::has_token(response.headers, "Vary", "Accept-Encoding") &&
+              !detail::has_token(response.headers, "Vary", "*"))
+            response.headers.add("Vary", "Accept-Encoding");
         }
       }
     }
