@@ -90,6 +90,19 @@ private:
   std::size_t offset_{0};
 };
 
+class StreamError final : public std::runtime_error {
+public:
+  explicit StreamError(ErrorInfo error)
+      : std::runtime_error(error.message), error_(std::move(error)) {}
+  [[nodiscard]] const ErrorInfo &error() const noexcept { return error_; }
+  [[nodiscard]] const char *what() const noexcept override {
+    return error_.message.c_str();
+  }
+
+private:
+  ErrorInfo error_;
+};
+
 struct ParsedUrl {
   std::string scheme;
   std::string host;
@@ -309,7 +322,7 @@ struct HttpReadOptions {
   std::function<bool(const ResponseHead &)> on_response_head;
   std::function<bool(std::string_view)> on_data;
   std::function<Task<bool>(std::string_view)> on_data_async;
-  std::function<bool(std::uint64_t, std::uint64_t)> on_progress;
+  ProgressHandler on_progress;
 };
 
 struct RequestBodyState {
@@ -342,15 +355,16 @@ Task<ResponseResult> read_response(
 Task<ErrorInfo> write_request(const std::shared_ptr<Connection> &connection,
                               const Request &request,
                               std::string_view wire_target,
-                              std::chrono::milliseconds timeout);
+                              std::chrono::milliseconds timeout,
+                              ProgressHandler on_upload_progress = {});
 Task<ErrorInfo> write_response(const std::shared_ptr<Connection> &connection,
                                const Request &request, const Response &response,
                                std::chrono::milliseconds timeout);
-Task<ErrorInfo> write_response_head(
-    const std::shared_ptr<Connection> &connection, const Request &request,
-    const Response &response, bool chunked,
-    std::optional<std::uint64_t> content_length,
-    std::chrono::milliseconds timeout);
+Task<ErrorInfo>
+write_response_head(const std::shared_ptr<Connection> &connection,
+                    const Request &request, const Response &response,
+                    bool chunked, std::optional<std::uint64_t> content_length,
+                    std::chrono::milliseconds timeout);
 Task<ErrorInfo> write_chunk(const std::shared_ptr<Connection> &connection,
                             std::string_view data,
                             std::chrono::milliseconds timeout);

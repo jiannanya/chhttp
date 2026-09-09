@@ -575,9 +575,123 @@ std::string status_reason(int status) {
   }
 }
 
+Result<ContentRange> parse_content_range(std::string_view value) {
+  const auto trim_ows = [](std::string_view text) {
+    while (!text.empty() && (text.front() == ' ' || text.front() == '\t'))
+      text.remove_prefix(1);
+    while (!text.empty() && (text.back() == ' ' || text.back() == '\t'))
+      text.remove_suffix(1);
+    return text;
+  };
+  const auto parse_number = [](std::string_view text, std::uint64_t &number) {
+    if (text.empty())
+      return false;
+    const auto parsed =
+        std::from_chars(text.data(), text.data() + text.size(), number);
+    return parsed.ec == std::errc{} && parsed.ptr == text.data() + text.size();
+  };
+
+  value = trim_ows(value);
+  const auto space = value.find(' ');
+  if (space == std::string_view::npos || space == 0)
+    return ErrorInfo{Error::protocol, "Malformed Content-Range"};
+  const auto unit = value.substr(0, space);
+  if (!detail::valid_header_name(unit))
+    return ErrorInfo{Error::protocol, "Invalid Content-Range unit"};
+  auto range = value.substr(space + 1);
+  if (range.empty() || range.front() == ' ' || range.front() == '\t' ||
+      range.find_first_of(" \t") != std::string_view::npos)
+    return ErrorInfo{Error::protocol, "Invalid Content-Range whitespace"};
+  const auto slash = range.find('/');
+  if (slash == std::string_view::npos || slash == 0 ||
+      range.find('/', slash + 1) != std::string_view::npos)
+    return ErrorInfo{Error::protocol, "Malformed Content-Range bounds"};
+
+  ContentRange result;
+  result.unit = std::string(unit);
+  const auto bounds = range.substr(0, slash);
+  const auto total_text = range.substr(slash + 1);
+  if (total_text.empty())
+    return ErrorInfo{Error::protocol, "Content-Range total is empty"};
+  if (total_text != "*") {
+    std::uint64_t total = 0;
+    if (!parse_number(total_text, total))
+      return ErrorInfo{Error::protocol, "Invalid Content-Range total"};
+    result.total = total;
+  }
+
+  if (bounds == "*") {
+    if (!result.total)
+      return ErrorInfo{Error::protocol,
+                       "Unsatisfied Content-Range requires a total"};
+    return result;
+  }
+  const auto dash = bounds.find('-');
+  if (dash == std::string_view::npos || dash == 0 ||
+      dash + 1 == bounds.size() ||
+      bounds.find('-', dash + 1) != std::string_view::npos)
+    return ErrorInfo{Error::protocol, "Malformed Content-Range interval"};
+  std::uint64_t first = 0;
+  std::uint64_t last = 0;
+  if (!parse_number(bounds.substr(0, dash), first) ||
+      !parse_number(bounds.substr(dash + 1), last))
+    return ErrorInfo{Error::protocol, "Invalid Content-Range interval"};
+  if (first > last)
+    return ErrorInfo{Error::protocol, "Content-Range begins after it ends"};
+  if (result.total && last >= *result.total)
+    return ErrorInfo{Error::protocol, "Content-Range exceeds its total"};
+  result.first = first;
+  result.last = last;
+  return result;
+}
+
+Result<std::string> format_byte_range(std::uint64_t first,
+                                      std::optional<std::uint64_t> last) {
+  if (last && first > *last)
+    return ErrorInfo{Error::invalid_argument,
+                     "Byte range begins after it ends"};
+  return "bytes=" + std::to_string(first) + "-" +
+         (last ? std::to_string(*last) : std::string{});
+}
+
+Result<std::string> format_content_range(std::uint64_t first,
+                                         std::uint64_t last,
+                                         std::optional<std::uint64_t> total) {
+  if (first > last)
+    return ErrorInfo{Error::invalid_argument,
+                     "Content range begins after it ends"};
+  if (total && last >= *total)
+    return ErrorInfo{Error::invalid_argument,
+                     "Content range exceeds its total"};
+  return "bytes " + std::to_string(first) + "-" + std::to_string(last) + "/" +
+         (total ? std::to_string(*total) : std::string{"*"});
+}
+
+Result<void> set_byte_range(Headers &headers, std::uint64_t first,
+                            std::optional<std::uint64_t> last,
+                            std::string_view if_range) {
+  auto range = format_byte_range(first, last);
+  if (!range)
+    return range.error();
+  if (!if_range.empty()) {
+    if (!detail::valid_header_value(if_range))
+      return ErrorInfo{Error::invalid_argument,
+                       "If-Range contains invalid characters"};
+    if (if_range.starts_with("W/") || if_range.starts_with("w/"))
+      return ErrorInfo{Error::invalid_argument,
+                       "If-Range requires a strong entity tag or HTTP date"};
+  }
+  headers.set("Range", std::move(*range));
+  if (!if_range.empty())
+    headers.set("If-Range", std::string(if_range));
+  else
+    headers.erase("If-Range");
+  return {};
+}
+
 std::string basic_auth(std::string_view username, std::string_view password) {
   return "Basic " + detail::base64_encode(std::string(username) + ":" +
-                                           std::string(password));
+                                          std::string(password));
 }
 
 std::string bearer_auth(std::string_view token) {
