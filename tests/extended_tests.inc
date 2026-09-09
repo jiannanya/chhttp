@@ -105,12 +105,21 @@ TEST(request_trailers_cannot_inject_control_or_authentication_fields) {
   CHECK(server.start("127.0.0.1", 0));
   for (std::string_view field : {"Authorization", "cOoKiE", "Host", "Connection", "Content-Type",
                                  "Content-Encoding", "Transfer-Encoding", "Content-Length", "Range", "If-Range"}) {
-    const auto response = raw_http_exchange(server.port(),
+    const auto request =
         "POST / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
-        "1\r\nx\r\n0\r\n" + std::string(field) + ": injected\r\n\r\n", 3);
+        "1\r\nx\r\n0\r\n" + std::string(field) + ": injected\r\n\r\n";
+    const auto response = raw_http_exchange(server.port(), request);
     CHECK(response.starts_with("HTTP/1.1 400"));
+    const auto fragmented = raw_http_exchange(server.port(), request, 3);
+    // Rejection can close the socket before the final CRLF arrives. A TCP
+    // reset may discard the error response; it must never dispatch the route.
+    CHECK(fragmented.empty() || fragmented.starts_with("HTTP/1.1 400"));
+    CHECK(accepted == 0);
   }
   CHECK(accepted == 0);
+  chhttp::Client client("http://127.0.0.1:" + std::to_string(server.port()));
+  auto recovered = client.post("/", "healthy", "text/plain");
+  CHECK(recovered && recovered->body == "ok" && accepted == 1);
 }
 
 TEST(response_trailers_cannot_change_redirect_cookie_or_encoding_semantics) {

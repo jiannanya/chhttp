@@ -35,6 +35,9 @@ no third-party HTTP, WebSocket or URL library is used.
   consumers with backpressure, progress and exact per-request cancellation
 - Fixed-length and HTTP/1.1 chunked request-body producers with awaited
   transport backpressure, avoiding complete upload buffers in the client
+- File-slice request bodies, independent upload/download progress, transfer
+  failure context, strict Content-Range helpers and ordered asynchronous file
+  sinks for application-managed resumable transfers
 - Server request-body stream routes with per-route size/deadline/idle limits,
   awaited consumer backpressure, active cancellation and temporary-file spooling
 - Public incremental WHATWG SSE parser plus GET/POST/arbitrary-method SSE
@@ -42,7 +45,8 @@ no third-party HTTP, WebSocket or URL library is used.
 - RFC 6455 WebSocket client/server, text/binary messages, ping, close and
   subprotocol negotiation; connections remain asynchronous at scale
 - Buffered and incremental `multipart/form-data` parsing plus a high-level
-  field/file/custom-stream writer with automatic fixed-length or chunked framing
+  field/file/file-slice/custom-stream writer with automatic fixed-length or
+  chunked framing
 - Incremental Base64 and streamed JSON-string production for vision/audio model
   inputs without constructing the encoded payload in memory
 - Incremental gzip, deflate, Brotli and Zstandard response decoding, including
@@ -94,15 +98,20 @@ ctest --test-dir build -L property --output-on-failure
 ctest --test-dir build -L stress --repeat until-fail:30 --output-on-failure
 ```
 
-Running `chhttp_tests` without an argument executes all 215 registered groups:
-176 functional/boundary groups, 30 load/lifecycle groups, and 9 randomized
+Running `chhttp_tests` without an argument executes all 229 registered groups:
+188 functional/boundary groups, 32 load/lifecycle groups, and 9 randomized
 property groups (with TLS and compression enabled). The stress
 group covers concurrent sync/async HTTP, thousands of keep-alive requests,
 large buffered and streamed uploads (including bounded-memory 100 MiB and
 concurrent 10 MiB cases), streamed callbacks, connection recycling, independent
 and global cancellation, client/server churn, parallel servers, graceful
 draining, SSE fan-out, WebSocket connection/message load, malformed-request
-floods, concurrent file spooling/download cancellation and HTTPS/TLS handshake concurrency.
+floods, concurrent file spooling/download cancellation, file-slice uploads,
+ordered file-sink writes and HTTPS/TLS handshake concurrency. Integration
+regressions check bounded buffered uploads with progress/cancellation, file
+producer loop affinity, and file-sink completion during runtime shutdown.
+Request and callback ownership is also checked after the caller's scope ends
+and across repeated redirects.
 
 Randomized tests cover URL/query and Base64 binary round trips, an ordered
 header reference model, receive-buffer moves, SSE and multipart fragmentation,
@@ -257,7 +266,7 @@ auto response = co_await client.get("/stream", {}, {
     consume(bytes);
     return true;
   },
-  .on_progress = [](std::uint64_t now, std::uint64_t total) {
+  .on_download_progress = [](const chhttp::TransferProgress& progress) {
     return true;
   }
 });
@@ -311,6 +320,64 @@ upload.set_stream_body([](chhttp::StreamWriter& writer)
 });
 auto response = co_await client.request(std::move(upload));
 ```
+
+## Application-managed resumable transfers
+
+`chhttp` exposes the stateless building blocks for resume logic. It does not
+store checkpoints, infer a server-committed upload offset, retry side-effecting
+requests, or implement provider-specific upload sessions.
+
+Send an exact interval from a file without buffering it:
+
+```cpp
+chhttp::Request part;
+part.method = "PUT";
+part.target = "/uploads/session/chunk";
+part.headers.set("Content-Range", "bytes 8388608-12582911/67108864");
+auto configured = part.set_file_body(
+    source, {.offset = 8388608, .length = 4 * 1024 * 1024});
+if (!configured) co_return configured.error();
+
+auto response = co_await client.request(std::move(part), {
+  .on_upload_progress = [](const chhttp::TransferProgress& progress) {
+    update_upload_ui(progress.transferred, progress.total);
+    return true;
+  }
+});
+```
+
+Compose validated Range responses with an asynchronous file sink:
+
+```cpp
+auto sink_result = chhttp::AsyncFileSink::open(
+    partial_path, {.mode = chhttp::FileSinkMode::append});
+if (!sink_result) co_return sink_result.error();
+auto sink = std::move(*sink_result);
+
+chhttp::Headers headers;
+auto ranged = chhttp::set_byte_range(headers, durable_size,
+                                     std::nullopt, saved_etag);
+if (!ranged) co_return ranged.error();
+headers.set("Accept-Encoding", "identity");
+
+auto response = co_await client.get(target, std::move(headers), {
+  .on_response_head = [&](const chhttp::ResponseHead& head) {
+    auto range = chhttp::parse_content_range(
+        head.headers.get("Content-Range"));
+    return head.status == 206 && range && range->unit == "bytes" &&
+           range->first == durable_size;
+  },
+  .on_data_async = [&](std::string_view bytes) -> chhttp::Task<bool> {
+    co_return !(co_await sink.write(bytes));
+  },
+  .auto_decompress = false
+});
+```
+
+After a failure, `ErrorInfo::transfer` identifies the phase, uploaded and
+downloaded payload counts, and whether a final response head was received.
+These counters are observability data—not proof that the server durably
+accepted the same upload offset.
 
 ## Server request-body streaming
 
@@ -486,8 +553,9 @@ at 64 KiB, each client origin at 64 total connections and keep-alive sessions
 at 1000 requests. A stream route can raise or lower its body limit independently
 without allocating that amount. Streaming callbacks avoid a second body allocation.
 Decoded gzip/deflate/Brotli/Zstd callbacks receive at most 32 KiB at a time and
-awaited consumers finish before the decoder produces the next block. Concatenated
-gzip members and Zstd frames are supported. Buffered HTTP bodies and large
+awaited consumers finish before the decoder produces the next block.
+Synchronous decoded consumers avoid a coroutine allocation per output block.
+Concatenated gzip members and Zstd frames are supported. Buffered HTTP bodies and large
 WebSocket writes use transport copies of at most 64 KiB; the caller's buffered
 body still occupies its original memory. TLS output is flushed after bounded
 plaintext writes. Network allocation callbacks share a 64 KiB scratch buffer per
@@ -496,6 +564,9 @@ event loop with an owned fallback for overlapping reads.
 Connection-pool waits are signalled by lease release, cancellation or deadline.
 Active cancellation registrations are inserted and removed directly without
 scanning the entire pending-request list or retaining expired entries.
+Requests waiting for a saturated origin defer allocation of the full exchange
+coroutine frame until a connection becomes available. They use the same pool
+wakeups, stop tokens and deadlines as connection acquisition.
 The legacy shared atomic cancellation flag still requires polling while queued;
 `stop_token` does not. Async body consumers may resume on another executor;
 protocol processing returns to the owning I/O loop before continuing.
@@ -512,6 +583,12 @@ worker pool when called from an I/O loop; standalone body streams use a bounded
 fallback pool. Awaited file operations preserve body backpressure and resume on
 the originating loop. Pending filesystem calls finish before runtime shutdown
 completes; slow filesystem calls can extend shutdown beyond the HTTP grace period.
+`AsyncFileSink` serializes writes on its bounded disk pool and resumes callers
+on their originating I/O loop, including during shutdown. Completed writes
+release their owned input buffer before notifying callers. Its `open()` and
+file-slice metadata validation are synchronous; prepare them outside I/O callbacks.
+Buffered uploads larger than 64 KiB report progress after each bounded write,
+so callback cancellation stops the remaining upload and retains partial counts.
 File responses open the file before sending a success header, suppress body
 bytes for HEAD/204/205/304, and apply Range only to otherwise successful GETs.
 HEAD with Range now returns the full representation's length and status 200.
