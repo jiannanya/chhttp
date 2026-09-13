@@ -89,7 +89,7 @@ std::string Request::get_param(std::string_view name,
 void Request::set_stream_body(
     StreamHandler handler,
     std::optional<std::uint64_t> content_length) {
-  body.clear();
+  std::string{}.swap(body);
   body_stream = std::move(handler);
   body_stream_length = content_length;
 }
@@ -153,14 +153,14 @@ void Response::set_redirect(std::string location, int redirect_status) {
 void Response::set_file(std::filesystem::path path,
                         std::string_view content_type) {
   file_path_ = std::move(path);
-  body.clear();
+  std::string{}.swap(body);
   stream_handler_ = {};
   headers.set("Content-Type", content_type.empty() ? mime_type(*file_path_)
                                                    : std::string(content_type));
 }
 
 void Response::set_stream(std::string content_type, StreamHandler handler) {
-  body.clear();
+  std::string{}.swap(body);
   file_path_.reset();
   stream_handler_ = std::move(handler);
   headers.set("Content-Type", std::move(content_type));

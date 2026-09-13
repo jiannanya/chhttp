@@ -5782,6 +5782,7 @@ TEST(stress_concurrent_file_upload_download_and_cancellation) {
 #include "merge_tests.inc"
 #include "extended_tests.inc"
 #include "randomized_tests.inc"
+#include "resource_tests.inc"
 
 } // namespace
 
