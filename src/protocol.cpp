@@ -226,23 +226,24 @@ private:
 #endif
 };
 
-Result<std::vector<std::string>> framing_values(std::string_view input,
-                                                std::string_view field) {
-  std::vector<std::string> values;
-  std::size_t start = 0;
-  while (start <= input.size()) {
-    const auto end = input.find(',', start);
-    auto value = trim(input.substr(start, end == std::string_view::npos
-                                             ? std::string_view::npos
-                                             : end - start));
+template <class Consumer>
+ErrorInfo visit_framing_values(std::string_view input, std::string_view field,
+                               const Consumer &consume) {
+  for (;;) {
+    const auto end = input.find(',');
+    auto value = input.substr(0, end);
+    while (!value.empty() && (value.front() == ' ' || value.front() == '\t'))
+      value.remove_prefix(1);
+    while (!value.empty() && (value.back() == ' ' || value.back() == '\t'))
+      value.remove_suffix(1);
     if (value.empty())
       return ErrorInfo{Error::protocol,
                        "Empty value in " + std::string(field)};
-    values.push_back(std::move(value));
+    if (auto error = consume(value); error) return error;
     if (end == std::string_view::npos) break;
-    start = end + 1;
+    input.remove_prefix(end + 1);
   }
-  return values;
+  return {};
 }
 
 Task<Result<std::string>> read_head_bytes(
@@ -307,10 +308,10 @@ Result<ParsedHead> parse_head(std::string_view input) {
   }
 
   std::optional<std::uint64_t> content_length;
-  for (const auto &line : result.headers.get_all("Content-Length")) {
-    auto values = framing_values(line, "Content-Length");
-    if (!values) return values.error();
-    for (const auto &value : *values) {
+  for (const auto &[name, line] : result.headers) {
+    if (!iequals(name, "Content-Length")) continue;
+    auto error = visit_framing_values(line, "Content-Length",
+                                      [&](std::string_view value) -> ErrorInfo {
       std::uint64_t parsed = 0;
       const auto conversion =
           std::from_chars(value.data(), value.data() + value.size(), parsed);
@@ -319,30 +320,36 @@ Result<ParsedHead> parse_head(std::string_view input) {
       if (content_length && *content_length != parsed)
         return ErrorInfo{Error::protocol, "Conflicting Content-Length headers"};
       content_length = parsed;
-    }
+      return {};
+    });
+    if (error) return error;
   }
   result.content_length = content_length;
 
-  std::vector<std::string> transfer_codings;
-  for (const auto &line : result.headers.get_all("Transfer-Encoding")) {
-    auto codings = framing_values(line, "Transfer-Encoding");
-    if (!codings) return codings.error();
-    for (auto coding : *codings) {
+  std::size_t transfer_codings = 0;
+  bool final_chunked = false;
+  for (const auto &[name, line] : result.headers) {
+    if (!iequals(name, "Transfer-Encoding")) continue;
+    auto error = visit_framing_values(line, "Transfer-Encoding",
+                                      [&](std::string_view coding) -> ErrorInfo {
       const auto semicolon = coding.find(';');
       if (semicolon != std::string::npos)
         return ErrorInfo{Error::protocol,
                          "Transfer-Encoding parameters are not supported"};
-      transfer_codings.push_back(lower(trim(coding)));
-    }
+      ++transfer_codings;
+      final_chunked = iequals(coding, "chunked");
+      return {};
+    });
+    if (error) return error;
   }
-  if (!transfer_codings.empty()) {
+  if (transfer_codings != 0) {
     if (content_length)
       return ErrorInfo{Error::protocol,
                        "Transfer-Encoding with Content-Length is rejected"};
-    if (transfer_codings.back() != "chunked")
+    if (!final_chunked)
       return ErrorInfo{Error::protocol,
                        "Final HTTP transfer coding is not chunked"};
-    if (transfer_codings.size() != 1)
+    if (transfer_codings != 1)
       return ErrorInfo{Error::protocol, "Unsupported HTTP transfer coding"};
     result.chunked = true;
   }
@@ -972,15 +979,19 @@ read_request_head(const std::shared_ptr<Connection> &connection,
   if (!parse_version(std::string_view(head->start_line).substr(last_space + 1),
                      request.version))
     co_return ErrorInfo{Error::protocol, "Unsupported HTTP version"};
-  if (request.version == 11 && head->headers.get_all("Host").size() != 1)
-    co_return ErrorInfo{Error::protocol,
-                        "HTTP/1.1 request must have exactly one Host header"};
-  if (request.version == 11 &&
-      (trim(head->headers.get("Host")).empty() ||
-       head->headers.get("Host").find(',') != std::string::npos))
-    co_return ErrorInfo{Error::protocol, "Invalid HTTP Host header"};
-  request.headers = head->headers;
-  request.keep_alive = keep_alive(request.version, request.headers);
+  if (request.version == 11) {
+    std::size_t hosts = 0;
+    for (const auto &[name, value] : head->headers) {
+      if (!iequals(name, "Host")) continue;
+      ++hosts;
+      if (value.empty() || value.find(',') != std::string::npos)
+        co_return ErrorInfo{Error::protocol, "Invalid HTTP Host header"};
+    }
+    if (hosts != 1)
+      co_return ErrorInfo{Error::protocol,
+                          "HTTP/1.1 request must have exactly one Host header"};
+  }
+  request.keep_alive = keep_alive(request.version, head->headers);
   std::string routing_target = request.target;
   if (!routing_target.starts_with('/') && routing_target.find("://") != std::string::npos) {
     auto absolute = parse_url(routing_target);
@@ -1144,8 +1155,7 @@ Task<ResponseResult> read_response(
         conversion.ptr != status_text.data() + status_text.size() ||
         response.status < 100)
       co_return ErrorInfo{Error::protocol, "Invalid HTTP response status"};
-    response.headers = head->headers;
-    response.keep_alive = keep_alive(response.version, response.headers);
+    response.keep_alive = keep_alive(response.version, head->headers);
     const bool no_body = iequals(request_method, "HEAD") ||
                          (iequals(request_method, "CONNECT") &&
                           response.status >= 200 && response.status < 300) ||
@@ -1159,7 +1169,7 @@ Task<ResponseResult> read_response(
         if (!options.on_response_head(ResponseHead{
                 .status = response.status,
                 .version = response.version,
-                .headers = response.headers,
+                .headers = head->headers,
                 .keep_alive = response.keep_alive}))
           co_return ErrorInfo{Error::cancelled,
                               "HTTP response head callback rejected the response"};
@@ -1176,7 +1186,7 @@ Task<ResponseResult> read_response(
       }
     }
     HttpReadOptions body_options = options;
-    const auto encoding = response.headers.get("Content-Encoding");
+    const auto encoding = head->headers.get("Content-Encoding");
     const bool decode = !no_body && options.auto_decompress && !encoding.empty() &&
                         !iequals(encoding, "identity");
     std::unique_ptr<StreamingDecoder> decoder;

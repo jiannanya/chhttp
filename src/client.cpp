@@ -271,6 +271,10 @@ public:
     return cancelled_.load(std::memory_order_acquire);
   }
 
+  // Only the I/O loop accesses this notification. It is cleared when a slot
+  // is acquired, or handed on when the request exits without acquiring one.
+  std::string notified_origin;
+
 private:
   mutable std::mutex mutex_;
   std::weak_ptr<detail::Connection> connection_;
@@ -312,12 +316,18 @@ public:
     bool reused{false};
   };
 
+  struct PoolWaiter;
+  using PoolQueue = std::list<std::shared_ptr<PoolWaiter>>;
+
   struct PoolWaiter {
     uv_timer_t timer{};
     std::shared_ptr<PoolWaiter> self_keep;
     std::coroutine_handle<> continuation;
     bool completed{false};
     bool notified{false};
+    bool queued{false};
+    bool slot_notified{false};
+    PoolQueue::iterator position;
     ErrorInfo error;
 
     void notify() {
@@ -357,7 +367,10 @@ public:
       }
       waiter->timer.data = waiter.get();
       waiter->self_keep = waiter;
-      owner->pool_waiters[key].push_back(waiter);
+      auto &queue = owner->pool_waiters[key];
+      waiter->position = queue.insert(queue.end(), waiter);
+      waiter->queued = true;
+      control->notified_origin.clear();
       if (options.deadline || options.cancellation) {
         const auto delay = options.cancellation ? 1ms : std::max(1ms,
             std::chrono::ceil<std::chrono::milliseconds>(
@@ -376,11 +389,13 @@ public:
 
     ErrorInfo await_resume() {
       control->set_wakeup({});
-      const auto found = owner->pool_waiters.find(key);
-      if (found != owner->pool_waiters.end()) {
-        std::erase(found->second, waiter);
+      if (waiter->queued) {
+        const auto found = owner->pool_waiters.find(key);
+        found->second.erase(waiter->position);
+        waiter->queued = false;
         if (found->second.empty()) owner->pool_waiters.erase(found);
       }
+      if (waiter->slot_notified) control->notified_origin = key;
       return std::move(waiter->error);
     }
   };
@@ -391,7 +406,9 @@ public:
     while (!found->second.empty()) {
       auto waiter = std::move(found->second.front());
       found->second.pop_front();
-      if (!waiter->completed) {
+      waiter->queued = false;
+      if (!waiter->completed && !waiter->notified) {
+        waiter->slot_notified = true;
         waiter->notify();
         break;
       }
@@ -461,6 +478,7 @@ public:
           entries.pop_back();
           if (lease.connection && lease.connection->open()) {
             lease.reused = true;
+            control->notified_origin.clear();
             active.push_back(lease.connection);
             control->bind(lease.connection);
             co_return lease;
@@ -472,6 +490,7 @@ public:
         if (options.max_connections_per_origin == 0 ||
             count < options.max_connections_per_origin) {
           ++count;
+          control->notified_origin.clear();
           break;
         }
       }
@@ -883,9 +902,16 @@ public:
     struct Registration {
       Impl *owner;
       ControlIterator position;
+      RequestControl *control;
       ~Registration() {
-        std::lock_guard lock(owner->mutex);
-        owner->controls.erase(position);
+        {
+          std::lock_guard lock(owner->mutex);
+          owner->controls.erase(position);
+        }
+        // Cancellation/deadline can race any check between wakeup and slot
+        // acquisition. Keep notification ownership until acquisition or exit.
+        if (!control->notified_origin.empty())
+          owner->wake_pool_waiter(control->notified_origin);
       }
     };
     ControlIterator position;
@@ -895,7 +921,7 @@ public:
     }
     // Remove exactly this request on success, cancellation, validation error,
     // or exception; registering a burst no longer scans every live request.
-    Registration registration{this, position};
+    Registration registration{this, position, control.get()};
     std::stop_callback stop_callback(
         request_options.stop_token, [control] { control->cancel(); });
     if (request_options.cancellation && *request_options.cancellation)
@@ -967,7 +993,7 @@ public:
   std::unordered_map<std::string, std::vector<Lease>> pool;
   std::unordered_map<std::string, std::size_t> connection_counts;
   // Accessed exclusively from the libuv loop.
-  std::unordered_map<std::string, std::deque<std::shared_ptr<PoolWaiter>>> pool_waiters;
+  std::unordered_map<std::string, PoolQueue> pool_waiters;
   std::vector<std::shared_ptr<detail::Connection>> active;
   std::list<std::shared_ptr<RequestControl>> controls;
 #ifdef CHHTTP_HAS_TLS
