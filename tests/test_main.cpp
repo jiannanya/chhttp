@@ -5379,6 +5379,20 @@ TEST(large_tls_buffered_and_streamed_bodies_preserve_integrity) {
 }
 #endif
 
+// Verifies that a host name resolving to several addresses falls back to a
+// later candidate instead of failing on the first unreachable one. libuv binds a
+// socket to a single address family, so this also exercises rebuilding the
+// transport for the remaining family.
+TEST(connect_falls_back_to_a_reachable_resolved_address) {
+  chhttp::Server server;
+  server.get("/", [](const auto &, auto &response) { response.body = "ipv6"; });
+  if (!server.start("::1", 0)) return; // No IPv6 loopback in this environment.
+  chhttp::Client client("http://localhost:" + std::to_string(server.port()));
+  auto response = client.get("/");
+  CHECK(response && response->body == "ipv6");
+  server.stop();
+}
+
 TEST(multipart_boundaries_preserve_payload_at_every_split_position) {
   const std::string payload = "left\r\n--bX\r\n--b-?\r\nright";
   const std::string wire = "junk\r\n--bX--b\r\nignored\r\n--b\r\n"

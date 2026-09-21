@@ -2,28 +2,75 @@
   "version": 6,
   "configurePresets": [
     {
-      "name": "windows-msvc",
-      "displayName": "Windows MSVC (vcpkg)",
+      "name": "base",
+      "hidden": true,
       "generator": "Ninja",
-      "binaryDir": "${sourceDir}/build-msvc",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "RelWithDebInfo",
         "CMAKE_CXX_STANDARD": "20",
+        "CHHTTP_BUILD_TESTS": "ON",
+        "CHHTTP_BUILD_EXAMPLES": "ON"
+      }
+    },
+    {
+      "name": "release",
+      "displayName": "Release (system dependencies)",
+      "inherits": "base",
+      "binaryDir": "${sourceDir}/build-release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    },
+    {
+      "name": "macos",
+      "displayName": "macOS (Homebrew dependencies)",
+      "inherits": "release",
+      "binaryDir": "${sourceDir}/build",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Darwin"
+      },
+      "cacheVariables": {
+        "CMAKE_PREFIX_PATH": "/opt/homebrew;/usr/local"
+      }
+    },
+    {
+      "name": "linux",
+      "displayName": "Linux (system dependencies)",
+      "inherits": "release",
+      "binaryDir": "${sourceDir}/build",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Linux"
+      }
+    },
+    {
+      "name": "vcpkg",
+      "displayName": "vcpkg toolchain (any host)",
+      "inherits": "base",
+      "binaryDir": "${sourceDir}/build",
+      "cacheVariables": {
+        "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake"
+      }
+    },
+    {
+      "name": "windows-msvc",
+      "displayName": "Windows MSVC (vcpkg)",
+      "inherits": "vcpkg",
+      "binaryDir": "${sourceDir}/build-msvc",
+      "cacheVariables": {
         "CMAKE_CXX_COMPILER": "cl.exe",
-        "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
         "VCPKG_TARGET_TRIPLET": "x64-windows"
       }
     },
     {
       "name": "windows-clang",
       "displayName": "Windows Clang (MSVC ABI, vcpkg)",
-      "generator": "Ninja",
-      "binaryDir": "${sourceDir}/build",
+      "inherits": "vcpkg",
       "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
-        "CMAKE_CXX_STANDARD": "20",
         "CMAKE_CXX_COMPILER": "clang++.exe",
-        "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
         "VCPKG_TARGET_TRIPLET": "x64-windows"
       }
     },
@@ -33,18 +80,60 @@
       "inherits": "windows-clang",
       "binaryDir": "${sourceDir}/build-asan",
       "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
         "CMAKE_CXX_FLAGS": "-fsanitize=address -shared-libasan",
         "CMAKE_CXX_FLAGS_RELWITHDEBINFO": "-O1 -g -DNDEBUG"
+      }
+    },
+    {
+      "name": "asan",
+      "displayName": "AddressSanitizer and UndefinedBehaviorSanitizer",
+      "inherits": "base",
+      "binaryDir": "${sourceDir}/build-asan",
+      "cacheVariables": {
+        "CHHTTP_BUILD_EXAMPLES": "OFF",
+        "CMAKE_CXX_FLAGS": "-fsanitize=address,undefined -fno-omit-frame-pointer",
+        "CMAKE_EXE_LINKER_FLAGS": "-fsanitize=address,undefined",
+        "CMAKE_CXX_FLAGS_RELWITHDEBINFO": "-O1 -g -DNDEBUG"
+      }
+    },
+    {
+      "name": "lto",
+      "displayName": "Release with link-time optimization",
+      "inherits": "release",
+      "binaryDir": "${sourceDir}/build-lto",
+      "cacheVariables": {
+        "CHHTTP_ENABLE_LTO": "ON",
+        "CHHTTP_BUILD_BENCHMARKS": "ON"
       }
     }
   ],
   "buildPresets": [
+    { "name": "release", "configurePreset": "release" },
+    { "name": "macos", "configurePreset": "macos" },
+    { "name": "linux", "configurePreset": "linux" },
+    { "name": "vcpkg", "configurePreset": "vcpkg" },
     { "name": "windows-msvc", "configurePreset": "windows-msvc" },
     { "name": "windows-clang", "configurePreset": "windows-clang" },
-    { "name": "windows-clang-asan", "configurePreset": "windows-clang-asan" }
+    { "name": "windows-clang-asan", "configurePreset": "windows-clang-asan" },
+    { "name": "asan", "configurePreset": "asan" },
+    { "name": "lto", "configurePreset": "lto" }
   ],
   "testPresets": [
+    {
+      "name": "release",
+      "configurePreset": "release",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "macos",
+      "configurePreset": "macos",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "linux",
+      "configurePreset": "linux",
+      "output": { "outputOnFailure": true }
+    },
     {
       "name": "windows-msvc",
       "configurePreset": "windows-msvc",
@@ -58,6 +147,11 @@
     {
       "name": "windows-clang-asan",
       "configurePreset": "windows-clang-asan",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "asan",
+      "configurePreset": "asan",
       "output": { "outputOnFailure": true }
     }
   ]

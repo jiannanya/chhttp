@@ -40,6 +40,8 @@ bool Headers::erase(std::string_view name) {
   return values_.size() != old_size;
 }
 
+void Headers::reserve(std::size_t count) { values_.reserve(count); }
+
 bool Headers::contains(std::string_view name) const {
   return std::ranges::any_of(values_, [&](const value_type &item) {
     return detail::iequals(item.first, name);
@@ -489,7 +491,9 @@ make_multipart(const MultipartForm &parts, std::string boundary) {
 }
 
 std::string mime_type(const std::filesystem::path &path) {
-  static const std::unordered_map<std::string, std::string> types{
+  // Lower-cased extension keys are short, so the lookup runs entirely on a stack
+  // buffer and never allocates for the common static-file response.
+  static const std::unordered_map<std::string_view, std::string_view> types{
       {".html", "text/html; charset=utf-8"}, {".htm", "text/html; charset=utf-8"},
       {".css", "text/css; charset=utf-8"},   {".js", "text/javascript; charset=utf-8"},
       {".json", "application/json"},        {".xml", "application/xml"},
@@ -502,12 +506,27 @@ std::string mime_type(const std::filesystem::path &path) {
       {".gz", "application/gzip"},          {".mp3", "audio/mpeg"},
       {".mp4", "video/mp4"},                {".woff", "font/woff"},
       {".woff2", "font/woff2"}};
-  auto extension = detail::lower(path.extension().string());
-  const auto found = types.find(extension);
-  return found == types.end() ? "application/octet-stream" : found->second;
+  constexpr std::string_view fallback = "application/octet-stream";
+  const auto extension = path.extension().native();
+  std::array<char, 16> key{};
+  std::size_t length = 0;
+  for (const auto value : extension) {
+    const auto wide = static_cast<unsigned long long>(value);
+    if (wide > 0x7f || length == key.size()) return std::string(fallback);
+    const auto ch = static_cast<char>(wide);
+    key[length++] = ch >= 'A' && ch <= 'Z' ? static_cast<char>(ch + ('a' - 'A')) : ch;
+  }
+  const auto found = types.find(std::string_view(key.data(), length));
+  return found == types.end() ? std::string(fallback) : std::string(found->second);
 }
 
 std::string status_reason(int status) {
+  return std::string(detail::status_reason_view(status));
+}
+
+namespace detail {
+
+std::string_view status_reason_view(int status) noexcept {
   switch (status) {
   case 100: return "Continue";
   case 101: return "Switching Protocols";
@@ -574,6 +593,8 @@ std::string status_reason(int status) {
   default: return "Unknown";
   }
 }
+
+} // namespace detail
 
 Result<ContentRange> parse_content_range(std::string_view value) {
   const auto trim_ows = [](std::string_view text) {
@@ -910,6 +931,26 @@ bool iequals(std::string_view lhs, std::string_view rhs) noexcept {
          });
 }
 
+bool istarts_with(std::string_view value, std::string_view prefix) noexcept {
+  return prefix.size() <= value.size() &&
+         std::ranges::equal(prefix, value.substr(0, prefix.size()),
+                            [](char left, char right) {
+                              const auto fold = [](unsigned char ch) {
+                                return ch >= 'A' && ch <= 'Z' ? ch + ('a' - 'A') : ch;
+                              };
+                              return fold(static_cast<unsigned char>(left)) ==
+                                     fold(static_cast<unsigned char>(right));
+                            });
+}
+
+const std::string *find_header(const Headers &headers,
+                               std::string_view name) noexcept {
+  for (const auto &entry : headers) {
+    if (iequals(entry.first, name)) return &entry.second;
+  }
+  return nullptr;
+}
+
 std::string lower(std::string_view value) {
   std::string output(value);
   std::ranges::transform(output, output.begin(), [](unsigned char ch) {
@@ -1068,14 +1109,36 @@ Result<ParsedUrl> parse_url(std::string_view input, std::string_view base) {
 }
 
 std::string ParsedUrl::authority() const {
-  std::string value = host.find(':') == std::string::npos ? host : "[" + host + "]";
+  const bool bracketed = host.find(':') != std::string::npos;
   const bool default_port = (secure && port == 443) || (!secure && port == 80);
-  if (!default_port) value += ":" + std::to_string(port);
+  std::string value;
+  value.reserve(host.size() + (bracketed ? 2 : 0) + (default_port ? 0 : 6));
+  if (bracketed) value.push_back('[');
+  value += host;
+  if (bracketed) value.push_back(']');
+  if (!default_port) {
+    value.push_back(':');
+    value += std::to_string(port);
+  }
   return value;
 }
 
 std::string ParsedUrl::origin() const {
-  return scheme + "://" + authority();
+  const bool bracketed = host.find(':') != std::string::npos;
+  const bool default_port = (secure && port == 443) || (!secure && port == 80);
+  std::string value;
+  value.reserve(scheme.size() + host.size() + (bracketed ? 2 : 0) +
+                (default_port ? 3 : 9));
+  value += scheme;
+  value += "://";
+  if (bracketed) value.push_back('[');
+  value += host;
+  if (bracketed) value.push_back(']');
+  if (!default_port) {
+    value.push_back(':');
+    value += std::to_string(port);
+  }
+  return value;
 }
 
 Result<std::string> resolve_url(std::string_view base,
@@ -1222,11 +1285,16 @@ ErrorInfo make_error(Error code, std::string message, int system_code,
 
 bool path_is_within(const std::filesystem::path &root,
                     const std::filesystem::path &candidate) {
-  const auto normalized_root = std::filesystem::weakly_canonical(root);
+  return path_is_within_canonical(std::filesystem::weakly_canonical(root),
+                                 candidate);
+}
+
+bool path_is_within_canonical(const std::filesystem::path &canonical_root,
+                              const std::filesystem::path &candidate) {
   const auto normalized_candidate = std::filesystem::weakly_canonical(candidate);
-  auto root_it = normalized_root.begin();
+  auto root_it = canonical_root.begin();
   auto candidate_it = normalized_candidate.begin();
-  for (; root_it != normalized_root.end(); ++root_it, ++candidate_it) {
+  for (; root_it != canonical_root.end(); ++root_it, ++candidate_it) {
     if (candidate_it == normalized_candidate.end() || *root_it != *candidate_it)
       return false;
   }

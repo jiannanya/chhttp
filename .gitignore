@@ -1,9 +1,11 @@
 /build/
 /build-asan/
+/build-lto/
+/build-nocompress/
+/build-release/
 /out/
 /.vs/
 *.user
 *.log
 build-msvc/
-benchmarks/
 docs/

@@ -27,6 +27,9 @@ no third-party HTTP, WebSocket or URL library is used.
   and header limits, keep-alive, TCP_NODELAY, cancellation and graceful stop
 - Per-origin HTTP/HTTPS/CONNECT connection pools with independent active and
   idle limits, asynchronous queueing, exclusive checkout and safe stale retry
+- Every resolved address of a host name is attempted in order, so a host whose
+  first address is unreachable (an unroutable IPv6 record, for example) still
+  connects over a later one within the caller's original timeout
 - HTTPS/WSS through OpenSSL 3, SNI, hostname verification, custom CAs, Windows
   root-store import, client certificates and optional server-side mTLS
 - Ordered duplicate headers, ordered duplicate query/form fields, URL encoding,
@@ -75,7 +78,17 @@ ctest --preset windows-msvc
 ```
 
 The matching `windows-clang` configure, build and test presets provide an
-independent Clang 17/MSVC-ABI verification on Windows.
+independent Clang 17/MSVC-ABI verification on Windows, and `asan` adds
+AddressSanitizer plus UndefinedBehaviorSanitizer on any host.
+
+`macos` and `linux` presets build against system packages (Homebrew or the
+distribution) with no vcpkg involvement:
+
+```sh
+cmake --preset macos     # or: cmake --preset linux
+cmake --build --preset macos
+ctest --preset macos
+```
 
 For another generator, point CMake at vcpkg or provide libuv 1.x, OpenSSL 3,
 zlib, Brotli and Zstd packages yourself:
@@ -86,6 +99,24 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
 cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
+
+Brotli is discovered through the vcpkg `unofficial-brotli` package when it is
+present, then through `pkg-config`, then through a plain header/library search.
+Distribution packages that ship Brotli without the vcpkg naming therefore build
+without extra configuration; `CHHTTP_ENABLE_COMPRESSION=OFF` removes the
+dependency entirely.
+
+`CHHTTP_ENABLE_LTO=ON` applies link-time optimization through CMake's portable
+`INTERPROCEDURAL_OPTIMIZATION`, which maps to `/GL` and `/LTCG` on MSVC and to
+`-flto` on GCC and Clang. The optimized build stays free of architecture-specific
+instruction set extensions; no CPU-specific flags are required or used.
+
+`CHHTTP_BUILD_BENCHMARKS=ON` builds `chhttp_benchmarks`, which reports wall-clock
+and per-operation user/system CPU cost for parsing, request round trips,
+connection scaling, static-file delivery, body transfer and route matching. Two
+memory cases measure the resident set of idle keep-alive connections and of
+streamed uploads held in flight, so connection and buffer costs are visible
+alongside throughput.
 
 The test executable separates protocol/feature checks, load/lifecycle checks,
 and deterministic randomized properties. Run a group independently, or repeat
@@ -543,3 +574,40 @@ or response controls are rejected.
 
 `worker_threads` controls the pool shared by synchronous route handlers and
 automatic response compression. Network I/O runs on the server's libuv loop.
+
+## Performance notes
+
+The request path is allocation aware rather than micro-tuned to one CPU: the
+transport hands a resolved candidate list a fresh connection per address, the
+loop thread runs callbacks directly instead of crossing a queue, and the runtime
+avoids type-erased closures and coroutine frames on paths that never suspend.
+
+- Route dispatch is indexed by method at `start()`. Literal routes resolve
+  through a hash lookup and only the parameterised routes registered ahead of a
+  matched literal are evaluated, which preserves registration order without
+  scanning the whole table.
+- `{name}` and `:name` segments, plus a trailing `*`, are matched by a
+  hand-written greedy matcher with backtracking that reproduces the equivalent
+  regular expression. `regex:` and `^`-anchored patterns, and wildcards placed
+  anywhere other than the end, still use `std::regex`.
+- Buffered and synchronous body consumers are fed without a coroutine frame per
+  block, and a received block is delivered straight from the read chunk whenever
+  no pipelined bytes are pending, which removes one full copy from large bodies.
+- The transport allocates each receive block with the read result as its owner
+  instead of copying through a shared per-runtime slab, so a completed read never
+  copies its payload; blocks are capped at 32 KiB because larger allocations are
+  disproportionately expensive on some platforms. Idle sockets retain no receive
+  buffer.
+- Outgoing messages substitute framing fields while serializing the caller's
+  field set in place, so a request or response no longer copies every header
+  just to change `Connection`, `Content-Length` or `Transfer-Encoding`. A small
+  buffered response body is coalesced with the head into one write.
+- Static file responses are read from the filesystem pool in larger blocks and
+  only the candidate path is canonicalised per request, because mount roots are
+  canonicalised when they are registered.
+- `Headers::reserve()` lets callers size a header set up front; the parser uses
+  it internally so a request head is stored with a single allocation, and
+  internal lookups borrow the stored value (`find_header`) instead of
+  materialising a string for every inspected field.
+- `Runtime::post()` invokes directly when the caller already owns the loop, so
+  on-loop I/O never builds a `std::function` nor wakes the async handle.

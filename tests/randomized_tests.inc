@@ -30,7 +30,8 @@ TEST(property_base64_random_chunking_matches_one_shot_encoding) {
     encoder.reset();
     std::string encoded;
     for (std::size_t offset = 0; offset < bytes.size();) {
-      const auto count = (std::min)(bytes.size() - offset, std::size_t{1} + random() % 97);
+      const auto count = (std::min)(bytes.size() - offset,
+                                    std::size_t{1} + static_cast<std::size_t>(random() % 97));
       encoded += encoder.update(std::as_bytes(std::span(bytes.data() + offset, count)));
       offset += count;
     }
@@ -131,7 +132,8 @@ TEST(property_sse_random_splits_preserve_multiline_utf8_and_metadata) {
             event.event == reference.event && event.retry == reference.retry);
     });
     for (std::size_t offset = 0; offset < wire.size();) {
-      const auto count = (std::min)(wire.size() - offset, std::size_t{1} + random() % 151);
+      const auto count = (std::min)(wire.size() - offset,
+                                    std::size_t{1} + static_cast<std::size_t>(random() % 151));
       CHECK(!parser.feed(std::string_view(wire).substr(offset, count)));
       offset += count;
     }
@@ -154,7 +156,8 @@ TEST(property_multipart_random_forms_and_splits_preserve_ordered_parts) {
     std::size_t active = 0;
     bool begun = false;
     for (std::size_t offset = 0; offset < wire.size();) {
-      const auto size = (std::min)(wire.size() - offset, std::size_t{1} + random() % 193);
+      const auto size = (std::min)(wire.size() - offset,
+                                   std::size_t{1} + static_cast<std::size_t>(random() % 193));
       auto events = parser.feed(std::string_view(wire).substr(offset, size));
       CHECK(events);
       for (const auto &event : *events) {
@@ -196,7 +199,8 @@ TEST(property_http_chunk_extensions_trailers_and_pipeline_keep_exact_bytes) {
     const auto payload = random_bytes(random, random() % 4097);
     std::string request = "POST / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n";
     for (std::size_t offset = 0; offset < payload.size();) {
-      const auto count = (std::min)(payload.size() - offset, std::size_t{1} + random() % 211);
+      const auto count = (std::min)(payload.size() - offset,
+                                    std::size_t{1} + static_cast<std::size_t>(random() % 211));
       request += hex_size(count) + ";random=\"a;b\"\r\n" + payload.substr(offset, count) + "\r\n";
       offset += count;
     }
@@ -221,7 +225,8 @@ TEST(property_compressed_binary_responses_match_original_under_chunk_framing) {
       std::string wire = "HTTP/1.1 200 OK\r\nContent-Encoding: " + encoding +
           "\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
       for (std::size_t offset = 0; offset < compressed->size();) {
-        const auto count = (std::min)(compressed->size() - offset, std::size_t{1} + random() % 31);
+        const auto count = (std::min)(compressed->size() - offset,
+                                      std::size_t{1} + static_cast<std::size_t>(random() % 31));
         wire += hex_size(count) + "\r\n" + compressed->substr(offset, count) + "\r\n";
         offset += count;
       }

@@ -223,3 +223,127 @@ TEST(stress_pool_mixed_cancellation_deadlines_and_origin_isolation) {
     CHECK(recovered && recovered->body == "recovered");
   }
 }
+
+// Captures the request bytes a client sends, then answers with a fixed response.
+class RawRequestCapture {
+public:
+  explicit RawRequestCapture(std::string response) {
+    initialize_raw_sockets();
+    listener_ = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (listener_ == invalid_raw_socket)
+      throw std::runtime_error("Unable to allocate raw capture socket");
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = 0;
+    if (::bind(listener_, reinterpret_cast<const sockaddr *>(&address),
+               sizeof(address)) != 0 ||
+        ::listen(listener_, 1) != 0) {
+      close_raw_socket(listener_);
+      throw std::runtime_error("Unable to bind raw capture socket");
+    }
+#ifdef _WIN32
+    int size = sizeof(address);
+#else
+    socklen_t size = sizeof(address);
+#endif
+    getsockname(listener_, reinterpret_cast<sockaddr *>(&address), &size);
+    port_ = ntohs(address.sin_port);
+    thread_ = std::thread([this, response = std::move(response)] {
+      raw_socket_t client = ::accept(listener_, nullptr, nullptr);
+      if (client == invalid_raw_socket) return;
+      std::array<char, 4096> buffer{};
+      // The framing fields under test all live in the head, so capture until
+      // the terminating CRLF appears.
+      for (;;) {
+        const int received =
+            ::recv(client, buffer.data(), static_cast<int>(buffer.size()), 0);
+        if (received <= 0) break;
+        std::lock_guard lock(mutex_);
+        request_.append(buffer.data(), static_cast<std::size_t>(received));
+        if (request_.find("\r\n\r\n") != std::string::npos) break;
+      }
+      std::size_t offset = 0;
+      while (offset < response.size()) {
+        const int sent = ::send(client, response.data() + offset,
+                                static_cast<int>(response.size() - offset), 0);
+        if (sent <= 0) break;
+        offset += static_cast<std::size_t>(sent);
+      }
+#ifdef _WIN32
+      shutdown(client, SD_BOTH);
+#else
+      shutdown(client, SHUT_RDWR);
+#endif
+      close_raw_socket(client);
+    });
+  }
+  ~RawRequestCapture() {
+    close_raw_socket(listener_);
+    if (thread_.joinable()) thread_.join();
+  }
+  std::uint16_t port() const noexcept { return port_; }
+  std::string request() const {
+    std::lock_guard lock(mutex_);
+    return request_;
+  }
+
+private:
+  raw_socket_t listener_{invalid_raw_socket};
+  std::uint16_t port_{0};
+  std::thread thread_;
+  mutable std::mutex mutex_;
+  std::string request_;
+};
+
+// Framing fields the caller supplied must be normalised on the wire: one
+// Content-Length with the real body size, no Transfer-Encoding, and a single
+// Connection field, whatever the caller passed.
+TEST(outbound_request_framing_fields_are_normalized_once) {
+  RawRequestCapture capture(
+      "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+  chhttp::Client client("http://127.0.0.1:" + std::to_string(capture.port()));
+  auto response = client.post("/framed", "hello", "text/plain",
+                              {{"Content-Length", "1"},
+                               {"Transfer-Encoding", "chunked"}});
+  CHECK(response && response->body == "ok");
+  const auto wire = capture.request();
+  CHECK(wire.starts_with("POST /framed HTTP/1.1\r\n"));
+  chhttp::detail::ReadBuffer buffer;
+  buffer.append(wire);
+  auto parsed = chhttp::detail::read_request_head({}, buffer, {}).get();
+  CHECK(parsed);
+  if (parsed) {
+    CHECK(parsed->body.content_length == 5);
+    CHECK(parsed->request.headers.get_all("Content-Length") ==
+          std::vector<std::string>{"5"});
+    CHECK(parsed->request.headers.get_all("Transfer-Encoding").empty());
+    CHECK(parsed->request.headers.get_all("Connection") ==
+          std::vector<std::string>{"keep-alive"});
+  }
+}
+
+TEST(outbound_response_framing_fields_are_normalized_once) {
+  chhttp::Server server;
+  server.get("/framed", [](const chhttp::Request &, chhttp::Response &response) {
+    // Deliberately contradictory framing fields; only one normalised set may
+    // reach the client or the client parser would reject the response.
+    response.headers.add("Connection", "close");
+    response.headers.add("Connection", "keep-alive");
+    response.headers.add("Transfer-Encoding", "chunked");
+    response.headers.set("Content-Length", "999");
+    response.set_content("hello");
+  });
+  CHECK(server.start("127.0.0.1", 0));
+  chhttp::Client client("http://127.0.0.1:" + std::to_string(server.port()));
+  auto response = client.get("/framed");
+  CHECK(response && response->body == "hello");
+  if (response) {
+    CHECK(response->headers.get_all("Content-Length") ==
+          std::vector<std::string>{"5"});
+    CHECK(response->headers.get_all("Transfer-Encoding").empty());
+    CHECK(response->headers.get_all("Connection") ==
+          std::vector<std::string>{"keep-alive"});
+  }
+  server.stop();
+}

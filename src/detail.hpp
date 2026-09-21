@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cstring>
 #include <deque>
 #include <future>
 #include <random>
@@ -118,8 +119,13 @@ Result<ParsedUrl> parse_url(std::string_view input, std::string_view base = {});
 Result<std::string> resolve_url(std::string_view base,
                                 std::string_view reference);
 bool iequals(std::string_view lhs, std::string_view rhs) noexcept;
+bool istarts_with(std::string_view value, std::string_view prefix) noexcept;
 std::string lower(std::string_view value);
 std::string trim(std::string_view value);
+// Borrows the stored value so internal callers do not materialize a std::string
+// for every header they merely inspect.
+const std::string *find_header(const Headers &headers,
+                               std::string_view name) noexcept;
 std::vector<std::string> split_tokens(std::string_view value, char separator);
 std::string random_boundary();
 bool valid_header_name(std::string_view value) noexcept;
@@ -133,6 +139,9 @@ Result<std::string> decompress(std::string_view input,
                                std::string_view encoding,
                                std::size_t max_output);
 std::string select_encoding(std::string_view accept_encoding);
+// Borrowed form of the public status_reason() so the response serializer can
+// append the reason phrase without materialising a temporary string.
+std::string_view status_reason_view(int status) noexcept;
 
 std::string base64_encode(std::string_view value);
 Result<std::string> base64_decode(std::string_view value);
@@ -143,6 +152,10 @@ ErrorInfo make_error(Error code, std::string message, int system_code = 0,
                      long tls_code = 0);
 bool path_is_within(const std::filesystem::path &root,
                     const std::filesystem::path &candidate);
+// Variant for roots that are already canonical, which avoids resolving the same
+// root again for every candidate checked against it.
+bool path_is_within_canonical(const std::filesystem::path &canonical_root,
+                              const std::filesystem::path &candidate);
 
 class DetachedTask {
 public:
@@ -166,19 +179,24 @@ public:
   Runtime(const Runtime &) = delete;
   Runtime &operator=(const Runtime &) = delete;
 
-  void post(std::function<void()> callback);
+  // Callbacks that are already running on this runtime's loop are invoked
+  // directly, so the common on-loop path never builds a type-erased
+  // std::function or touches the cross-thread queue.
+  template <class Callback> void post(Callback &&callback) {
+    if (on_loop_thread()) {
+      std::forward<Callback>(callback)();
+      return;
+    }
+    post_remote(std::function<void()>(std::forward<Callback>(callback)));
+  }
   void stop();
   [[nodiscard]] bool on_loop_thread() const noexcept;
   [[nodiscard]] uv_loop_t *loop() noexcept { return &loop_; }
 
-  // Shared only by reads on this loop. An overlapping allocation falls back
-  // to an individually owned buffer; idle sockets retain no receive slab.
-  std::array<char, 64 * 1024> read_storage_;
-  bool read_storage_in_use_{false};
-
 private:
   static void async_callback(uv_async_t *handle);
   void drain();
+  void post_remote(std::function<void()> callback);
 
   uv_loop_t loop_{};
   uv_async_t async_{};
@@ -206,9 +224,49 @@ SSL_CTX *create_server_tls_context(const TlsServerOptions &options,
 
 class Connection : public std::enable_shared_from_this<Connection> {
 public:
-  struct ReadChunk {
-    std::string data;
+  // A received byte range that owns its storage. The transport hands over the
+  // block the kernel filled, so consumers that only view the bytes pay no
+  // payload copy and the bytes stay valid after the read callback returns.
+  class ReadChunk {
+  public:
+    ReadChunk() = default;
+    ReadChunk(std::unique_ptr<char[]> storage, std::size_t size)
+        : storage_(std::move(storage)), size_(size) {}
+    ReadChunk(ReadChunk &&) noexcept = default;
+    ReadChunk &operator=(ReadChunk &&) noexcept = default;
+    ReadChunk(const ReadChunk &) = delete;
+    ReadChunk &operator=(const ReadChunk &) = delete;
+
+    // The transport reached end of stream, so no storage is involved.
+    [[nodiscard]] static ReadChunk closed() {
+      ReadChunk chunk;
+      chunk.eof = true;
+      return chunk;
+    }
+    // Copies a borrowed range into owned storage; used where the transport
+    // cannot hand its own block over (TLS decrypts into a stack buffer).
+    [[nodiscard]] static ReadChunk copy_of(std::string_view bytes) {
+      ReadChunk chunk;
+      if (!bytes.empty()) {
+        chunk.storage_.reset(new char[bytes.size()]);
+        std::memcpy(chunk.storage_.get(), bytes.data(), bytes.size());
+      }
+      chunk.size_ = bytes.size();
+      return chunk;
+    }
+
+    [[nodiscard]] std::string_view view() const noexcept {
+      return std::string_view(storage_.get(), size_);
+    }
+    [[nodiscard]] std::size_t size() const noexcept { return size_; }
+    [[nodiscard]] bool empty() const noexcept { return size_ == 0; }
+    [[nodiscard]] const char *data() const noexcept { return storage_.get(); }
+
     bool eof{false};
+
+  private:
+    std::unique_ptr<char[]> storage_;
+    std::size_t size_{0};
   };
 
   static Task<Result<std::shared_ptr<Connection>>>
@@ -338,9 +396,13 @@ struct RequestHeadResult {
   RequestBodyState body;
 };
 
+// `duplicate_headers` mirrors the parsed fields onto `Request::headers`. Callers
+// that go on to take ownership of `RequestBodyState::headers` can pass false and
+// avoid a second copy of every field.
 Task<Result<RequestHeadResult>>
 read_request_head(const std::shared_ptr<Connection> &connection,
-                  ReadBuffer &buffer, const HttpReadOptions &options);
+                  ReadBuffer &buffer, const HttpReadOptions &options,
+                  bool duplicate_headers = true);
 Task<Result<std::string>>
 read_request_body(const std::shared_ptr<Connection> &connection,
                   ReadBuffer &buffer, RequestBodyState &state,

@@ -234,6 +234,9 @@ public:
   void add(std::string name, std::string value);
   void set(std::string name, std::string value);
   bool erase(std::string_view name);
+  // Reserves capacity for a known number of fields so bulk parsing performs a
+  // single allocation instead of growing the container repeatedly.
+  void reserve(std::size_t count);
   [[nodiscard]] bool contains(std::string_view name) const;
   [[nodiscard]] std::string get(std::string_view name,
                                 std::string_view fallback = {}) const;

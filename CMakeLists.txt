@@ -9,14 +9,60 @@ option(CHHTTP_BUILD_EXAMPLES "Build chhttp examples" ON)
 option(CHHTTP_BUILD_BENCHMARKS "Build repeatable performance/memory benchmarks" OFF)
 option(CHHTTP_ENABLE_TLS "Enable TLS through OpenSSL" ON)
 option(CHHTTP_ENABLE_COMPRESSION "Enable gzip/deflate, Brotli and Zstd" ON)
+option(CHHTTP_ENABLE_LTO "Compile the static library with link-time optimization" OFF)
 
 find_package(libuv CONFIG REQUIRED)
 find_package(OpenSSL REQUIRED)
 
 if(CHHTTP_ENABLE_COMPRESSION)
   find_package(ZLIB REQUIRED)
-  find_package(unofficial-brotli CONFIG REQUIRED)
   find_package(zstd CONFIG REQUIRED)
+  # vcpkg ships an "unofficial-brotli" config, but many system package managers
+  # (Homebrew, Debian, Fedora) only install plain headers and libraries. Fall
+  # back to pkg-config or a manual search so the default configuration builds
+  # everywhere instead of requiring a vcpkg-specific package.
+  find_package(unofficial-brotli CONFIG QUIET)
+  if(NOT unofficial-brotli_FOUND)
+    if(PkgConfig_FOUND OR NOT DEFINED CMAKE_DISABLE_FIND_PACKAGE_PkgConfig)
+      find_package(PkgConfig QUIET)
+    endif()
+    if(PkgConfig_FOUND)
+      pkg_check_modules(BROTLIENC IMPORTED_TARGET libbrotlienc)
+      pkg_check_modules(BROTLIDEC IMPORTED_TARGET libbrotlidec)
+      pkg_check_modules(BROTLICOMMON IMPORTED_TARGET libbrotlicommon)
+    endif()
+    if(BROTLIENC_FOUND AND BROTLIDEC_FOUND)
+      add_library(unofficial::brotli::brotlienc ALIAS PkgConfig::BROTLIENC)
+      add_library(unofficial::brotli::brotlidec ALIAS PkgConfig::BROTLIDEC)
+    else()
+      find_path(BROTLI_INCLUDE_DIR brotli/encode.h)
+      find_library(BROTLIENC_LIBRARY NAMES brotlienc)
+      find_library(BROTLIDEC_LIBRARY NAMES brotlidec)
+      find_library(BROTLICOMMON_LIBRARY NAMES brotlicommon)
+      if(BROTLI_INCLUDE_DIR AND BROTLIENC_LIBRARY AND BROTLIDEC_LIBRARY)
+        add_library(chhttp_brotlienc UNKNOWN IMPORTED)
+        set_target_properties(chhttp_brotlienc PROPERTIES
+          IMPORTED_LOCATION "${BROTLIENC_LIBRARY}"
+          INTERFACE_INCLUDE_DIRECTORIES "${BROTLI_INCLUDE_DIR}")
+        add_library(chhttp_brotlidec UNKNOWN IMPORTED)
+        set_target_properties(chhttp_brotlidec PROPERTIES
+          IMPORTED_LOCATION "${BROTLIDEC_LIBRARY}"
+          INTERFACE_INCLUDE_DIRECTORIES "${BROTLI_INCLUDE_DIR}")
+        # Brotli's decoder links against its common library on most platforms.
+        if(BROTLICOMMON_LIBRARY AND NOT APPLE)
+          set_target_properties(chhttp_brotlidec PROPERTIES
+            INTERFACE_LINK_LIBRARIES "${BROTLICOMMON_LIBRARY}")
+        endif()
+        add_library(unofficial::brotli::brotlienc ALIAS chhttp_brotlienc)
+        add_library(unofficial::brotli::brotlidec ALIAS chhttp_brotlidec)
+      else()
+        message(FATAL_ERROR
+          "Brotli was not found. Install it (for example `brew install brotli` or "
+          "`apt install libbrotli-dev`), set CHHTTP_ENABLE_COMPRESSION=OFF, or point "
+          "CMAKE_PREFIX_PATH at a vcpkg toolchain that provides unofficial-brotli.")
+      endif()
+    endif()
+  endif()
 endif()
 
 add_library(chhttp STATIC
@@ -74,6 +120,18 @@ set_target_properties(chhttp PROPERTIES
   SOVERSION ${PROJECT_VERSION_MAJOR}
   EXPORT_NAME chhttp
 )
+
+# Portable LTO: CMake maps this to MSVC /GL+/LTCG and GCC/Clang -flto, so no
+# architecture- or compiler-specific flags are needed.
+if(CHHTTP_ENABLE_LTO)
+  include(CheckIPOSupported)
+  check_ipo_supported(RESULT CHHTTP_IPO_SUPPORTED OUTPUT CHHTTP_IPO_ERROR)
+  if(CHHTTP_IPO_SUPPORTED)
+    set_property(TARGET chhttp PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
+  else()
+    message(WARNING "Link-time optimization was requested but is unsupported: ${CHHTTP_IPO_ERROR}")
+  endif()
+endif()
 
 if(CHHTTP_BUILD_EXAMPLES)
   add_subdirectory(examples)

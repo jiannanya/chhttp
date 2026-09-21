@@ -47,12 +47,8 @@ Runtime::Runtime() {
 
 Runtime::~Runtime() { stop(); }
 
-void Runtime::post(std::function<void()> callback) {
+void Runtime::post_remote(std::function<void()> callback) {
   if (!callback) return;
-  if (on_loop_thread()) {
-    callback();
-    return;
-  }
   {
     std::lock_guard lock(queue_mutex_);
     if (stopping_) return;
@@ -167,6 +163,12 @@ struct Connection::PendingConnect {
       ErrorInfo{Error::internal, "Connect not completed"}};
   std::string host;
   std::string service;
+  // Resolved candidates stay alive while the caller walks the list. libuv binds
+  // a socket to one address family on first use, so each candidate is attempted
+  // on its own connection instead of reusing a handle across families.
+  std::shared_ptr<addrinfo> addresses;
+  addrinfo *candidate{nullptr};
+  addrinfo *next{nullptr};
   bool completed{false};
   bool resolving{true};
 };
@@ -181,6 +183,60 @@ Connection::~Connection() {
 }
 
 namespace {
+
+// uv_freeaddrinfo runs from whichever thread observes the last owner, keeping a
+// resolved candidate list valid across the whole fallback walk.
+void release_addrinfo(addrinfo *value) noexcept {
+  if (value) uv_freeaddrinfo(value);
+}
+using AddrinfoList = std::shared_ptr<addrinfo>;
+
+std::string describe_address(const addrinfo *address) {
+  char text[INET6_ADDRSTRLEN]{};
+  if (address && address->ai_addr) {
+    if (address->ai_addr->sa_family == AF_INET)
+      uv_ip4_name(reinterpret_cast<const sockaddr_in *>(address->ai_addr), text,
+                  sizeof(text));
+    else if (address->ai_addr->sa_family == AF_INET6)
+      uv_ip6_name(reinterpret_cast<const sockaddr_in6 *>(address->ai_addr), text,
+                  sizeof(text));
+  }
+  return text;
+}
+
+void start_tcp_connect(Connection::PendingConnect *pending) {
+  auto *candidate = pending->candidate;
+  auto connection = pending->connection;
+  pending->next = candidate->ai_next;
+  pending->connector.data = pending;
+  const int status = uv_tcp_connect(
+      &pending->connector, &connection->tcp_, candidate->ai_addr,
+      [](uv_connect_t *request, int status) {
+        auto *pending = static_cast<Connection::PendingConnect *>(request->data);
+        auto self = pending->self_keep;
+        auto connection = pending->connection;
+        if (!pending->completed) {
+          if (status == 0)
+            connection->finish_connect(connection);
+          else
+            connection->finish_connect(ErrorInfo{
+                Error::connect,
+                "Unable to connect to " + pending->host + " (" +
+                    describe_address(pending->candidate) + "): " +
+                    uv_message(status),
+                status});
+        }
+        pending->self_keep.reset();
+      });
+  if (status != 0) {
+    connection->finish_connect(ErrorInfo{
+        Error::connect,
+        "Unable to start connection to " + pending->host + " (" +
+            describe_address(candidate) + "): " + uv_message(status),
+        status});
+    pending->self_keep.reset();
+  }
+}
 
 struct ConnectAwaiter {
   std::shared_ptr<Connection> connection;
@@ -226,8 +282,6 @@ struct ConnectAwaiter {
       }
       connection->pending_connect_ = pending_copy;
       pending_copy->self_keep = pending_copy;
-      pending_copy->resolver.data = pending_copy.get();
-      pending_copy->connector.data = pending_copy.get();
       if (observer) observer(connection_copy);
       if (pending_copy->completed) {
         pending_copy->self_keep.reset();
@@ -236,6 +290,12 @@ struct ConnectAwaiter {
       uv_timer_start(&connection->read_timer_, &Connection::read_timeout,
                      timeout_ms(timeout), 0);
 
+      if (pending_copy->candidate) {
+        start_tcp_connect(pending_copy.get());
+        return;
+      }
+
+      pending_copy->resolver.data = pending_copy.get();
       addrinfo hints{};
       hints.ai_family = AF_UNSPEC;
       hints.ai_socktype = SOCK_STREAM;
@@ -248,12 +308,12 @@ struct ConnectAwaiter {
             auto connection = pending->connection;
             pending->resolving = false;
             if (pending->completed) {
-              if (addresses) uv_freeaddrinfo(addresses);
+              release_addrinfo(addresses);
               pending->self_keep.reset();
               return;
             }
             if (resolve_status != 0 || !addresses) {
-              if (addresses) uv_freeaddrinfo(addresses);
+              release_addrinfo(addresses);
               connection->finish_connect(ErrorInfo{
                   Error::resolve,
                   "Unable to resolve " + pending->host + ": " +
@@ -262,33 +322,9 @@ struct ConnectAwaiter {
               pending->self_keep.reset();
               return;
             }
-            const int connect_status = uv_tcp_connect(
-                &pending->connector, &connection->tcp_, addresses->ai_addr,
-                [](uv_connect_t *request, int status) {
-                  auto *pending =
-                      static_cast<Connection::PendingConnect *>(request->data);
-                  auto self = pending->self_keep;
-                  auto connection = pending->connection;
-                  if (!pending->completed) {
-                    if (status == 0)
-                      connection->finish_connect(connection);
-                    else
-                      connection->finish_connect(ErrorInfo{
-                          Error::connect,
-                          "Unable to connect to " + pending->host + ": " +
-                              uv_message(status),
-                          status});
-                  }
-                  pending->self_keep.reset();
-                });
-            uv_freeaddrinfo(addresses);
-            if (connect_status != 0) {
-              connection->finish_connect(ErrorInfo{
-                  Error::connect,
-                  "Unable to start connection: " + uv_message(connect_status),
-                  connect_status});
-              pending->self_keep.reset();
-            }
+            pending->addresses = AddrinfoList(addresses, release_addrinfo);
+            pending->candidate = addresses;
+            start_tcp_connect(pending);
           },
           pending_copy->host.c_str(), pending_copy->service.c_str(), &hints);
       if (resolve_status != 0) {
@@ -313,13 +349,41 @@ Connection::connect(std::shared_ptr<Runtime> runtime, std::string host,
                     std::chrono::milliseconds timeout,
                     std::function<void(const std::shared_ptr<Connection> &)>
                         on_created) {
-  auto connection = std::shared_ptr<Connection>(new Connection(std::move(runtime)));
-  auto pending = std::make_shared<PendingConnect>();
-  pending->connection = connection;
-  pending->host = std::move(host);
-  pending->service = std::to_string(port);
-  co_return co_await ConnectAwaiter{connection, pending, timeout,
-                                    std::move(on_created)};
+  if (!runtime->on_loop_thread()) co_await resume_on(runtime);
+  // A host name can resolve to several addresses, and the first one is not
+  // always reachable (for example when IPv6 is not routable). Walk the list so
+  // a resolved-but-unreachable address cannot fail the whole request, and give
+  // the remaining attempts the remaining share of the caller's budget.
+  const auto deadline = std::chrono::steady_clock::now() +
+                        std::max(timeout, std::chrono::milliseconds(1));
+  const std::string service = std::to_string(port);
+  AddrinfoList addresses;
+  addrinfo *candidate = nullptr;
+  for (;;) {
+    const auto remaining = std::chrono::ceil<std::chrono::milliseconds>(
+        deadline - std::chrono::steady_clock::now());
+    if (remaining <= std::chrono::milliseconds::zero())
+      co_return ErrorInfo{Error::timeout, "Connection attempt timed out"};
+    auto connection = std::shared_ptr<Connection>(new Connection(runtime));
+    auto pending = std::make_shared<PendingConnect>();
+    pending->connection = connection;
+    pending->host = host;
+    pending->service = service;
+    pending->addresses = addresses;
+    pending->candidate = candidate;
+    auto attempt = co_await ConnectAwaiter{
+        connection, pending, std::max(remaining, std::chrono::milliseconds(1)),
+        on_created};
+    if (attempt) co_return attempt;
+    const ErrorInfo failure = attempt.error();
+    // Cancellation and deadline expiry belong to the caller, not to the
+    // address list, so they must not trigger another attempt.
+    if (failure.code == Error::cancelled || failure.code == Error::timeout)
+      co_return failure;
+    addresses = pending->addresses;
+    if (!addresses || pending->next == nullptr) co_return failure;
+    candidate = pending->next;
+  }
 }
 
 void Connection::finish_connect(Result<std::shared_ptr<Connection>> result) {
@@ -399,7 +463,7 @@ struct ReadAwaiter {
                                  timeout = timeout] {
       auto *connection = connection_copy.get();
       if (!connection->open()) {
-        pending_copy->result = Connection::ReadChunk{{}, true};
+        pending_copy->result = Connection::ReadChunk::closed();
         pending_copy->completed = true;
         pending_copy->continuation.resume();
         return;
@@ -496,37 +560,30 @@ Task<ErrorInfo> Connection::raw_write(std::string data,
 }
 
 void Connection::allocate(uv_handle_t *handle, std::size_t suggested, uv_buf_t *buf) {
-  auto &runtime = *static_cast<Connection *>(handle->data)->runtime_;
-  const auto size = std::clamp<std::size_t>(suggested, 16 * 1024,
-                                          runtime.read_storage_.size());
-  if (!runtime.read_storage_in_use_) {
-    runtime.read_storage_in_use_ = true;
-    buf->base = runtime.read_storage_.data();
-  } else {
-    buf->base = static_cast<char *>(std::malloc(size));
-  }
+  (void)handle;
+  // The read result takes ownership of this block, so a completed read never
+  // copies its payload and no shared receive slab has to be tracked. The block
+  // stays at or below 32 KiB because larger allocations are disproportionately
+  // expensive on some platforms, and a failed allocation is reported to libuv
+  // as UV_ENOBUFS by a zero-length buffer.
+  const auto size = std::clamp<std::size_t>(suggested, 16 * 1024, 32 * 1024);
+  buf->base = new (std::nothrow) char[size];
   buf->len = buf->base ? static_cast<decltype(buf->len)>(size) : 0;
 }
 
 void Connection::read_callback(uv_stream_t *stream, ssize_t count,
                                const uv_buf_t *buffer) {
   auto *connection = static_cast<Connection *>(stream->data);
-  auto &runtime = *connection->runtime_;
-  const auto release_storage = [&] {
-    if (buffer->base == runtime.read_storage_.data())
-      runtime.read_storage_in_use_ = false;
-    else
-      std::free(buffer->base);
-  };
+  // Receives ownership of whatever allocate() handed out; if the read reports
+  // no data the block is simply released with this local owner.
+  std::unique_ptr<char[]> block(static_cast<char *>(buffer->base));
   if (count > 0) {
-    ReadChunk chunk{std::string(buffer->base, static_cast<std::size_t>(count)), false};
-    release_storage();
-    connection->finish_read(std::move(chunk));
+    connection->finish_read(Connection::ReadChunk{
+        std::move(block), static_cast<std::size_t>(count)});
     return;
   }
-  release_storage();
   if (count == UV_EOF) {
-    connection->finish_read(ReadChunk{{}, true});
+    connection->finish_read(Connection::ReadChunk::closed());
   } else if (count < 0) {
     connection->finish_read(ErrorInfo{
         Error::read, "Socket read failed: " + uv_message(static_cast<int>(count)),
@@ -596,7 +653,7 @@ Connection::read(std::chrono::milliseconds timeout) {
 #ifdef CHHTTP_HAS_TLS
   if (ssl_) {
     for (;;) {
-      std::array<char, 16 * 1024> output{};
+      std::array<char, 16 * 1024> output;
       std::size_t count = 0;
       const int status = SSL_read_ex(ssl_, output.data(), output.size(), &count);
       const int ssl_error =
@@ -610,8 +667,9 @@ Connection::read(std::chrono::milliseconds timeout) {
       auto flushed = co_await flush_tls(timeout);
       if (flushed) co_return flushed;
       if (status == 1 && count > 0)
-        co_return ReadChunk{std::string(output.data(), count), false};
-      if (ssl_error == SSL_ERROR_ZERO_RETURN) co_return ReadChunk{{}, true};
+        co_return ReadChunk::copy_of(
+            std::string_view(output.data(), static_cast<std::size_t>(count)));
+      if (ssl_error == SSL_ERROR_ZERO_RETURN) co_return ReadChunk::closed();
       if (ssl_error != SSL_ERROR_WANT_READ && ssl_error != SSL_ERROR_WANT_WRITE) {
         co_return ErrorInfo{Error::read, "TLS read failed", ssl_error,
                             static_cast<long>(tls_code)};
@@ -619,15 +677,18 @@ Connection::read(std::chrono::milliseconds timeout) {
       if (ssl_error == SSL_ERROR_WANT_READ) {
         auto encrypted = co_await raw_read(timeout);
         if (!encrypted) co_return encrypted.error();
-        if (encrypted->eof) co_return ReadChunk{{}, true};
-        if (BIO_write(SSL_get_rbio(ssl_), encrypted->data.data(),
-                      static_cast<int>(encrypted->data.size())) <= 0)
+        if (encrypted->eof) co_return ReadChunk::closed();
+        if (BIO_write(SSL_get_rbio(ssl_), encrypted->view().data(),
+                      static_cast<int>(encrypted->view().size())) <= 0)
           co_return ErrorInfo{Error::read, "Unable to feed TLS input"};
       }
     }
   }
 #endif
-  co_return co_await raw_read(timeout);
+  // Await the transport directly: an extra coroutine layer here would allocate
+  // and unwind a frame for every socket read.
+  co_return co_await ReadAwaiter{shared_from_this(),
+                                 std::make_shared<PendingRead>(), timeout};
 }
 
 Task<ErrorInfo> Connection::write(std::string data,
@@ -659,8 +720,8 @@ Task<ErrorInfo> Connection::write(std::string data,
         if (!encrypted) co_return encrypted.error();
         if (encrypted->eof)
           co_return ErrorInfo{Error::write, "TLS peer closed during write"};
-        if (BIO_write(SSL_get_rbio(ssl_), encrypted->data.data(),
-                      static_cast<int>(encrypted->data.size())) <= 0)
+        if (BIO_write(SSL_get_rbio(ssl_), encrypted->view().data(),
+                      static_cast<int>(encrypted->view().size())) <= 0)
           co_return ErrorInfo{Error::write, "Unable to feed TLS input"};
         continue;
       }
@@ -671,7 +732,10 @@ Task<ErrorInfo> Connection::write(std::string data,
     co_return co_await flush_tls(timeout);
   }
 #endif
-  co_return co_await raw_write(std::move(data), timeout);
+  if (data.empty()) co_return ErrorInfo{};
+  auto pending = std::make_shared<PendingWrite>();
+  pending->data = std::move(data);
+  co_return co_await WriteAwaiter{shared_from_this(), pending, timeout};
 }
 
 ErrorInfo Connection::set_no_delay(bool enabled) {
@@ -770,8 +834,8 @@ Task<ErrorInfo> Connection::handshake(std::chrono::milliseconds timeout) {
       if (encrypted->eof)
         co_return ErrorInfo{Error::tls_handshake,
                             "TLS peer closed during handshake"};
-      if (BIO_write(SSL_get_rbio(ssl_), encrypted->data.data(),
-                    static_cast<int>(encrypted->data.size())) <= 0)
+      if (BIO_write(SSL_get_rbio(ssl_), encrypted->view().data(),
+                    static_cast<int>(encrypted->view().size())) <= 0)
         co_return ErrorInfo{Error::tls_handshake, "Unable to feed TLS handshake"};
       continue;
     }

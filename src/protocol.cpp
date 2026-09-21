@@ -34,28 +34,31 @@ Task<Result<Connection::ReadChunk>> timed_read(
     std::string_view phase) {
   if (options.cancelled && options.cancelled())
     co_return ErrorInfo{Error::cancelled, "Request cancelled"};
-  const auto now = std::chrono::steady_clock::now();
   auto timeout = options.read_timeout;
   std::string timeout_message = "Socket read timed out";
-  const auto apply_deadline = [&](const std::optional<TimePoint> &deadline,
-                                  std::string message) -> ErrorInfo {
-    if (!deadline) return {};
-    if (*deadline <= now)
-      return {Error::timeout, std::move(message)};
-    const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
-        *deadline - now);
-    if (remaining < timeout) {
-      timeout = std::max(remaining, 1ms);
-      timeout_message = std::move(message);
-    }
-    return {};
-  };
-  if (auto error = apply_deadline(options.deadline,
-                                  "Request deadline exceeded"))
-    co_return error;
-  if (auto error = apply_deadline(phase_deadline,
-                                  std::string(phase) + " timed out"))
-    co_return error;
+  // Deadlines are usually unset, so the clock is only read when one applies.
+  if (options.deadline || phase_deadline) {
+    const auto now = std::chrono::steady_clock::now();
+    const auto apply_deadline = [&](const std::optional<TimePoint> &deadline,
+                                    std::string message) -> ErrorInfo {
+      if (!deadline) return {};
+      if (*deadline <= now)
+        return {Error::timeout, std::move(message)};
+      const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+          *deadline - now);
+      if (remaining < timeout) {
+        timeout = std::max(remaining, 1ms);
+        timeout_message = std::move(message);
+      }
+      return {};
+    };
+    if (auto error = apply_deadline(options.deadline,
+                                    "Request deadline exceeded"))
+      co_return error;
+    if (auto error = apply_deadline(phase_deadline,
+                                    std::string(phase) + " timed out"))
+      co_return error;
+  }
   auto chunk = co_await connection->read(timeout);
   if (!chunk && chunk.error().code == Error::timeout)
     co_return ErrorInfo{Error::timeout, std::move(timeout_message),
@@ -271,7 +274,7 @@ Task<Result<std::string>> read_head_bytes(
     if (!chunk) co_return chunk.error();
     if (chunk->eof)
       co_return ErrorInfo{Error::protocol, "Connection closed during HTTP headers"};
-    buffer.append(std::move(chunk->data));
+    buffer.append_view(chunk->view());
   }
 }
 
@@ -283,6 +286,11 @@ Result<ParsedHead> parse_head(std::string_view input) {
   result.start_line = std::string(input.substr(0, first_end));
   if (!valid_header_value(result.start_line))
     return ErrorInfo{Error::protocol, "Invalid character in HTTP start line"};
+  // The head always ends with the CRLF that terminates its last line, so the
+  // number of line breaks resolves the exact field count in one pass.
+  const auto line_breaks =
+      static_cast<std::size_t>(std::ranges::count(input, '\n'));
+  if (line_breaks > 1) result.headers.reserve(line_breaks - 1);
   std::size_t cursor = first_end + 2;
   while (cursor < input.size()) {
     const auto line_end = input.find("\r\n", cursor);
@@ -398,7 +406,7 @@ Task<Result<std::string>> read_line(
     if (!chunk) co_return chunk.error();
     if (chunk->eof)
       co_return ErrorInfo{Error::protocol, "Unexpected end of HTTP line"};
-    buffer.append(std::move(chunk->data));
+    buffer.append_view(chunk->view());
   }
 }
 
@@ -422,7 +430,53 @@ Task<Result<std::string>> read_body(
                                   received == 0 ? "First response body byte"
                                                 : "Response body idle");
   };
-  const auto deliver =
+  // Buffered downloads, synchronous callbacks and progress-only consumers never
+  // suspend, so they share one plain function instead of a coroutine frame per
+  // delivered block. Only an awaited consumer takes the coroutine path.
+  const auto deliver_now =
+      [&](std::string_view data,
+          std::optional<std::uint64_t> total) -> ErrorInfo {
+    if (data.empty())
+      return ErrorInfo{};
+    if (options.cancelled && options.cancelled())
+      return ErrorInfo{Error::cancelled, "Request cancelled"};
+    if (options.deadline &&
+        std::chrono::steady_clock::now() >= *options.deadline)
+      return ErrorInfo{Error::timeout, "Request deadline exceeded"};
+    if (data.size() > options.max_body_size ||
+        received > options.max_body_size - data.size())
+      return ErrorInfo{Error::body_too_large,
+                       "HTTP body exceeds configured limit"};
+    received += data.size();
+    try {
+      if (options.on_data) {
+        if (!options.on_data(data))
+          return ErrorInfo{Error::cancelled,
+                           "HTTP body callback cancelled the transfer"};
+      } else {
+        body.append(data);
+      }
+      if (options.on_progress &&
+          !options.on_progress(TransferProgress{received, total}))
+        return ErrorInfo{Error::cancelled,
+                         "HTTP progress callback cancelled the transfer"};
+      if (options.deadline &&
+          std::chrono::steady_clock::now() >= *options.deadline)
+        return ErrorInfo{Error::timeout, "Request deadline exceeded"};
+      // Consumer backpressure is application work, not network idleness. Start
+      // the next idle interval only after the consumer is ready again.
+      if (options.idle_timeout)
+        idle_deadline = std::chrono::steady_clock::now() + *options.idle_timeout;
+    } catch (const std::exception &exception) {
+      return ErrorInfo{Error::internal, "HTTP body callback failed: " +
+                                            std::string(exception.what())};
+    } catch (...) {
+      return ErrorInfo{Error::internal, "HTTP body callback failed"};
+    }
+    return ErrorInfo{};
+  };
+  // Invoked only when an awaited consumer is installed.
+  const auto deliver_awaited =
       [&](std::string_view data,
           std::optional<std::uint64_t> total) -> Task<ErrorInfo> {
     if (data.empty())
@@ -438,20 +492,12 @@ Task<Result<std::string>> read_body(
                           "HTTP body exceeds configured limit"};
     received += data.size();
     try {
-      if (options.on_data) {
-        if (!options.on_data(data))
-          co_return ErrorInfo{Error::cancelled,
-                              "HTTP body callback cancelled the transfer"};
-      } else if (options.on_data_async) {
-        const bool accepted = co_await options.on_data_async(data);
-        if (!connection->runtime()->on_loop_thread())
-          co_await resume_on(connection->runtime());
-        if (!accepted)
-          co_return ErrorInfo{Error::cancelled,
-                              "HTTP async body callback cancelled the transfer"};
-      } else {
-        body.append(data);
-      }
+      const bool accepted = co_await options.on_data_async(data);
+      if (!connection->runtime()->on_loop_thread())
+        co_await resume_on(connection->runtime());
+      if (!accepted)
+        co_return ErrorInfo{Error::cancelled,
+                            "HTTP async body callback cancelled the transfer"};
       if (options.on_progress &&
           !options.on_progress(TransferProgress{received, total}))
         co_return ErrorInfo{Error::cancelled,
@@ -459,11 +505,8 @@ Task<Result<std::string>> read_body(
       if (options.deadline &&
           std::chrono::steady_clock::now() >= *options.deadline)
         co_return ErrorInfo{Error::timeout, "Request deadline exceeded"};
-      // Consumer backpressure is application work, not network idleness. Start
-      // the next idle interval only after the awaited consumer is ready again.
       if (options.idle_timeout)
-        idle_deadline =
-            std::chrono::steady_clock::now() + *options.idle_timeout;
+        idle_deadline = std::chrono::steady_clock::now() + *options.idle_timeout;
     } catch (const std::exception &exception) {
       co_return ErrorInfo{Error::internal, "HTTP body callback failed: " +
                                                std::string(exception.what())};
@@ -472,6 +515,9 @@ Task<Result<std::string>> read_body(
     }
     co_return ErrorInfo{};
   };
+  // A synchronous consumer keeps precedence, matching the historical order.
+  const bool awaited_delivery =
+      static_cast<bool>(options.on_data_async) && !options.on_data;
   if (no_body)
     co_return body;
 
@@ -549,12 +595,30 @@ Task<Result<std::string>> read_body(
           if (chunk->eof)
             co_return ErrorInfo{Error::protocol,
                                 "Unexpected end of HTTP chunk"};
-          buffer.append(std::move(chunk->data));
+          if (!chunk->empty()) {
+            const auto received = chunk->view();
+            const auto direct = static_cast<std::size_t>(
+                std::min<std::uint64_t>(remaining, received.size()));
+            auto error =
+                awaited_delivery
+                    ? co_await deliver_awaited(received.substr(0, direct),
+                                               std::nullopt)
+                    : deliver_now(received.substr(0, direct), std::nullopt);
+            if (error) co_return error;
+            if (direct < received.size())
+              buffer.append_view(received.substr(direct));
+            remaining -= direct;
+            continue;
+          }
+          continue;
         }
         const auto count = static_cast<std::size_t>(
             std::min<std::uint64_t>(remaining, buffer.size()));
-        auto error = co_await deliver(
-            buffer.view().substr(0, count), std::nullopt);
+        auto error = awaited_delivery
+                         ? co_await deliver_awaited(
+                               buffer.view().substr(0, count), std::nullopt)
+                         : deliver_now(buffer.view().substr(0, count),
+                                       std::nullopt);
         if (error) co_return error;
         buffer.consume(count);
         remaining -= count;
@@ -566,7 +630,7 @@ Task<Result<std::string>> read_body(
         if (chunk->eof)
           co_return ErrorInfo{Error::protocol,
                               "Unexpected end after HTTP chunk"};
-        buffer.append(std::move(chunk->data));
+        buffer.append_view(chunk->view());
       }
       if (buffer[0] != '\r' || buffer[1] != '\n')
         co_return ErrorInfo{Error::protocol, "Chunk payload lacks CRLF"};
@@ -588,12 +652,31 @@ Task<Result<std::string>> read_body(
           co_return chunk.error();
         if (chunk->eof)
           co_return ErrorInfo{Error::protocol, "Truncated HTTP body"};
-        buffer.append(std::move(chunk->data));
+        // With no buffered bytes pending, a received block can be handed to the
+        // consumer straight from the read chunk. Large bodies therefore skip a
+        // full copy through the incremental buffer.
+        if (!chunk->empty()) {
+          const auto received = chunk->view();
+          const auto direct = static_cast<std::size_t>(
+              std::min<std::uint64_t>(remaining, received.size()));
+          auto error = awaited_delivery
+                           ? co_await deliver_awaited(received.substr(0, direct),
+                                                      total)
+                           : deliver_now(received.substr(0, direct), total);
+          if (error) co_return error;
+          if (direct < received.size())
+            buffer.append_view(received.substr(direct));
+          remaining -= direct;
+          continue;
+        }
+        continue;
       }
       const auto count = static_cast<std::size_t>(
           std::min<std::uint64_t>(remaining, buffer.size()));
-      auto error = co_await deliver(
-          buffer.view().substr(0, count), total);
+      auto error = awaited_delivery
+                       ? co_await deliver_awaited(
+                             buffer.view().substr(0, count), total)
+                       : deliver_now(buffer.view().substr(0, count), total);
       if (error) co_return error;
       buffer.consume(count);
       remaining -= count;
@@ -603,7 +686,9 @@ Task<Result<std::string>> read_body(
 
   if (body_until_eof) {
     if (!buffer.empty()) {
-      auto error = co_await deliver(buffer.view(), std::nullopt);
+      auto error = awaited_delivery
+                       ? co_await deliver_awaited(buffer.view(), std::nullopt)
+                       : deliver_now(buffer.view(), std::nullopt);
       buffer.clear();
       if (error)
         co_return error;
@@ -614,7 +699,9 @@ Task<Result<std::string>> read_body(
         co_return chunk.error();
       if (chunk->eof)
         break;
-      auto error = co_await deliver(chunk->data, std::nullopt);
+      auto error = awaited_delivery
+                       ? co_await deliver_awaited(chunk->view(), std::nullopt)
+                       : deliver_now(chunk->view(), std::nullopt);
       if (error)
         co_return error;
     }
@@ -622,20 +709,77 @@ Task<Result<std::string>> read_body(
   co_return body;
 }
 
-Result<std::string> serialize_head(std::string start_line,
-                                   const Headers &headers) {
+// An outbound field that replaces the first equal field of the source set (or
+// is appended when the source has none), mirroring Headers::set without copying
+// the whole set first.
+struct HeadOverride {
+  std::string_view name;
+  std::string_view value;
+};
+
+// Emits the field set in order while substituting `overrides` at the position of
+// the first equal field and dropping every field named in `omitted`. This
+// reproduces Headers::set/erase semantics for the outgoing message without
+// materialising a mutable copy of the caller's headers.
+Result<std::string>
+serialize_head(std::string start_line, const Headers &headers,
+               std::span<const HeadOverride> overrides = {},
+               std::span<const std::string_view> omitted = {}) {
   if (start_line.find_first_of("\r\n") != std::string::npos)
     return ErrorInfo{Error::protocol, "Invalid HTTP start line"};
-  std::string output = std::move(start_line) + "\r\n";
+  constexpr std::size_t max_overrides = 8;
+  if (overrides.size() > max_overrides)
+    return ErrorInfo{Error::internal, "Too many HTTP header overrides"};
+  // Size the output once so a response with many headers performs a single
+  // allocation instead of growing the buffer while appending.
+  std::size_t total = start_line.size() + 4;
   for (const auto &[name, value] : headers) {
     if (!valid_header_name(name) || !valid_header_value(value))
       return ErrorInfo{Error::protocol, "Invalid outbound HTTP header"};
-    output += name;
-    output += ": ";
-    output += value;
-    output += "\r\n";
+    total += name.size() + value.size() + 4;
   }
-  output += "\r\n";
+  for (const auto &field : overrides) {
+    if (!valid_header_name(field.name) || !valid_header_value(field.value))
+      return ErrorInfo{Error::protocol, "Invalid outbound HTTP header"};
+    total += field.name.size() + field.value.size() + 4;
+  }
+  std::string output;
+  output.reserve(total);
+  output.append(start_line);
+  output.append("\r\n");
+  std::array<bool, max_overrides> emitted{};
+  for (const auto &[name, value] : headers) {
+    if (std::ranges::any_of(omitted, [&](std::string_view candidate) {
+          return iequals(name, candidate);
+        }))
+      continue;
+    bool replaced = false;
+    for (std::size_t index = 0; index < overrides.size(); ++index) {
+      if (!iequals(name, overrides[index].name)) continue;
+      if (!emitted[index]) {
+        emitted[index] = true;
+        output.append(overrides[index].name);
+        output.append(": ");
+        output.append(overrides[index].value);
+        output.append("\r\n");
+      }
+      replaced = true;
+      break;
+    }
+    if (replaced) continue;
+    output.append(name);
+    output.append(": ");
+    output.append(value);
+    output.append("\r\n");
+  }
+  for (std::size_t index = 0; index < overrides.size(); ++index) {
+    if (emitted[index]) continue;
+    output.append(overrides[index].name);
+    output.append(": ");
+    output.append(overrides[index].value);
+    output.append("\r\n");
+  }
+  output.append("\r\n");
   return output;
 }
 
@@ -896,7 +1040,7 @@ private:
         open_ = false;
         co_return ErrorInfo{Error::websocket_closed, "WebSocket transport closed"};
       }
-      buffer_.append(std::move(chunk->data));
+      buffer_.append_view(chunk->view());
     }
     co_return ErrorInfo{};
   }
@@ -958,7 +1102,8 @@ private:
 
 Task<Result<RequestHeadResult>>
 read_request_head(const std::shared_ptr<Connection> &connection,
-                  ReadBuffer &buffer, const HttpReadOptions &options) {
+                  ReadBuffer &buffer, const HttpReadOptions &options,
+                  bool duplicate_headers) {
   auto bytes = co_await read_head_bytes(connection, buffer, options);
   if (!bytes) co_return bytes.error();
   auto head = parse_head(*bytes);
@@ -1023,7 +1168,7 @@ read_request_head(const std::shared_ptr<Connection> &connection,
       .content_length = head->content_length,
       .chunked = head->chunked,
       .expect_continue = expect_continue};
-  request.headers = body_state.headers;
+  if (duplicate_headers) request.headers = body_state.headers;
   co_return RequestHeadResult{std::move(request), std::move(body_state)};
 }
 
@@ -1038,13 +1183,17 @@ read_request_body(const std::shared_ptr<Connection> &connection,
     state.continue_sent = true;
   }
   ParsedHead head{
-      .headers = state.headers,
+      // Moving the parsed fields into the body reader keeps trailers in the
+      // same storage, so a request with a body does not copy every header.
+      .headers = std::move(state.headers),
       .content_length = state.content_length,
       .chunked = state.chunked};
-  HttpReadOptions body_options = options;
-  const auto encoding = state.headers.get("Content-Encoding");
-  const bool decode = options.auto_decompress && !encoding.empty() &&
-                      !iequals(encoding, "identity");
+  // Only the decoding path needs a mutated option set; copying it would duplicate
+  // every callback for the common non-compressed request.
+  std::optional<HttpReadOptions> decoded_options;
+  const auto *encoding = find_header(head.headers, "Content-Encoding");
+  const bool decode = options.auto_decompress && encoding != nullptr &&
+                      !encoding->empty() && !iequals(*encoding, "identity");
   std::unique_ptr<StreamingDecoder> decoder;
   std::string decoded_body;
   std::uint64_t decoded_received = 0;
@@ -1089,21 +1238,27 @@ read_request_body(const std::shared_ptr<Connection> &connection,
     co_return ErrorInfo{};
   };
   if (decode) {
-    auto created = StreamingDecoder::create(encoding, options.max_body_size);
+    auto created = StreamingDecoder::create(*encoding, options.max_body_size);
     if (!created) co_return created.error();
     decoder = std::move(*created);
-    body_options.on_data = {};
-    body_options.on_data_async = [&](std::string_view data) -> Task<bool> {
+    decoded_options = options;
+    decoded_options->on_data = {};
+    decoded_options->on_data_async = [&](std::string_view data) -> Task<bool> {
       decode_error = co_await decoder->feed(data, false, consume_decoded);
       co_return !decode_error;
     };
-    body_options.on_progress = {};
+    decoded_options->on_progress = {};
   }
-  auto body = co_await read_body(connection, buffer, head, body_options, false,
-                                 false);
+  auto body = co_await read_body(connection, buffer, head,
+                                 decoded_options ? *decoded_options : options,
+                                 false, false);
   if (!connection->runtime()->on_loop_thread())
     co_await resume_on(connection->runtime());
-  if (!body) co_return decode_error ? decode_error : body.error();
+  if (!body) {
+    // The caller still observes the parsed fields when the body read fails.
+    state.headers = std::move(head.headers);
+    co_return decode_error ? decode_error : body.error();
+  }
   state.headers = std::move(head.headers);
   if (decode) {
     if (auto error = co_await decoder->feed({}, true, consume_decoded); error)
@@ -1185,10 +1340,13 @@ Task<ResponseResult> read_response(
                             "HTTP response head callback failed"};
       }
     }
-    HttpReadOptions body_options = options;
-    const auto encoding = head->headers.get("Content-Encoding");
-    const bool decode = !no_body && options.auto_decompress && !encoding.empty() &&
-                        !iequals(encoding, "identity");
+    // Only the decoding path needs a mutated option set; copying it would
+    // duplicate every callback for the common uncompressed response.
+    std::optional<HttpReadOptions> decoded_options;
+    const auto *encoding = find_header(head->headers, "Content-Encoding");
+    const bool decode = !no_body && options.auto_decompress &&
+                        encoding != nullptr && !encoding->empty() &&
+                        !iequals(*encoding, "identity");
     std::unique_ptr<StreamingDecoder> decoder;
     std::string decoded_body;
     std::uint64_t decoded_received = 0;
@@ -1261,11 +1419,12 @@ Task<ResponseResult> read_response(
       co_return ErrorInfo{};
     };
     if (decode) {
-      auto created = StreamingDecoder::create(encoding, options.max_body_size);
+      auto created = StreamingDecoder::create(*encoding, options.max_body_size);
       if (!created) co_return created.error();
       decoder = std::move(*created);
-      body_options.on_data = {};
-      body_options.on_data_async =
+      decoded_options = options;
+      decoded_options->on_data = {};
+      decoded_options->on_data_async =
           [&](std::string_view data) -> Task<bool> {
         if (options.on_data_async)
           decode_error = co_await decoder->feed(data, false, consume_decoded);
@@ -1273,9 +1432,10 @@ Task<ResponseResult> read_response(
           decode_error = co_await decoder->feed(data, false, consume_decoded_sync);
         co_return !decode_error;
       };
-      body_options.on_progress = {};
+      decoded_options->on_progress = {};
     }
-    auto body = co_await read_body(connection, buffer, *head, body_options,
+    auto body = co_await read_body(connection, buffer, *head,
+                                   decoded_options ? *decoded_options : options,
                                    until_eof, no_body);
     if (!connection->runtime()->on_loop_thread())
       co_await resume_on(connection->runtime());
@@ -1424,24 +1584,38 @@ Task<ErrorInfo> write_request(const std::shared_ptr<Connection> &connection,
         Error::invalid_argument,
         "HTTP/1.0 streamed request bodies require a Content-Length"};
 
-  Headers headers = request.headers;
-  headers.erase("Transfer-Encoding");
+  // Serialize overrides instead of copying the whole field set: Headers::set
+  // replaces the first equal field in place and appends when there is none, so
+  // the emitted order stays identical without a per-request header copy.
+  std::string generated_length;
+  std::array<HeadOverride, 4> overrides;
+  std::size_t override_count = 0;
+  std::array<std::string_view, 2> omitted;
+  std::size_t omitted_count = 0;
   if (chunked) {
-    headers.erase("Content-Length");
-    headers.set("Transfer-Encoding", "chunked");
-  } else if (streaming) {
-    headers.set("Content-Length", std::to_string(*request.body_stream_length));
+    omitted[omitted_count++] = "Content-Length";
+    overrides[override_count++] = {"Transfer-Encoding", "chunked"};
   } else {
-    headers.set("Content-Length", std::to_string(request.body.size()));
+    omitted[omitted_count++] = "Transfer-Encoding";
+    generated_length = std::to_string(streaming ? *request.body_stream_length
+                                                : request.body.size());
+    overrides[override_count++] = {"Content-Length", generated_length};
   }
-  if (!headers.contains("Connection"))
-    headers.set("Connection", request.keep_alive ? "keep-alive" : "close");
-  if (!headers.contains("User-Agent"))
-    headers.set("User-Agent", "chhttp/0.4");
+  if (find_header(request.headers, "Connection") == nullptr)
+    overrides[override_count++] = {"Connection",
+                                   request.keep_alive ? "keep-alive" : "close"};
+  if (find_header(request.headers, "User-Agent") == nullptr)
+    overrides[override_count++] = {"User-Agent", "chhttp/0.4"};
+  std::string start_line;
+  start_line.reserve(request.method.size() + wire_target.size() + 16);
+  start_line.append(request.method);
+  start_line.push_back(' ');
+  start_line.append(wire_target);
+  start_line.append(request.version == 10 ? " HTTP/1.0" : " HTTP/1.1");
   auto output =
-      serialize_head(request.method + " " + std::string(wire_target) +
-                         (request.version == 10 ? " HTTP/1.0" : " HTTP/1.1"),
-                     headers);
+      serialize_head(std::move(start_line), request.headers,
+                     std::span(overrides.data(), override_count),
+                     std::span(omitted.data(), omitted_count));
   if (!output)
     co_return output.error();
   if (streaming) {
@@ -1523,39 +1697,64 @@ Task<ErrorInfo> write_request(const std::shared_ptr<Connection> &connection,
   co_return ErrorInfo{};
 }
 
+namespace {
+
+// Builds the response head in one allocation. Overrides are substituted while
+// the caller's field set is emitted, mirroring Headers::set/erase, so no header
+// copy is made.
+Result<std::string> build_response_head(const Request &request,
+                                        const Response &response, bool chunked,
+                                        std::optional<std::uint64_t> content_length) {
+  if ((response.version != 10 && response.version != 11) ||
+      response.status < 100 || response.status > 999)
+    return ErrorInfo{Error::protocol, "Invalid outbound HTTP response line"};
+  const bool keep = request.keep_alive && response.keep_alive;
+  std::string generated_length;
+  std::array<HeadOverride, 4> overrides;
+  std::size_t override_count = 0;
+  std::array<std::string_view, 2> omitted;
+  std::size_t omitted_count = 0;
+  if (find_header(response.headers, "Server") == nullptr)
+    overrides[override_count++] = {"Server", "chhttp/0.4"};
+  overrides[override_count++] = {"Connection", keep ? "keep-alive" : "close"};
+  if ((response.status >= 100 && response.status < 200) ||
+      response.status == 204) {
+    omitted[omitted_count++] = "Content-Length";
+    omitted[omitted_count++] = "Transfer-Encoding";
+  } else if (response.status == 205) {
+    omitted[omitted_count++] = "Transfer-Encoding";
+    overrides[override_count++] = {"Content-Length", "0"};
+  } else if (chunked) {
+    omitted[omitted_count++] = "Content-Length";
+    overrides[override_count++] = {"Transfer-Encoding", "chunked"};
+  } else if (content_length) {
+    omitted[omitted_count++] = "Transfer-Encoding";
+    generated_length = std::to_string(*content_length);
+    overrides[override_count++] = {"Content-Length", generated_length};
+  } else {
+    omitted[omitted_count++] = "Transfer-Encoding";
+    omitted[omitted_count++] = "Content-Length";
+  }
+  const auto reason = status_reason_view(response.status);
+  std::string start_line;
+  start_line.reserve(16 + reason.size());
+  start_line.append(response.version == 10 ? "HTTP/1.0 " : "HTTP/1.1 ");
+  start_line.append(std::to_string(response.status));
+  start_line.push_back(' ');
+  start_line.append(reason);
+  return serialize_head(std::move(start_line), response.headers,
+                        std::span(overrides.data(), override_count),
+                        std::span(omitted.data(), omitted_count));
+}
+
+} // namespace
+
 Task<ErrorInfo> write_response_head(
     const std::shared_ptr<Connection> &connection, const Request &request,
     const Response &response, bool chunked,
     std::optional<std::uint64_t> content_length,
     std::chrono::milliseconds timeout) {
-  if ((response.version != 10 && response.version != 11) ||
-      response.status < 100 || response.status > 999)
-    co_return ErrorInfo{Error::protocol, "Invalid outbound HTTP response line"};
-  Headers headers = response.headers;
-  if (!headers.contains("Server")) headers.set("Server", "chhttp/0.4");
-  const bool keep = request.keep_alive && response.keep_alive;
-  headers.set("Connection", keep ? "keep-alive" : "close");
-  if ((response.status >= 100 && response.status < 200) ||
-      response.status == 204) {
-    headers.erase("Content-Length");
-    headers.erase("Transfer-Encoding");
-  } else if (response.status == 205) {
-    headers.erase("Transfer-Encoding");
-    headers.set("Content-Length", "0");
-  } else if (chunked) {
-    headers.erase("Content-Length");
-    headers.set("Transfer-Encoding", "chunked");
-  } else if (content_length) {
-    headers.erase("Transfer-Encoding");
-    headers.set("Content-Length", std::to_string(*content_length));
-  } else {
-    headers.erase("Transfer-Encoding");
-    headers.erase("Content-Length");
-  }
-  auto output = serialize_head(
-      std::string(response.version == 10 ? "HTTP/1.0 " : "HTTP/1.1 ") +
-          std::to_string(response.status) + " " + status_reason(response.status),
-      headers);
+  auto output = build_response_head(request, response, chunked, content_length);
   if (!output) co_return output.error();
   co_return co_await connection->write(std::move(*output), timeout);
 }
@@ -1565,6 +1764,18 @@ Task<ErrorInfo> write_response(const std::shared_ptr<Connection> &connection,
                                std::chrono::milliseconds timeout) {
   const bool omit = iequals(request.method, "HEAD") ||
                     status_has_no_body(response.status);
+  // A small buffered body is coalesced with the head into a single write, which
+  // saves a syscall; write_body_bytes() would copy the body anyway.
+  constexpr std::size_t coalesce_limit = 64 * 1024;
+  if (!omit && !response.body.empty() &&
+      response.body.size() <= coalesce_limit) {
+    auto output =
+        build_response_head(request, response, false, response.body.size());
+    if (!output) co_return output.error();
+    output->reserve(output->size() + response.body.size());
+    output->append(response.body);
+    co_return co_await connection->write(std::move(*output), timeout);
+  }
   auto error = co_await write_response_head(connection, request, response, false,
                                              response.body.size(), timeout);
   if (error || omit || response.body.empty()) co_return error;
@@ -1607,13 +1818,23 @@ Task<ErrorInfo> write_last_chunk(
 }
 
 bool is_websocket_upgrade(const Request &request) {
-  return iequals(request.method, "GET") &&
-         has_token(request.headers, "Connection", "upgrade") &&
-         has_token(request.headers, "Upgrade", "websocket") &&
-         request.headers.get_all("Sec-WebSocket-Version").size() == 1 &&
-         request.headers.get_all("Sec-WebSocket-Key").size() == 1 &&
-         request.headers.get("Sec-WebSocket-Version") == "13" &&
-         request.headers.contains("Sec-WebSocket-Key");
+  if (!iequals(request.method, "GET")) return false;
+  if (!has_token(request.headers, "Connection", "upgrade") ||
+      !has_token(request.headers, "Upgrade", "websocket"))
+    return false;
+  // A single scan counts both handshake fields without materialising header
+  // value copies for every request that is not an upgrade.
+  std::size_t versions = 0;
+  std::size_t keys = 0;
+  for (const auto &[name, value] : request.headers) {
+    if (iequals(name, "Sec-WebSocket-Version")) {
+      if (value != "13") return false;
+      ++versions;
+    } else if (iequals(name, "Sec-WebSocket-Key")) {
+      ++keys;
+    }
+  }
+  return versions == 1 && keys == 1;
 }
 
 Task<ErrorInfo> websocket_server_handshake(
