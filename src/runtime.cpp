@@ -62,17 +62,21 @@ void Runtime::async_callback(uv_async_t *handle) {
 }
 
 void Runtime::drain() {
-  std::deque<std::function<void()>> callbacks;
+  // The loop thread owns the scratch buffer, so it is reused across deliveries
+  // instead of materialising (and immediately discarding) a fresh deque for
+  // every wake-up. Swapping only exchanges the internal maps, which stay
+  // allocated for the next batch.
   {
     std::lock_guard lock(queue_mutex_);
-    callbacks.swap(queue_);
+    std::swap(drain_scratch_, queue_);
   }
-  for (auto &callback : callbacks) {
+  for (auto &callback : drain_scratch_) {
     try {
       callback();
     } catch (...) {
     }
   }
+  drain_scratch_.clear();
 }
 
 void Runtime::stop() {
@@ -118,23 +122,6 @@ void stop_runtime(std::shared_ptr<Runtime> runtime) noexcept {
     std::lock_guard lock(retained_mutex);
     retained.push_back(std::move(runtime));
   }
-}
-
-namespace {
-
-struct ResumeOnAwaiter {
-  std::shared_ptr<Runtime> runtime;
-  bool await_ready() const noexcept { return runtime->on_loop_thread(); }
-  void await_suspend(std::coroutine_handle<> continuation) {
-    runtime->post([continuation] { continuation.resume(); });
-  }
-  void await_resume() const noexcept {}
-};
-
-} // namespace
-
-Task<void> resume_on(std::shared_ptr<Runtime> runtime) {
-  co_await ResumeOnAwaiter{std::move(runtime)};
 }
 
 struct Connection::PendingRead {
@@ -652,10 +639,16 @@ Connection::read(std::chrono::milliseconds timeout) {
   if (!runtime_->on_loop_thread()) co_await resume_on(runtime_);
 #ifdef CHHTTP_HAS_TLS
   if (ssl_) {
+    // The decrypted block lives in a per-connection buffer rather than in this
+    // coroutine's frame. A 16 KiB local that is live across the flush below would
+    // otherwise be reserved in every frame of this coroutine, including plain
+    // connections that never take the TLS branch, and a suspended read would keep
+    // the whole 16 KiB resident for as long as the peer is quiet.
+    char *const output = tls_read_scratch();
+    const std::size_t output_size = tls_scratch_size;
     for (;;) {
-      std::array<char, 16 * 1024> output;
       std::size_t count = 0;
-      const int status = SSL_read_ex(ssl_, output.data(), output.size(), &count);
+      const int status = SSL_read_ex(ssl_, output, output_size, &count);
       const int ssl_error =
           status == 1 ? SSL_ERROR_NONE : SSL_get_error(ssl_, status);
       const auto tls_code =
@@ -667,8 +660,7 @@ Connection::read(std::chrono::milliseconds timeout) {
       auto flushed = co_await flush_tls(timeout);
       if (flushed) co_return flushed;
       if (status == 1 && count > 0)
-        co_return ReadChunk::copy_of(
-            std::string_view(output.data(), static_cast<std::size_t>(count)));
+        co_return ReadChunk::copy_of(std::string_view(output, count));
       if (ssl_error == SSL_ERROR_ZERO_RETURN) co_return ReadChunk::closed();
       if (ssl_error != SSL_ERROR_WANT_READ && ssl_error != SSL_ERROR_WANT_WRITE) {
         co_return ErrorInfo{Error::read, "TLS read failed", ssl_error,
@@ -756,6 +748,15 @@ ErrorInfo Connection::enable_tls(SSL_CTX *context, bool server,
   if (!runtime_->on_loop_thread())
     return ErrorInfo{Error::tls_configuration,
                      "TLS must be initialized on the owning libuv loop"};
+  try {
+    tls_read_scratch_.reset(new char[tls_scratch_size]);
+    tls_flush_scratch_.reset(new char[tls_scratch_size]);
+  } catch (const std::bad_alloc &) {
+    tls_read_scratch_.reset();
+    tls_flush_scratch_.reset();
+    return ErrorInfo{Error::tls_configuration,
+                     "Unable to allocate TLS scratch buffers"};
+  }
   ssl_ = SSL_new(context);
   if (!ssl_)
     return ErrorInfo{Error::tls_configuration, "Unable to allocate TLS state",
@@ -802,11 +803,16 @@ ErrorInfo Connection::enable_tls(SSL_CTX *context, bool server,
 Task<ErrorInfo> Connection::flush_tls(std::chrono::milliseconds timeout) {
   BIO *output = SSL_get_wbio(ssl_);
   while (BIO_ctrl_pending(output) > 0) {
-    std::array<char, 16 * 1024> buffer{};
+    // A connection-wide ciphertext scratch keeps this buffer out of the coroutine
+    // frame. Sharing it between the read and write paths is safe because each use
+    // copies what it needs into a std::string before reaching a suspension point,
+    // so two flushes can never be interleaved inside the BIO_read.
+    char *const buffer = tls_flush_scratch();
     const int count =
-        BIO_read(output, buffer.data(), static_cast<int>(buffer.size()));
+        BIO_read(output, buffer, static_cast<int>(tls_scratch_size));
     if (count <= 0) break;
-    auto error = co_await raw_write(std::string(buffer.data(), count), timeout);
+    auto error = co_await raw_write(std::string(buffer, static_cast<std::size_t>(count)),
+                                    timeout);
     if (error) co_return error;
   }
   co_return ErrorInfo{};

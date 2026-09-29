@@ -1127,6 +1127,51 @@ TEST(native_http_protocol_framing_pipeline_and_expect) {
   server.stop();
 }
 
+// Verifies that a request declaring no body leaves the pipeline synchronized for
+// the next pipelined request. The server skips the body reader entirely for a
+// body-less request, so a regression that consumed or retained bytes would
+// desynchronize the following request on the same connection.
+TEST(bodyless_requests_keep_pipelined_streams_synchronized) {
+  chhttp::Server server;
+  server.get("/plain", [](const chhttp::Request &request,
+                          chhttp::Response &response) {
+    response.set_content("plain:" + request.target + ":" +
+                         std::to_string(request.body.size()));
+  });
+  server.post("/echo", [](const chhttp::Request &request,
+                          chhttp::Response &response) {
+    response.set_content("echo:" + request.body);
+  });
+  CHECK(server.start("127.0.0.1", 0));
+  // A body-less GET, a POST that declares zero length, and a POST with a real
+  // body are pipelined into a single write so the server observes them in one
+  // buffered read.
+  const auto response = raw_http_exchange(
+      server.port(),
+      "GET /plain HTTP/1.1\r\n"
+      "Host: localhost\r\n"
+      "Connection: keep-alive\r\n\r\n"
+      "POST /echo HTTP/1.1\r\n"
+      "Host: localhost\r\n"
+      "Content-Length: 0\r\n"
+      "Connection: keep-alive\r\n\r\n"
+      "POST /echo HTTP/1.1\r\n"
+      "Host: localhost\r\n"
+      "Content-Length: 5\r\n"
+      "Connection: keep-alive\r\n\r\n"
+      "hello"
+      "GET /plain?after=1 HTTP/1.1\r\n"
+      "Host: localhost\r\n"
+      "Connection: close\r\n\r\n");
+  CHECK(response.find("plain:/plain:0") != std::string::npos);
+  CHECK(response.find("echo:") != std::string::npos);
+  CHECK(response.find("echo:hello") != std::string::npos);
+  // The final request is only reachable when every earlier body was consumed
+  // exactly once.
+  CHECK(response.find("plain:/plain?after=1:0") != std::string::npos);
+  server.stop();
+}
+
 // Verifies opt-in HTTP/1.0 keep-alive across two pipelined requests and an explicit final close.
 TEST(http10_keep_alive_can_process_multiple_pipelined_requests) {
   chhttp::Server server;
@@ -5791,6 +5836,156 @@ TEST(stress_concurrent_file_upload_download_and_cancellation) {
     else CHECK(result && result->body == std::string(256 * 1024, static_cast<char>('a' + i % 26)));
   }
   server.stop();
+}
+
+// ---------------------------------------------------------------------------
+// Task completion hand-off. Every coroutine in the library publishes its result
+// through one atomic word, so the three consumption shapes (already finished,
+// awaiting coroutine, blocking thread) each need a dedicated probe.
+// ---------------------------------------------------------------------------
+
+// Lets a test hold a coroutine suspended until it says otherwise, which makes the
+// "consumer arrived first" ordering deterministic instead of timing dependent.
+struct HandoffGate {
+  std::mutex mutex;
+  std::coroutine_handle<> continuation;
+  std::atomic_bool armed{false};
+
+  // Resumes the parked coroutine once it has actually suspended.
+  void open() {
+    while (!armed.load(std::memory_order_acquire))
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    std::coroutine_handle<> pending;
+    {
+      std::lock_guard lock(mutex);
+      pending = continuation;
+    }
+    if (pending) pending.resume();
+  }
+};
+
+struct HandoffGateAwaiter {
+  std::shared_ptr<HandoffGate> gate;
+  bool await_ready() const noexcept { return false; }
+  void await_suspend(std::coroutine_handle<> continuation) const {
+    std::lock_guard lock(gate->mutex);
+    gate->continuation = continuation;
+    gate->armed.store(true, std::memory_order_release);
+  }
+  void await_resume() const noexcept {}
+};
+
+chhttp::Task<int> gated_value(std::shared_ptr<HandoffGate> gate, int value) {
+  co_await HandoffGateAwaiter{gate};
+  co_return value;
+}
+
+chhttp::Task<int> immediately_ready_value() { co_return 11; }
+
+chhttp::Task<int> immediately_failing_value() {
+  throw std::runtime_error("immediate failure");
+  co_return 0;
+}
+
+// Awaits another Task, so the inner completion has to resume a suspended
+// coroutine rather than a parked thread.
+chhttp::Task<int> awaiting_consumer(std::shared_ptr<HandoffGate> gate, int value) {
+  auto inner = gated_value(gate, value);
+  co_return co_await std::move(inner);
+}
+
+chhttp::Task<int> awaiting_task_consumer(chhttp::Task<int> inner) {
+  co_return co_await std::move(inner);
+}
+
+TEST(task_handoff_serves_eager_awaiting_blocking_and_throwing_consumers) {
+  // Finished before anyone consumed it: ready() is true and consuming later must
+  // not park.
+  {
+    chhttp::Task<int> task = immediately_ready_value();
+    CHECK(task.ready());
+    CHECK(task.get() == 11);
+    CHECK(task.ready());
+  }
+  // A suspending consumer that is resumed from the completing side.
+  {
+    auto gate = std::make_shared<HandoffGate>();
+    auto outer = awaiting_consumer(gate, 5);
+    CHECK(!outer.ready());
+    gate->open();
+    CHECK(outer.ready());
+    CHECK(outer.get() == 5);
+  }
+  // A blocking consumer parked on another thread while the coroutine finishes.
+  {
+    auto gate = std::make_shared<HandoffGate>();
+    auto task = gated_value(gate, 9);
+    CHECK(!task.ready());
+    std::atomic_int observed{0};
+    std::thread consumer([&] { observed.store(task.get(), std::memory_order_release); });
+    gate->open();
+    consumer.join();
+    CHECK(observed.load() == 9);
+    CHECK(task.ready());
+  }
+  // A thread that blocks only after completion must observe the value too.
+  {
+    auto gate = std::make_shared<HandoffGate>();
+    auto task = gated_value(gate, 13);
+    gate->open();
+    CHECK(task.ready());
+    std::atomic_int observed{0};
+    std::thread consumer([&] { observed.store(task.get(), std::memory_order_release); });
+    consumer.join();
+    CHECK(observed.load() == 13);
+  }
+  // An exception must travel through the same hand-off, both to a blocking
+  // consumer and to an awaiting one.
+  {
+    chhttp::Task<int> task = immediately_failing_value();
+    CHECK(task.ready());
+    bool rethrown = false;
+    try {
+      (void)task.get();
+    } catch (const std::runtime_error &error) {
+      rethrown = std::string(error.what()) == "immediate failure";
+    }
+    CHECK(rethrown);
+  }
+  {
+    bool rethrown = false;
+    try {
+      (void)awaiting_task_consumer(immediately_failing_value()).get();
+    } catch (const std::runtime_error &) {
+      rethrown = true;
+    }
+    CHECK(rethrown);
+  }
+}
+
+// Alternates the two racing orders: the consumer reaches the hand-off before the
+// producer publishes, and after. Both must complete exactly once and observe the
+// value.
+TEST(stress_task_handoff_completes_exactly_once_under_contention) {
+  for (int round = 0; round < 400; ++round) {
+    auto gate = std::make_shared<HandoffGate>();
+    auto task = gated_value(gate, round);
+    std::atomic_int observed{-1};
+    std::atomic_bool finished{false};
+    std::thread consumer([&] {
+      observed.store(task.get(), std::memory_order_release);
+      finished.store(true, std::memory_order_release);
+    });
+    if (round % 2 == 0) {
+      // Publish while the consumer is still on its way into the hand-off.
+      std::this_thread::yield();
+    }
+    gate->open();
+    consumer.join();
+    CHECK(finished.load());
+    CHECK(observed.load() == round);
+    CHECK(task.ready());
+  }
 }
 
 #include "merge_tests.inc"

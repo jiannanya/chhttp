@@ -28,8 +28,10 @@
 #include <windows.h>
 #elif defined(__APPLE__)
 #include <mach/mach.h>
+#include <malloc/malloc.h>
 #include <sys/resource.h>
 #else
+#include <malloc.h>
 #include <sys/resource.h>
 #include <unistd.h>
 #endif
@@ -108,6 +110,42 @@ std::size_t current_resident_bytes() {
 #else
   return 0;
 #endif
+}
+
+// Bytes the allocator has handed out, and how many blocks that is.
+//
+// Resident memory is the number an operator sees, but it also counts the pages
+// the allocator has committed for its own bookkeeping. A burst of short-lived
+// allocations enlarges that footprint far beyond what is live at the sampling
+// moment, which makes RSS look like "cost per connection" when it is really
+// "peak churn". These counters are what actually move when per-connection or
+// per-request retention changes, so memory cases report both.
+struct HeapUsage {
+  std::size_t in_use{0};
+  std::size_t blocks{0};
+  [[nodiscard]] bool available() const { return blocks != 0 || in_use != 0; }
+};
+
+HeapUsage heap_usage() {
+#if defined(__APPLE__)
+  malloc_statistics_t statistics{};
+  malloc_zone_statistics(malloc_default_zone(), &statistics);
+  return {statistics.size_in_use, statistics.blocks_in_use};
+#elif defined(__linux__) && defined(__GLIBC__) &&                              \
+    (__GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ >= 33))
+  const auto info = mallinfo2();
+  return {static_cast<std::size_t>(info.uordblks), 0};
+#else
+  return {};
+#endif
+}
+
+void report_heap(const char *label, HeapUsage value, HeapUsage baseline) {
+  const auto per =
+      static_cast<double>(value.in_use) - static_cast<double>(baseline.in_use);
+  std::printf("    %-24s %8.2f MiB live  (%+.2f MiB, %+zd blocks)\n", label,
+              static_cast<double>(value.in_use) / 1048576.0, per / 1048576.0,
+              static_cast<long>(value.blocks) - static_cast<long>(baseline.blocks));
 }
 
 void report_memory(const char *label, std::size_t bytes, std::size_t baseline) {
@@ -400,8 +438,11 @@ void benchmark_idle_connections(std::size_t connections) {
   client_options.max_connections_per_origin = connections;
   client_options.connection_pool_size = connections;
   const auto baseline = current_resident_bytes();
+  const auto heap_baseline = heap_usage();
   std::size_t idle_bytes = 0;
   std::size_t reused_bytes = 0;
+  HeapUsage idle_heap{};
+  HeapUsage reused_heap{};
   bool completed = false;
   {
     chhttp::AsyncClient client("http://127.0.0.1:" + std::to_string(server.port()),
@@ -418,11 +459,13 @@ void benchmark_idle_connections(std::size_t connections) {
     if (ok) {
       // Every socket is parked in the pool at this point.
       idle_bytes = current_resident_bytes();
+      idle_heap = heap_usage();
       // Prove each parked socket is usable, so the sample cannot hide sockets
       // that would be discarded on the next use.
       for (std::size_t index = 0; index < connections; ++index)
         client.get("/ping").get();
       reused_bytes = current_resident_bytes();
+      reused_heap = heap_usage();
       completed = true;
     } else {
       std::printf("idle-connection benchmark: request failed\n");
@@ -437,13 +480,34 @@ void benchmark_idle_connections(std::size_t connections) {
     report_memory("all idle", idle_bytes, baseline);
     report_memory("after reuse", reused_bytes, baseline);
     report_memory("after close", released, baseline);
-    const auto per_connection =
-        connections == 0 ? 0.0
-                         : (static_cast<double>(idle_bytes) -
-                            static_cast<double>(baseline)) /
-                               static_cast<double>(connections) / 1024.0;
-    std::printf("    %.1f KiB per idle connection (both ends in-process)\n",
-                per_connection);
+    const auto per_connection = [&](std::size_t bytes) {
+      return connections == 0
+                 ? 0.0
+                 : (static_cast<double>(bytes) - static_cast<double>(baseline)) /
+                       static_cast<double>(connections) / 1024.0;
+    };
+    std::printf("    %.1f KiB resident per idle connection (both ends in-process)\n",
+                per_connection(idle_bytes));
+    if (heap_baseline.available() && idle_heap.available()) {
+      report_heap("heap baseline", heap_baseline, heap_baseline);
+      report_heap("heap all idle", idle_heap, heap_baseline);
+      report_heap("heap after reuse", reused_heap, heap_baseline);
+      const auto per_heap = [&](HeapUsage value) {
+        return connections == 0
+                   ? 0.0
+                   : (static_cast<double>(value.in_use) -
+                      static_cast<double>(heap_baseline.in_use)) /
+                         static_cast<double>(connections) / 1024.0;
+      };
+      std::printf(
+          "    %.2f KiB live, %.2f blocks per idle connection (both ends)\n",
+          per_heap(idle_heap),
+          connections == 0
+              ? 0.0
+              : (static_cast<double>(idle_heap.blocks) -
+                 static_cast<double>(heap_baseline.blocks)) /
+                    static_cast<double>(connections));
+    }
   }
   server.stop();
 }
@@ -486,7 +550,9 @@ void benchmark_streaming_memory(std::size_t connections, std::size_t payload_byt
   client_options.max_connections_per_origin = connections;
   client_options.connection_pool_size = connections;
   const auto baseline = current_resident_bytes();
+  const auto heap_baseline = heap_usage();
   std::size_t in_flight_bytes = 0;
+  HeapUsage in_flight_heap{};
   bool completed = false;
   {
     chhttp::AsyncClient client("http://127.0.0.1:" + std::to_string(server.port()),
@@ -519,6 +585,7 @@ void benchmark_streaming_memory(std::size_t connections, std::size_t payload_byt
     while (consuming.load() < connections && Clock::now() < deadline)
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
     in_flight_bytes = current_resident_bytes();
+    in_flight_heap = heap_usage();
     bool ok = consuming.load() == connections;
     for (auto &task : pending) {
       auto response = task.get();
@@ -536,6 +603,8 @@ void benchmark_streaming_memory(std::size_t connections, std::size_t payload_byt
                 payload_mib);
     report_memory("resident baseline", baseline, baseline);
     report_memory("while in flight", in_flight_bytes, baseline);
+    if (heap_baseline.available() && in_flight_heap.available())
+      report_heap("heap while in flight", in_flight_heap, heap_baseline);
     std::printf("    resident growth is %.2f%% of the payload volume\n",
                 payload_mib > 0
                     ? (static_cast<double>(in_flight_bytes) -
@@ -587,9 +656,9 @@ int main(int argc, char **argv) {
   if (selected("static")) benchmark_static_file(1024 * 1024, 200 * scale);
   if (selected("echo")) benchmark_body_transfer(512 * 1024, 200 * scale);
   if (selected("routing")) benchmark_route_table(64, 20000 * scale);
-  if (selected("memory-idle")) benchmark_idle_connections(64);
+  if (selected("memory-idle")) benchmark_idle_connections(64 * scale);
   if (selected("memory-stream"))
-    benchmark_streaming_memory(16, 4 * 1024 * 1024);
+    benchmark_streaming_memory(16 * scale, 4 * 1024 * 1024);
   std::printf("\npeak resident after run %.1f MiB\n",
               static_cast<double>(peak_resident_bytes()) / 1048576.0);
   return 0;

@@ -258,39 +258,54 @@ public:
 
   // The handler callable is stored inside the shared completion state so the
   // queued closures stay within std::function's small-buffer limit. Dispatching a
-  // handler therefore costs one allocation (the state) instead of two.
-  template <class Function> Task<void> execute(Function function) {
+  // handler therefore costs one allocation (the state) instead of two. The
+  // awaiter is returned directly rather than wrapped in a Task, so a dispatch
+  // does not also allocate a coroutine frame and a TaskState.
+  template <class Function> class DispatchAwaiter {
+  public:
     struct State {
+      WorkerPool *pool{nullptr};
       std::coroutine_handle<> continuation{};
       std::exception_ptr exception;
       Function function;
-      explicit State(Function value) : function(std::move(value)) {}
+      State(WorkerPool *pool, Function value)
+          : pool(pool), function(std::move(value)) {}
     };
-    struct Awaiter {
-      WorkerPool *pool;
-      std::shared_ptr<State> state;
-      Awaiter(WorkerPool *pool, Function function)
-          : pool(pool),
-            state(std::make_shared<State>(std::move(function))) {}
-      bool await_ready() const noexcept { return false; }
-      void await_suspend(std::coroutine_handle<> continuation) {
-        state->continuation = continuation;
-        auto state_copy = state;
-        pool->enqueue([pool = pool, state_copy] {
-          try {
-            state_copy->function();
-          } catch (...) {
-            state_copy->exception = std::current_exception();
-          }
-          pool->runtime_->post(
-              [state_copy] { state_copy->continuation.resume(); });
-        });
-      }
-      void await_resume() {
-        if (state->exception) std::rethrow_exception(state->exception);
-      }
-    };
-    co_await Awaiter{this, std::move(function)};
+
+    DispatchAwaiter(WorkerPool *pool, Function function)
+        : state_(std::make_shared<State>(pool, std::move(function))) {}
+    DispatchAwaiter(DispatchAwaiter &&) noexcept = default;
+    DispatchAwaiter &operator=(DispatchAwaiter &&) noexcept = default;
+    DispatchAwaiter(const DispatchAwaiter &) = delete;
+    DispatchAwaiter &operator=(const DispatchAwaiter &) = delete;
+
+    bool await_ready() const noexcept { return false; }
+    void await_suspend(std::coroutine_handle<> continuation) {
+      state_->continuation = continuation;
+      auto state_copy = state_;
+      // Capturing only the state keeps the queued closure inside std::function's
+      // small-buffer limit, so dispatching does not pay a second allocation. The
+      // pool pointer travels inside the state instead of the closure.
+      state_copy->pool->enqueue([state_copy] {
+        try {
+          state_copy->function();
+        } catch (...) {
+          state_copy->exception = std::current_exception();
+        }
+        state_copy->pool->runtime_->post(
+            [state_copy] { state_copy->continuation.resume(); });
+      });
+    }
+    void await_resume() {
+      if (state_->exception) std::rethrow_exception(state_->exception);
+    }
+
+  private:
+    std::shared_ptr<State> state_;
+  };
+
+  template <class Function> DispatchAwaiter<Function> execute(Function function) {
+    return DispatchAwaiter<Function>{this, std::move(function)};
   }
 
 private:
@@ -650,7 +665,11 @@ public:
         break;
       }
       session->in_request = true;
-      Request request = std::move(parsed->request);
+      // The parsed request is reused in place rather than moved into a second
+      // object: it is only ever touched while `parsed` is alive, and a duplicate
+      // would be reserved in this frame (which stays resident while the session
+      // waits for its next request) for no benefit.
+      Request &request = parsed->request;
       request.remote_address = connection->remote_address();
       request.remote_port = connection->remote_port();
       if (const auto route = find_stream_route(request)) {
@@ -719,25 +738,33 @@ public:
         continue;
       }
 
-      auto request_body = co_await detail::read_request_body(
-          connection, *buffer, parsed->body,
-          {.max_header_size = options.max_header_size,
-           .max_body_size = options.max_body_size,
-           .read_timeout = options.request_timeout,
-           .auto_decompress = options.auto_decompress_request});
-      if (!request_body) {
-        Response response;
-        response.status = request_body.error().code == Error::body_too_large
-                              ? 413
-                              : request_body.error().code == Error::timeout ? 408
-                                                                             : 400;
-        response.keep_alive = false;
-        response.set_content(request_body.error().message);
-        co_await detail::write_response(connection, request, response,
-                                         options.request_timeout);
-        break;
+      // A request that declares no body needs no body reader at all. Skipping
+      // the call avoids a coroutine frame, its shared state and the header
+      // round-trip through the body reader for the most common request shape.
+      const bool has_body = parsed->body.chunked ||
+                            parsed->body.content_length.value_or(0) != 0 ||
+                            parsed->body.expect_continue;
+      if (has_body) {
+        auto request_body = co_await detail::read_request_body(
+            connection, *buffer, parsed->body,
+            {.max_header_size = options.max_header_size,
+             .max_body_size = options.max_body_size,
+             .read_timeout = options.request_timeout,
+             .auto_decompress = options.auto_decompress_request});
+        if (!request_body) {
+          Response response;
+          response.status = request_body.error().code == Error::body_too_large
+                                ? 413
+                                : request_body.error().code == Error::timeout ? 408
+                                                                              : 400;
+          response.keep_alive = false;
+          response.set_content(request_body.error().message);
+          co_await detail::write_response(connection, request, response,
+                                           options.request_timeout);
+          break;
+        }
+        request.body = std::move(*request_body);
       }
-      request.body = std::move(*request_body);
       request.headers = std::move(parsed->body.headers);
       // Borrowed lookup: the common non-multipart body path must not allocate a
       // Content-Type copy just to compare a prefix.
@@ -949,6 +976,9 @@ public:
   }
 
   std::optional<std::size_t> find_stream_route(Request &request) const {
+    // Almost every server declares no stream routes; skip the method key and the
+    // two lookup buffers entirely when the table is empty.
+    if (stream_routes_by_method.empty()) return std::nullopt;
     const MethodKey key(request.method);
     PathParams parameters;
     PatternCaptures captures;

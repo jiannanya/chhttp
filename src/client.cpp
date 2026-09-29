@@ -227,8 +227,17 @@ ErrorInfo with_transfer(ErrorInfo error, TransferPhase phase,
   return error;
 }
 
-class RequestControl {
+class RequestControl
+    : public std::enable_shared_from_this<RequestControl> {
 public:
+  // Membership in AsyncClient::Impl's list of live requests. The links live
+  // inside the block that is already allocated for every request, so
+  // registration costs no second node allocation; they are only ever touched
+  // while Impl::mutex is held, and a request unlinks itself before it can be
+  // destroyed.
+  RequestControl *link_prev{nullptr};
+  RequestControl *link_next{nullptr};
+
   void bind(const std::shared_ptr<detail::Connection> &connection) {
     bool close = false;
     {
@@ -898,15 +907,13 @@ public:
                           "A streamed body length requires a body producer"};
     request_options.deadline = effective_deadline(request_options);
     auto control = std::make_shared<RequestControl>();
-    using ControlIterator = std::list<std::shared_ptr<RequestControl>>::iterator;
     struct Registration {
       Impl *owner;
-      ControlIterator position;
       RequestControl *control;
       ~Registration() {
         {
           std::lock_guard lock(owner->mutex);
-          owner->controls.erase(position);
+          owner->unlink(control);
         }
         // Cancellation/deadline can race any check between wakeup and slot
         // acquisition. Keep notification ownership until acquisition or exit.
@@ -914,14 +921,13 @@ public:
           owner->wake_pool_waiter(control->notified_origin);
       }
     };
-    ControlIterator position;
     {
       std::lock_guard lock(mutex);
-      position = controls.insert(controls.end(), control);
+      link(control.get());
     }
     // Remove exactly this request on success, cancellation, validation error,
     // or exception; registering a burst no longer scans every live request.
-    Registration registration{this, position, control.get()};
+    Registration registration{this, control.get()};
     std::stop_callback stop_callback(
         request_options.stop_token, [control] { control->cancel(); });
     if (request_options.cancellation && *request_options.cancellation)
@@ -972,13 +978,43 @@ public:
                                 true);
   }
 
+  // Intrusive list of live requests, guarded by `mutex`. Registration and
+  // removal stay O(1) without a per-request node, which matters because every
+  // client request registers and unregisters exactly once.
+  void link(RequestControl *control) noexcept {
+    control->link_prev = controls_tail;
+    control->link_next = nullptr;
+    if (controls_tail)
+      controls_tail->link_next = control;
+    else
+      controls_head = control;
+    controls_tail = control;
+  }
+  void unlink(RequestControl *control) noexcept {
+    if (control->link_prev)
+      control->link_prev->link_next = control->link_next;
+    else
+      controls_head = control->link_next;
+    if (control->link_next)
+      control->link_next->link_prev = control->link_prev;
+    else
+      controls_tail = control->link_prev;
+    control->link_prev = nullptr;
+    control->link_next = nullptr;
+  }
+
   void cancel() {
     std::vector<std::shared_ptr<detail::Connection>> connections;
     std::vector<std::shared_ptr<RequestControl>> request_controls;
     {
       std::lock_guard lock(mutex);
       connections = active;
-      request_controls.assign(controls.begin(), controls.end());
+      // Pinned under the lock: the raw links are only valid while their entry
+      // is registered, and holding a reference is what keeps a concurrent
+      // Registration destructor from freeing the control mid-iteration.
+      for (auto *control = controls_head; control;
+           control = control->link_next)
+        request_controls.push_back(control->shared_from_this());
     }
     for (auto &control : request_controls) control->cancel();
     for (auto &connection : connections)
@@ -995,7 +1031,9 @@ public:
   // Accessed exclusively from the libuv loop.
   std::unordered_map<std::string, PoolQueue> pool_waiters;
   std::vector<std::shared_ptr<detail::Connection>> active;
-  std::list<std::shared_ptr<RequestControl>> controls;
+  // Guarded by `mutex`.
+  RequestControl *controls_head{nullptr};
+  RequestControl *controls_tail{nullptr};
 #ifdef CHHTTP_HAS_TLS
   SSL_CTX *tls_context{nullptr};
 #endif

@@ -130,6 +130,10 @@ std::vector<std::string> split_tokens(std::string_view value, char separator);
 std::string random_boundary();
 bool valid_header_name(std::string_view value) noexcept;
 bool valid_header_value(std::string_view value) noexcept;
+// Matches one token inside a comma-separated field value. Shared by has_token()
+// and by callers that already hold the single value they need to inspect.
+bool header_value_has_token(std::string_view value,
+                            std::string_view token) noexcept;
 bool has_token(const Headers &headers, std::string_view name,
                std::string_view token);
 
@@ -202,6 +206,8 @@ private:
   uv_async_t async_{};
   std::mutex queue_mutex_;
   std::deque<std::function<void()>> queue_;
+  // Loop-thread-only scratch for the batch currently being drained.
+  std::deque<std::function<void()>> drain_scratch_;
   std::thread thread_;
   std::thread::id thread_id_{};
   std::promise<void> ready_;
@@ -210,7 +216,31 @@ private:
 
 Runtime *current_runtime() noexcept;
 void stop_runtime(std::shared_ptr<Runtime> runtime) noexcept;
-Task<void> resume_on(std::shared_ptr<Runtime> runtime);
+
+// Hands the current coroutine back to a runtime's loop. This is a plain awaiter
+// rather than a Task so that the common no-op case (the coroutine already runs
+// on the target loop) costs neither a coroutine frame nor a TaskState
+// allocation.
+class ResumeOnAwaiter {
+public:
+  explicit ResumeOnAwaiter(std::shared_ptr<Runtime> runtime)
+      : runtime_(std::move(runtime)) {}
+  [[nodiscard]] bool await_ready() const noexcept {
+    return runtime_->on_loop_thread();
+  }
+  void await_suspend(std::coroutine_handle<> continuation) {
+    runtime_->post([continuation] { continuation.resume(); });
+  }
+  void await_resume() const noexcept {}
+
+private:
+  std::shared_ptr<Runtime> runtime_;
+};
+
+inline ResumeOnAwaiter resume_on(std::shared_ptr<Runtime> runtime) {
+  return ResumeOnAwaiter(std::move(runtime));
+}
+
 // Run blocking filesystem work on a bounded pool, then return to the caller's
 // I/O loop when invoked from one. Exceptions propagate through the Task.
 Task<void> run_file_io(std::function<void()> operation);
@@ -336,8 +366,22 @@ public: // Internal transport implementation; not exposed by the public API.
   std::uint16_t remote_port_{0};
 
 #ifdef CHHTTP_HAS_TLS
+  // Scratch blocks for the TLS paths. Keeping them on the connection instead of
+  // in a coroutine frame matters a lot: a frame that holds a local live across a
+  // suspension reserves that space for the whole suspension, and the read path is
+  // suspended whenever the peer is quiet. They are allocated only for connections
+  // that actually enable TLS.
+  static constexpr std::size_t tls_scratch_size = 16 * 1024;
   SSL *ssl_{nullptr};
   bool tls_server_{false};
+  std::unique_ptr<char[]> tls_read_scratch_;
+  std::unique_ptr<char[]> tls_flush_scratch_;
+  [[nodiscard]] char *tls_read_scratch() noexcept {
+    return tls_read_scratch_.get();
+  }
+  [[nodiscard]] char *tls_flush_scratch() noexcept {
+    return tls_flush_scratch_.get();
+  }
   Task<ErrorInfo> flush_tls(std::chrono::milliseconds timeout);
 #endif
 };

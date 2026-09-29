@@ -20,7 +20,9 @@ namespace chhttp::detail {
 namespace {
 
 struct ParsedHead {
-  std::string start_line;
+  // Borrows the head bytes, so a caller must finish with the fields before it
+  // advances the read buffer. Every other member owns its storage.
+  std::string_view start_line;
   Headers headers;
   std::optional<std::uint64_t> content_length;
   bool chunked{false};
@@ -35,33 +37,40 @@ Task<Result<Connection::ReadChunk>> timed_read(
   if (options.cancelled && options.cancelled())
     co_return ErrorInfo{Error::cancelled, "Request cancelled"};
   auto timeout = options.read_timeout;
-  std::string timeout_message = "Socket read timed out";
-  // Deadlines are usually unset, so the clock is only read when one applies.
+  // The deadline messages are only materialised when a deadline actually
+  // shortens the wait, so the common read path builds no strings at all.
+  std::string_view timeout_message = "Socket read timed out";
+  std::string phase_message;
   if (options.deadline || phase_deadline) {
     const auto now = std::chrono::steady_clock::now();
     const auto apply_deadline = [&](const std::optional<TimePoint> &deadline,
-                                    std::string message) -> ErrorInfo {
+                                    std::string_view message,
+                                    bool phase_specific) -> ErrorInfo {
       if (!deadline) return {};
       if (*deadline <= now)
-        return {Error::timeout, std::move(message)};
+        return {Error::timeout, std::string(message)};
       const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
           *deadline - now);
       if (remaining < timeout) {
         timeout = std::max(remaining, 1ms);
-        timeout_message = std::move(message);
+        if (phase_specific) {
+          phase_message = std::string(phase) + " timed out";
+          timeout_message = phase_message;
+        } else {
+          timeout_message = message;
+        }
       }
       return {};
     };
     if (auto error = apply_deadline(options.deadline,
-                                    "Request deadline exceeded"))
+                                    "Request deadline exceeded", false))
       co_return error;
-    if (auto error = apply_deadline(phase_deadline,
-                                    std::string(phase) + " timed out"))
+    if (auto error = apply_deadline(phase_deadline, {}, true))
       co_return error;
   }
   auto chunk = co_await connection->read(timeout);
   if (!chunk && chunk.error().code == Error::timeout)
-    co_return ErrorInfo{Error::timeout, std::move(timeout_message),
+    co_return ErrorInfo{Error::timeout, std::string(timeout_message),
                         chunk.error().system_code, chunk.error().tls_code};
   if (options.cancelled && options.cancelled())
     co_return ErrorInfo{Error::cancelled, "Request cancelled"};
@@ -249,7 +258,11 @@ ErrorInfo visit_framing_values(std::string_view input, std::string_view field,
   return {};
 }
 
-Task<Result<std::string>> read_head_bytes(
+// Returns a borrowed view of the complete head, up to and including the CRLF of
+// its last field. The caller parses the view and then advances the buffer by
+// `view.size() + 2`; parsing copies every field out, so no allocation or copy of
+// the head is needed on the receive path.
+Task<Result<std::string_view>> read_head_bytes(
     const std::shared_ptr<Connection> &connection, ReadBuffer &buffer,
     const HttpReadOptions &options) {
   const auto header_deadline = options.header_timeout
@@ -259,12 +272,10 @@ Task<Result<std::string>> read_head_bytes(
   std::size_t search_from = 0;
   for (;;) {
     const auto end = buffer.find("\r\n\r\n", search_from);
-    if (end != std::string::npos) {
+    if (end != std::string_view::npos) {
       if (end + 4 > options.max_header_size)
         co_return ErrorInfo{Error::protocol, "HTTP headers exceed configured limit"};
-      std::string head = buffer.substr(0, end + 2);
-      buffer.consume(end + 4);
-      co_return head;
+      co_return buffer.view().substr(0, end + 2);
     }
     if (buffer.size() >= options.max_header_size)
       co_return ErrorInfo{Error::protocol, "HTTP headers exceed configured limit"};
@@ -283,13 +294,13 @@ Result<ParsedHead> parse_head(std::string_view input) {
   const auto first_end = input.find("\r\n");
   if (first_end == std::string_view::npos || first_end == 0)
     return ErrorInfo{Error::protocol, "Malformed HTTP start line"};
-  result.start_line = std::string(input.substr(0, first_end));
+  result.start_line = input.substr(0, first_end);
   if (!valid_header_value(result.start_line))
     return ErrorInfo{Error::protocol, "Invalid character in HTTP start line"};
   // The head always ends with the CRLF that terminates its last line, so the
   // number of line breaks resolves the exact field count in one pass.
   const auto line_breaks =
-      static_cast<std::size_t>(std::ranges::count(input, '\n'));
+      static_cast<std::size_t>(std::count(input.begin(), input.end(), '\n'));
   if (line_breaks > 1) result.headers.reserve(line_breaks - 1);
   std::size_t cursor = first_end + 2;
   while (cursor < input.size()) {
@@ -416,10 +427,12 @@ Task<Result<std::string>> read_body(
     bool no_body) {
   std::string body;
   std::uint64_t received = 0;
-  const auto started = std::chrono::steady_clock::now();
+  // The clock is only read when a first-byte deadline applies; the common path
+  // therefore performs no time query at all.
   std::optional<TimePoint> first_body_deadline =
       options.first_body_byte_timeout
-          ? std::optional<TimePoint>{started + *options.first_body_byte_timeout}
+          ? std::optional<TimePoint>{std::chrono::steady_clock::now() +
+                                     *options.first_body_byte_timeout}
           : std::nullopt;
   std::optional<TimePoint> idle_deadline;
   const auto body_deadline = [&]() {
@@ -720,11 +733,13 @@ struct HeadOverride {
 // Emits the field set in order while substituting `overrides` at the position of
 // the first equal field and dropping every field named in `omitted`. This
 // reproduces Headers::set/erase semantics for the outgoing message without
-// materialising a mutable copy of the caller's headers.
+// materialising a mutable copy of the caller's headers. `reserve_extra` lets a
+// caller that will append a body size the buffer once for both.
 Result<std::string>
 serialize_head(std::string start_line, const Headers &headers,
                std::span<const HeadOverride> overrides = {},
-               std::span<const std::string_view> omitted = {}) {
+               std::span<const std::string_view> omitted = {},
+               std::size_t reserve_extra = 0) {
   if (start_line.find_first_of("\r\n") != std::string::npos)
     return ErrorInfo{Error::protocol, "Invalid HTTP start line"};
   constexpr std::size_t max_overrides = 8;
@@ -732,7 +747,7 @@ serialize_head(std::string start_line, const Headers &headers,
     return ErrorInfo{Error::internal, "Too many HTTP header overrides"};
   // Size the output once so a response with many headers performs a single
   // allocation instead of growing the buffer while appending.
-  std::size_t total = start_line.size() + 4;
+  std::size_t total = start_line.size() + 4 + reserve_extra;
   for (const auto &[name, value] : headers) {
     if (!valid_header_name(name) || !valid_header_value(value))
       return ErrorInfo{Error::protocol, "Invalid outbound HTTP header"};
@@ -1109,9 +1124,12 @@ read_request_head(const std::shared_ptr<Connection> &connection,
   auto head = parse_head(*bytes);
   if (!head) co_return head.error();
   Request request;
+  // The start line is a view into the borrowed head, so everything derived from
+  // it is copied out before the buffer is advanced. The parsed headers already
+  // own their storage.
   const auto first_space = head->start_line.find(' ');
   const auto last_space = head->start_line.rfind(' ');
-  if (first_space == std::string::npos || last_space == first_space ||
+  if (first_space == std::string_view::npos || last_space == first_space ||
       head->start_line.find(' ', first_space + 1) != last_space)
     co_return ErrorInfo{Error::protocol, "Malformed HTTP request line"};
   request.method = head->start_line.substr(0, first_space);
@@ -1121,9 +1139,9 @@ read_request_head(const std::shared_ptr<Connection> &connection,
       request.target, [](unsigned char ch) { return ch <= 0x20 || ch == 0x7f; });
   if (!valid_header_name(request.method) || request.target.empty() || invalid_target)
     co_return ErrorInfo{Error::protocol, "Invalid HTTP request line"};
-  if (!parse_version(std::string_view(head->start_line).substr(last_space + 1),
-                     request.version))
+  if (!parse_version(head->start_line.substr(last_space + 1), request.version))
     co_return ErrorInfo{Error::protocol, "Unsupported HTTP version"};
+  buffer.consume(bytes->size() + 2);
   if (request.version == 11) {
     std::size_t hosts = 0;
     for (const auto &[name, value] : head->headers) {
@@ -1137,28 +1155,35 @@ read_request_head(const std::shared_ptr<Connection> &connection,
                           "HTTP/1.1 request must have exactly one Host header"};
   }
   request.keep_alive = keep_alive(request.version, head->headers);
-  std::string routing_target = request.target;
-  if (!routing_target.starts_with('/') && routing_target.find("://") != std::string::npos) {
+  // The routing target only needs to be inspected, so it borrows the request
+  // target unless an absolute-form request forces the origin-form target to be
+  // materialised. Path and query are then decoded straight from the view, which
+  // removes two string allocations per request.
+  std::string absolute_target;
+  std::string_view routing_target = request.target;
+  if (!routing_target.starts_with('/') &&
+      routing_target.find("://") != std::string_view::npos) {
     auto absolute = parse_url(routing_target);
     if (!absolute)
       co_return ErrorInfo{Error::protocol,
                           "Invalid absolute HTTP request target: " +
                               absolute.error().message};
-    routing_target = absolute->target;
+    absolute_target = std::move(absolute->target);
+    routing_target = absolute_target;
   }
   const auto query = routing_target.find('?');
-  request.path = routing_target.substr(0, query);
-  if (request.path.empty()) request.path = "/";
-  auto decoded_path = url_decode(request.path);
+  std::string_view raw_path = routing_target.substr(0, query);
+  if (raw_path.empty()) raw_path = "/";
+  auto decoded_path = url_decode(raw_path);
   if (!decoded_path)
     co_return ErrorInfo{Error::protocol,
                         "Invalid encoded HTTP request path: " +
                             decoded_path.error().message};
   request.path = std::move(*decoded_path);
-  if (query != std::string::npos)
-    request.query = parse_query(std::string_view(routing_target).substr(query + 1));
+  if (query != std::string_view::npos)
+    request.query = parse_query(routing_target.substr(query + 1));
   bool expect_continue = false;
-  if (head->headers.contains("Expect")) {
+  if (find_header(head->headers, "Expect") != nullptr) {
     if (!has_token(head->headers, "Expect", "100-continue"))
       co_return ErrorInfo{Error::protocol, "Unsupported HTTP expectation"};
     expect_continue = true;
@@ -1291,17 +1316,19 @@ Task<ResponseResult> read_response(
     if (!bytes) co_return bytes.error();
     auto head = parse_head(*bytes);
     if (!head) co_return head.error();
+    // The start line borrows the head, so the version and status are decoded
+    // before the buffer is advanced.
     const auto first_space = head->start_line.find(' ');
     const auto second_space = head->start_line.find(' ', first_space + 1);
-    if (first_space == std::string::npos)
+    if (first_space == std::string_view::npos)
       co_return ErrorInfo{Error::protocol, "Malformed HTTP status line"};
     Response response;
-    if (!parse_version(std::string_view(head->start_line).substr(0, first_space),
+    if (!parse_version(head->start_line.substr(0, first_space),
                        response.version))
       co_return ErrorInfo{Error::protocol, "Unsupported HTTP response version"};
-    const auto status_text = std::string_view(head->start_line).substr(
-        first_space + 1, second_space == std::string::npos
-                             ? std::string::npos
+    const auto status_text = head->start_line.substr(
+        first_space + 1, second_space == std::string_view::npos
+                             ? std::string_view::npos
                              : second_space - first_space - 1);
     const auto conversion = std::from_chars(status_text.data(),
                                              status_text.data() + status_text.size(),
@@ -1310,6 +1337,9 @@ Task<ResponseResult> read_response(
         conversion.ptr != status_text.data() + status_text.size() ||
         response.status < 100)
       co_return ErrorInfo{Error::protocol, "Invalid HTTP response status"};
+    // The start line and every field have been copied out, so the borrowed head
+    // can be released.
+    buffer.consume(bytes->size() + 2);
     response.keep_alive = keep_alive(response.version, head->headers);
     const bool no_body = iequals(request_method, "HEAD") ||
                          (iequals(request_method, "CONNECT") &&
@@ -1434,13 +1464,17 @@ Task<ResponseResult> read_response(
       };
       decoded_options->on_progress = {};
     }
-    auto body = co_await read_body(connection, buffer, *head,
-                                   decoded_options ? *decoded_options : options,
-                                   until_eof, no_body);
-    if (!connection->runtime()->on_loop_thread())
-      co_await resume_on(connection->runtime());
-    if (!body) co_return decode_error ? decode_error : body.error();
-    response.body = std::move(*body);
+    std::string received_body;
+    if (!no_body) {
+      auto body = co_await read_body(connection, buffer, *head,
+                                     decoded_options ? *decoded_options : options,
+                                     until_eof, no_body);
+      if (!connection->runtime()->on_loop_thread())
+        co_await resume_on(connection->runtime());
+      if (!body) co_return decode_error ? decode_error : body.error();
+      received_body = std::move(*body);
+    }
+    response.body = std::move(received_body);
     response.headers = std::move(head->headers);
     if (decode) {
       auto error = options.on_data_async
@@ -1612,10 +1646,16 @@ Task<ErrorInfo> write_request(const std::shared_ptr<Connection> &connection,
   start_line.push_back(' ');
   start_line.append(wire_target);
   start_line.append(request.version == 10 ? " HTTP/1.0" : " HTTP/1.1");
+  // A body that will be coalesced with the head is accounted for here so the
+  // serialized message is allocated once.
+  constexpr std::size_t coalesce_limit = 64 * 1024;
+  const std::size_t body_reserve =
+      !streaming && request.body.size() <= coalesce_limit ? request.body.size()
+                                                          : 0;
   auto output =
       serialize_head(std::move(start_line), request.headers,
                      std::span(overrides.data(), override_count),
-                     std::span(omitted.data(), omitted_count));
+                     std::span(omitted.data(), omitted_count), body_reserve);
   if (!output)
     co_return output.error();
   if (streaming) {
@@ -1649,7 +1689,7 @@ Task<ErrorInfo> write_request(const std::shared_ptr<Connection> &connection,
     }
     co_return co_await sink->finish();
   }
-  if (request.body.size() > 64 * 1024) {
+  if (request.body.size() > coalesce_limit) {
     if (auto error = co_await connection->write(std::move(*output), timeout); error) {
       error.transfer = TransferContext{.phase = TransferPhase::request_head};
       co_return error;
@@ -1704,7 +1744,8 @@ namespace {
 // copy is made.
 Result<std::string> build_response_head(const Request &request,
                                         const Response &response, bool chunked,
-                                        std::optional<std::uint64_t> content_length) {
+                                        std::optional<std::uint64_t> content_length,
+                                        std::size_t body_reserve = 0) {
   if ((response.version != 10 && response.version != 11) ||
       response.status < 100 || response.status > 999)
     return ErrorInfo{Error::protocol, "Invalid outbound HTTP response line"};
@@ -1744,7 +1785,7 @@ Result<std::string> build_response_head(const Request &request,
   start_line.append(reason);
   return serialize_head(std::move(start_line), response.headers,
                         std::span(overrides.data(), override_count),
-                        std::span(omitted.data(), omitted_count));
+                        std::span(omitted.data(), omitted_count), body_reserve);
 }
 
 } // namespace
@@ -1769,10 +1810,10 @@ Task<ErrorInfo> write_response(const std::shared_ptr<Connection> &connection,
   constexpr std::size_t coalesce_limit = 64 * 1024;
   if (!omit && !response.body.empty() &&
       response.body.size() <= coalesce_limit) {
-    auto output =
-        build_response_head(request, response, false, response.body.size());
+    auto output = build_response_head(request, response, false,
+                                      response.body.size(),
+                                      response.body.size());
     if (!output) co_return output.error();
-    output->reserve(output->size() + response.body.size());
     output->append(response.body);
     co_return co_await connection->write(std::move(*output), timeout);
   }
@@ -1819,22 +1860,28 @@ Task<ErrorInfo> write_last_chunk(
 
 bool is_websocket_upgrade(const Request &request) {
   if (!iequals(request.method, "GET")) return false;
-  if (!has_token(request.headers, "Connection", "upgrade") ||
-      !has_token(request.headers, "Upgrade", "websocket"))
-    return false;
-  // A single scan counts both handshake fields without materialising header
-  // value copies for every request that is not an upgrade.
+  // A single pass resolves the two connection tokens and both handshake fields,
+  // so a GET that is not an upgrade costs one scan of the field set instead of
+  // three.
+  bool connection_upgrade = false;
+  bool upgrade_websocket = false;
   std::size_t versions = 0;
   std::size_t keys = 0;
   for (const auto &[name, value] : request.headers) {
-    if (iequals(name, "Sec-WebSocket-Version")) {
+    if (iequals(name, "Connection")) {
+      if (!connection_upgrade)
+        connection_upgrade = header_value_has_token(value, "upgrade");
+    } else if (iequals(name, "Upgrade")) {
+      if (!upgrade_websocket)
+        upgrade_websocket = header_value_has_token(value, "websocket");
+    } else if (iequals(name, "Sec-WebSocket-Version")) {
       if (value != "13") return false;
       ++versions;
     } else if (iequals(name, "Sec-WebSocket-Key")) {
       ++keys;
     }
   }
-  return versions == 1 && keys == 1;
+  return connection_upgrade && upgrade_websocket && versions == 1 && keys == 1;
 }
 
 Task<ErrorInfo> websocket_server_handshake(

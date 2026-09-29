@@ -19,6 +19,7 @@
 #include <stop_token>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -31,123 +32,359 @@ template <class T> class Task;
 
 namespace detail {
 
+// Completion channel shared between a coroutine and its single consumer.
+//
+// One atomic word carries the whole hand-off. It holds either a sentinel (no
+// consumer yet / a thread is parked / already completed) or the address of the
+// awaiting coroutine. Awaiting is therefore a single compare-exchange with no
+// lock and no condition variable, which matters because every coroutine in the
+// library hosts one of these and the previous mutex + condition variable pair
+// dominated the cost of short-lived internal coroutines. Only a blocking
+// consumer pays for a condition variable, and only the ones that actually
+// block: that object is created lazily in wait(), so the coroutine-to-coroutine
+// case -- every request on the hot path -- stays allocation-free.
+//
+// The state lives inside the coroutine frame, so a coroutine costs exactly one
+// allocation instead of a frame plus a control block. Frame lifetime is tracked
+// with `references`: one reference for the Task handed back to the caller and
+// one held by the running coroutine itself, released at the final suspend
+// point. The second reference is what keeps a frame alive when its Task is
+// abandoned while a callback still has to resume it.
 template <class T> struct TaskState {
-  std::mutex mutex;
-  std::condition_variable completed_cv;
-  std::coroutine_handle<> continuation{};
+  // Sentinels for `handoff`. A registered coroutine always contributes a real
+  // address, which is above both values.
+  static constexpr std::uintptr_t unclaimed = 0;
+  static constexpr std::uintptr_t completed = 1;
+  static constexpr std::uintptr_t parked = 2;
+
+  // A blocking waiter parks on this instead of on `handoff`. Created on first
+  // use, so the overwhelmingly common shape -- a coroutine whose result is
+  // consumed by another coroutine -- neither stores a mutex nor allocates one.
+  // std::atomic::wait is not a substitute: implementations poll with an
+  // exponential backoff before entering the kernel, which measured ~4.5 us of
+  // user CPU per short wait on macOS/libc++ against ~0.5 us for a condition
+  // variable, and every synchronous request pays for exactly one such wait.
+  struct Block {
+    std::mutex mutex;
+    std::condition_variable cv;
+  };
+
+  std::atomic<std::uintptr_t> handoff{unclaimed};
+  std::atomic<unsigned> references{2};
   std::optional<T> value;
   std::exception_ptr exception;
-  bool completed{false};
+  std::unique_ptr<Block> block;
 
-  void complete() noexcept {
-    std::coroutine_handle<> pending_continuation;
-    {
-      std::lock_guard lock(mutex);
-      completed = true;
-      pending_continuation = std::exchange(continuation, {});
+  [[nodiscard]] bool done() const noexcept {
+    return handoff.load(std::memory_order_acquire) == completed;
+  }
+
+  // Publishes completion. The result must already be stored in value/exception.
+  void publish() noexcept {
+    const auto previous = handoff.exchange(completed, std::memory_order_acq_rel);
+    if (previous > parked) {
+      std::coroutine_handle<>::from_address(
+          reinterpret_cast<void *>(previous)).resume();
+      return;
     }
-    completed_cv.notify_all();
-    if (pending_continuation) pending_continuation.resume();
+    if (previous != parked) return;
+    // A blocking waiter owns the word, so `block` was allocated before it
+    // announced itself. Taking the mutex here closes the window in which the
+    // waiter has tested the predicate but not yet entered wait(); the coroutine
+    // still holds its own reference at this point, so the frame -- and with it
+    // this block -- cannot be destroyed under us.
+    std::lock_guard lock(block->mutex);
+    block->cv.notify_one();
+  }
+
+  // Registers `continuation` unless completion already happened, in which case
+  // the awaiter must not suspend.
+  [[nodiscard]] bool suspend(std::coroutine_handle<> continuation) noexcept {
+    const auto address =
+        reinterpret_cast<std::uintptr_t>(continuation.address());
+    auto expected = unclaimed;
+    for (;;) {
+      if (handoff.compare_exchange_strong(expected, address,
+                                          std::memory_order_acq_rel,
+                                          std::memory_order_acquire))
+        return true;
+      if (expected == completed) return false;
+      // Only a blocking consumer can own the word without being registered
+      // above. Poll until it leaves, which happens when the result is
+      // published; parking instead would block on a value nobody notifies.
+      expected = unclaimed;
+      std::this_thread::yield();
+    }
+  }
+
+  // Parks the calling thread until completion.
+  void wait() noexcept {
+    auto current = handoff.load(std::memory_order_acquire);
+    while (current != completed) {
+      if (current == unclaimed) {
+        // The block has to exist before `parked` becomes visible, because
+        // publish() dereferences it as soon as it observes that value. Creating
+        // it on this branch rather than on entry keeps the overwhelmingly
+        // common case -- get() on a coroutine that already finished -- free of
+        // an allocation, while still ordering it before the store that publishes
+        // `parked`.
+        if (!block) block = std::make_unique<Block>();
+        // Announce the imminent park so completion knows a thread must be woken.
+        handoff.compare_exchange_strong(current, parked,
+                                        std::memory_order_acq_rel,
+                                        std::memory_order_acquire);
+        continue;
+      }
+      if (current == parked) {
+        // Only this thread can ever store `parked`, and it always allocates
+        // first, so the block exists here.
+        std::unique_lock lock(block->mutex);
+        // The predicate re-reads `handoff` under the mutex. publish() stores
+        // `completed` before it takes that mutex, so a completion racing with
+        // the transition above is either already visible here or blocks in
+        // publish() until this thread is inside wait(); neither order can drop
+        // the wake-up.
+        block->cv.wait(lock, [this] {
+          return handoff.load(std::memory_order_acquire) == completed;
+        });
+        return;
+      }
+      // An awaiting coroutine owns the word. It is resumed by publish(), which
+      // does not notify, so parking here could miss the wake-up entirely.
+      std::this_thread::yield();
+      current = handoff.load(std::memory_order_acquire);
+    }
   }
 };
 
 template <> struct TaskState<void> {
-  std::mutex mutex;
-  std::condition_variable completed_cv;
-  std::coroutine_handle<> continuation{};
-  std::exception_ptr exception;
-  bool completed{false};
+  static constexpr std::uintptr_t unclaimed = 0;
+  static constexpr std::uintptr_t completed = 1;
+  static constexpr std::uintptr_t parked = 2;
 
-  void complete() noexcept {
-    std::coroutine_handle<> pending_continuation;
-    {
-      std::lock_guard lock(mutex);
-      completed = true;
-      pending_continuation = std::exchange(continuation, {});
-    }
-    completed_cv.notify_all();
-    if (pending_continuation) pending_continuation.resume();
+  // See TaskState<T>: only a blocking consumer creates this, and only before
+  // it announces `parked`.
+  struct Block {
+    std::mutex mutex;
+    std::condition_variable cv;
+  };
+
+  std::atomic<std::uintptr_t> handoff{unclaimed};
+  std::atomic<unsigned> references{2};
+  std::exception_ptr exception;
+  std::unique_ptr<Block> block;
+
+  [[nodiscard]] bool done() const noexcept {
+    return handoff.load(std::memory_order_acquire) == completed;
   }
+
+  void publish() noexcept {
+    const auto previous = handoff.exchange(completed, std::memory_order_acq_rel);
+    if (previous > parked) {
+      std::coroutine_handle<>::from_address(
+          reinterpret_cast<void *>(previous)).resume();
+      return;
+    }
+    if (previous != parked) return;
+    std::lock_guard lock(block->mutex);
+    block->cv.notify_one();
+  }
+
+  [[nodiscard]] bool suspend(std::coroutine_handle<> continuation) noexcept {
+    const auto address =
+        reinterpret_cast<std::uintptr_t>(continuation.address());
+    auto expected = unclaimed;
+    for (;;) {
+      if (handoff.compare_exchange_strong(expected, address,
+                                          std::memory_order_acq_rel,
+                                          std::memory_order_acquire))
+        return true;
+      if (expected == completed) return false;
+      expected = unclaimed;
+      std::this_thread::yield();
+    }
+  }
+
+  void wait() noexcept {
+    auto current = handoff.load(std::memory_order_acquire);
+    while (current != completed) {
+      if (current == unclaimed) {
+        // See TaskState<T>: the block must exist before `parked` becomes
+        // visible, and only this branch ever publishes that value.
+        if (!block) block = std::make_unique<Block>();
+        handoff.compare_exchange_strong(current, parked,
+                                        std::memory_order_acq_rel,
+                                        std::memory_order_acquire);
+        continue;
+      }
+      if (current == parked) {
+        // Only this thread can ever store `parked`, and it always allocates
+        // first, so the block exists here.
+        std::unique_lock lock(block->mutex);
+        block->cv.wait(lock, [this] {
+          return handoff.load(std::memory_order_acquire) == completed;
+        });
+        return;
+      }
+      std::this_thread::yield();
+      current = handoff.load(std::memory_order_acquire);
+    }
+  }
+};
+
+// Drops one reference and reports whether the caller took the last one, in
+// which case the frame hosting this state has to be destroyed. Deliberately a
+// free function: the state lives inside that frame, so nothing may touch it
+// after the decrement, and the short-circuit guarantees `done()` is evaluated
+// only while this caller still holds the state alive. The reference count is
+// also what makes the hand-off race-free -- exactly one of the two parties that
+// can drop the final reference observes the transition to zero.
+template <class State>
+[[nodiscard]] bool release_task_state(State &state) noexcept {
+  return state.references.fetch_sub(1, std::memory_order_acq_rel) == 1 &&
+         state.done();
+}
+
+// Final suspend point of every Task. The result is already in the frame when
+// publish() runs, so resuming the consumer here is safe. The coroutine then
+// releases its own reference: if that was the last one nobody else can hold the
+// frame, so returning false lets the run-time destroy it; otherwise the frame
+// stays alive for the consumer that still holds a reference.
+struct TaskFinalAwaiter {
+  bool await_ready() const noexcept { return false; }
+  template <class Promise>
+  static bool await_suspend(std::coroutine_handle<Promise> frame) noexcept {
+    Promise &promise = frame.promise();
+    promise.state.publish();
+    return !release_task_state(promise.state);
+  }
+  void await_resume() const noexcept {}
 };
 
 } // namespace detail
 
 // A small executor-neutral C++20 coroutine result. Network operations resume
 // on the libuv loop that owns them; get() may be used by blocking callers.
+//
+// The result state lives inside the coroutine frame and is reference counted by
+// hand, so a coroutine allocates exactly one block -- the frame -- instead of a
+// frame plus a control block. A Task and the Awaiter created from it each hold
+// one reference; the frame is destroyed by whichever party drops the last one
+// once the result has been published, or by the run-time when the coroutine
+// finishes with no consumer left.
 template <class T> class [[nodiscard]] Task {
 public:
   using state_type = detail::TaskState<T>;
 
   struct promise_type {
-    std::shared_ptr<state_type> state = std::make_shared<state_type>();
+    state_type state{};
 
-    Task get_return_object() noexcept { return Task(state); }
+    Task get_return_object() noexcept {
+      return Task{std::coroutine_handle<promise_type>::from_promise(*this)};
+    }
     std::suspend_never initial_suspend() const noexcept { return {}; }
-    std::suspend_never final_suspend() const noexcept { return {}; }
-    ~promise_type() { state->complete(); }
+    detail::TaskFinalAwaiter final_suspend() const noexcept { return {}; }
     template <class U> void return_value(U &&result) {
-      state->value.emplace(std::forward<U>(result));
+      state.value.emplace(std::forward<U>(result));
     }
     void unhandled_exception() noexcept {
-      state->exception = std::current_exception();
+      state.exception = std::current_exception();
     }
   };
 
-  Task() = default;
-  Task(Task &&) noexcept = default;
-  Task &operator=(Task &&) noexcept = default;
+  Task() noexcept = default;
+  Task(Task &&other) noexcept : frame_(std::exchange(other.frame_, {})) {}
+  Task &operator=(Task &&other) noexcept {
+    if (this != &other) {
+      release();
+      frame_ = std::exchange(other.frame_, {});
+    }
+    return *this;
+  }
   Task(const Task &) = delete;
   Task &operator=(const Task &) = delete;
-  ~Task() = default;
+  ~Task() { release(); }
 
   [[nodiscard]] bool ready() const noexcept {
-    if (!state_) return true;
-    std::lock_guard lock(state_->mutex);
-    return state_->completed;
+    return !frame_ || frame_.promise().state.done();
   }
 
   T get() {
-    if (!state_) throw std::logic_error("Empty chhttp::Task");
-    auto state = std::exchange(state_, {});
-    {
-      std::unique_lock lock(state->mutex);
-      state->completed_cv.wait(lock, [&] { return state->completed; });
+    if (!frame_) throw std::logic_error("Empty chhttp::Task");
+    const auto frame = std::exchange(frame_, {});
+    auto &state = frame.promise().state;
+    state.wait();
+    // Everything is copied out of the state before the reference is dropped,
+    // because releasing the last one destroys the frame that stores it.
+    if (state.exception) {
+      const auto failure = state.exception;
+      if (detail::release_task_state(state)) frame.destroy();
+      std::rethrow_exception(failure);
     }
-    if (state->exception) std::rethrow_exception(state->exception);
-    return std::move(*state->value);
+    T result = std::move(*state.value);
+    if (detail::release_task_state(state)) frame.destroy();
+    return result;
   }
 
   struct Awaiter {
-    std::shared_ptr<state_type> state;
-    bool await_ready() const noexcept {
-      if (!state) return true;
-      std::lock_guard lock(state->mutex);
-      return state->completed;
+    std::coroutine_handle<promise_type> frame{};
+
+    Awaiter() noexcept = default;
+    explicit Awaiter(std::coroutine_handle<promise_type> frame) noexcept
+        : frame(frame) {}
+    Awaiter(Awaiter &&other) noexcept : frame(std::exchange(other.frame, {})) {}
+    Awaiter(const Awaiter &) = delete;
+    Awaiter &operator=(const Awaiter &) = delete;
+    Awaiter &operator=(Awaiter &&) = delete;
+    // A parent coroutine destroyed while suspended must not strand the
+    // reference it holds over the task it was awaiting.
+    ~Awaiter() { release(); }
+
+    [[nodiscard]] bool await_ready() const noexcept {
+      return !frame || frame.promise().state.done();
     }
     bool await_suspend(std::coroutine_handle<> continuation) noexcept {
-      if (!state) return false;
-      std::lock_guard lock(state->mutex);
-      if (state->completed) return false;
-      state->continuation = continuation;
-      return true;
+      return frame && frame.promise().state.suspend(continuation);
     }
     T await_resume() {
-      if (!state) throw std::logic_error("Empty chhttp::Task");
-      auto completed_state = std::exchange(state, {});
-      if (completed_state->exception)
-        std::rethrow_exception(completed_state->exception);
-      return std::move(*completed_state->value);
+      if (!frame) throw std::logic_error("Empty chhttp::Task");
+      const auto owner = std::exchange(frame, {});
+      auto &state = owner.promise().state;
+      if (state.exception) {
+        const auto failure = state.exception;
+        if (detail::release_task_state(state)) owner.destroy();
+        std::rethrow_exception(failure);
+      }
+      T result = std::move(*state.value);
+      if (detail::release_task_state(state)) owner.destroy();
+      return result;
+    }
+
+  private:
+    void release() noexcept {
+      if (!frame) return;
+      const auto owner = std::exchange(frame, {});
+      if (detail::release_task_state(owner.promise().state))
+        owner.destroy();
     }
   };
 
   Awaiter operator co_await() && noexcept {
-    return Awaiter{std::exchange(state_, {})};
+    return Awaiter{std::exchange(frame_, {})};
   }
 
 private:
-  explicit Task(std::shared_ptr<state_type> state) noexcept
-      : state_(std::move(state)) {}
-  std::shared_ptr<state_type> state_;
+  explicit Task(std::coroutine_handle<promise_type> frame) noexcept
+      : frame_(frame) {}
+
+  void release() noexcept {
+    if (!frame_) return;
+    const auto frame = std::exchange(frame_, {});
+    if (detail::release_task_state(frame.promise().state))
+      frame.destroy();
+  }
+
+  std::coroutine_handle<promise_type> frame_{};
 };
 
 template <> class [[nodiscard]] Task<void> {
@@ -155,68 +392,95 @@ public:
   using state_type = detail::TaskState<void>;
 
   struct promise_type {
-    std::shared_ptr<state_type> state = std::make_shared<state_type>();
+    state_type state{};
 
-    Task get_return_object() noexcept { return Task(state); }
+    Task get_return_object() noexcept {
+      return Task{std::coroutine_handle<promise_type>::from_promise(*this)};
+    }
     std::suspend_never initial_suspend() const noexcept { return {}; }
-    std::suspend_never final_suspend() const noexcept { return {}; }
-    ~promise_type() { state->complete(); }
+    detail::TaskFinalAwaiter final_suspend() const noexcept { return {}; }
     void return_void() const noexcept {}
     void unhandled_exception() noexcept {
-      state->exception = std::current_exception();
+      state.exception = std::current_exception();
     }
   };
 
-  Task() = default;
-  Task(Task &&) noexcept = default;
-  Task &operator=(Task &&) noexcept = default;
+  Task() noexcept = default;
+  Task(Task &&other) noexcept : frame_(std::exchange(other.frame_, {})) {}
+  Task &operator=(Task &&other) noexcept {
+    if (this != &other) {
+      release();
+      frame_ = std::exchange(other.frame_, {});
+    }
+    return *this;
+  }
   Task(const Task &) = delete;
   Task &operator=(const Task &) = delete;
-  ~Task() = default;
+  ~Task() { release(); }
 
   [[nodiscard]] bool ready() const noexcept {
-    if (!state_) return true;
-    std::lock_guard lock(state_->mutex);
-    return state_->completed;
+    return !frame_ || frame_.promise().state.done();
   }
   void get() {
-    if (!state_) throw std::logic_error("Empty chhttp::Task");
-    auto state = std::exchange(state_, {});
-    {
-      std::unique_lock lock(state->mutex);
-      state->completed_cv.wait(lock, [&] { return state->completed; });
-    }
-    if (state->exception) std::rethrow_exception(state->exception);
+    if (!frame_) throw std::logic_error("Empty chhttp::Task");
+    const auto frame = std::exchange(frame_, {});
+    auto &state = frame.promise().state;
+    state.wait();
+    const auto failure = state.exception;
+    if (detail::release_task_state(state)) frame.destroy();
+    if (failure) std::rethrow_exception(failure);
   }
   struct Awaiter {
-    std::shared_ptr<state_type> state;
-    bool await_ready() const noexcept {
-      if (!state) return true;
-      std::lock_guard lock(state->mutex);
-      return state->completed;
+    std::coroutine_handle<promise_type> frame{};
+
+    Awaiter() noexcept = default;
+    explicit Awaiter(std::coroutine_handle<promise_type> frame) noexcept
+        : frame(frame) {}
+    Awaiter(Awaiter &&other) noexcept : frame(std::exchange(other.frame, {})) {}
+    Awaiter(const Awaiter &) = delete;
+    Awaiter &operator=(const Awaiter &) = delete;
+    Awaiter &operator=(Awaiter &&) = delete;
+    ~Awaiter() { release(); }
+
+    [[nodiscard]] bool await_ready() const noexcept {
+      return !frame || frame.promise().state.done();
     }
     bool await_suspend(std::coroutine_handle<> continuation) noexcept {
-      if (!state) return false;
-      std::lock_guard lock(state->mutex);
-      if (state->completed) return false;
-      state->continuation = continuation;
-      return true;
+      return frame && frame.promise().state.suspend(continuation);
     }
     void await_resume() {
-      if (!state) throw std::logic_error("Empty chhttp::Task");
-      auto completed_state = std::exchange(state, {});
-      if (completed_state->exception)
-        std::rethrow_exception(completed_state->exception);
+      if (!frame) throw std::logic_error("Empty chhttp::Task");
+      const auto owner = std::exchange(frame, {});
+      auto &state = owner.promise().state;
+      const auto failure = state.exception;
+      if (detail::release_task_state(state)) owner.destroy();
+      if (failure) std::rethrow_exception(failure);
+    }
+
+  private:
+    void release() noexcept {
+      if (!frame) return;
+      const auto owner = std::exchange(frame, {});
+      if (detail::release_task_state(owner.promise().state))
+        owner.destroy();
     }
   };
   Awaiter operator co_await() && noexcept {
-    return Awaiter{std::exchange(state_, {})};
+    return Awaiter{std::exchange(frame_, {})};
   }
 
 private:
-  explicit Task(std::shared_ptr<state_type> state) noexcept
-      : state_(std::move(state)) {}
-  std::shared_ptr<state_type> state_;
+  explicit Task(std::coroutine_handle<promise_type> frame) noexcept
+      : frame_(frame) {}
+
+  void release() noexcept {
+    if (!frame_) return;
+    const auto frame = std::exchange(frame_, {});
+    if (detail::release_task_state(frame.promise().state))
+      frame.destroy();
+  }
+
+  std::coroutine_handle<promise_type> frame_{};
 };
 
 Task<void> sleep_for(std::chrono::milliseconds duration);

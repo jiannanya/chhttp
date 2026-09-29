@@ -239,6 +239,11 @@ std::string url_encode(std::string_view value, bool space_as_plus) {
 }
 
 Result<std::string> url_decode(std::string_view value, bool plus_as_space) {
+  // Path segments and query values usually contain no escape at all, so the
+  // scanning loop is skipped and the result is a straight copy.
+  if (value.find('%') == std::string_view::npos &&
+      (!plus_as_space || value.find('+') == std::string_view::npos))
+    return std::string(value);
   std::string output;
   output.reserve(value.size());
   const auto hex_value = [](char ch) -> int {
@@ -270,6 +275,11 @@ Result<std::string> url_decode(std::string_view value, bool plus_as_space) {
 Params parse_query(std::string_view query) {
   Params result;
   if (!query.empty() && query.front() == '?') query.remove_prefix(1);
+  // One capacity reservation sized from the separator count avoids the repeated
+  // growth a multi-parameter query would otherwise pay for.
+  result.reserve(static_cast<std::size_t>(
+                     std::count(query.begin(), query.end(), '&')) +
+                 1);
   std::size_t start = 0;
   while (start <= query.size()) {
     const auto end = query.find('&', start);
@@ -278,11 +288,14 @@ Params parse_query(std::string_view query) {
                                              : end - start);
     if (!part.empty()) {
       const auto equal = part.find('=');
-      const auto key = url_decode(part.substr(0, equal), true);
-      const auto value = equal == std::string_view::npos
-                             ? Result<std::string>(std::string{})
-                             : url_decode(part.substr(equal + 1), true);
-      if (key && value) result.emplace_back(*key, *value);
+      auto key = url_decode(part.substr(0, equal), true);
+      auto value = equal == std::string_view::npos
+                       ? Result<std::string>(std::string{})
+                       : url_decode(part.substr(equal + 1), true);
+      // Moving the decoded strings into the pair avoids a second allocation and
+      // copy of every key and value.
+      if (key && value)
+        result.emplace_back(std::move(*key), std::move(*value));
     }
     if (end == std::string_view::npos) break;
     start = end + 1;
@@ -921,26 +934,32 @@ std::string format_sse(const SseEvent &event) {
 namespace chhttp::detail {
 
 bool iequals(std::string_view lhs, std::string_view rhs) noexcept {
-  return lhs.size() == rhs.size() &&
-         std::ranges::equal(lhs, rhs, [](char left, char right) {
-           const auto fold = [](unsigned char ch) {
-             return ch >= 'A' && ch <= 'Z' ? ch + ('a' - 'A') : ch;
-           };
-           return fold(static_cast<unsigned char>(left)) ==
-                  fold(static_cast<unsigned char>(right));
-         });
+  if (lhs.size() != rhs.size()) return false;
+  // Field names and values are overwhelmingly already lower-case on the wire, so
+  // the equal-byte case is taken without any folding work; only a mismatch pays
+  // for the ASCII case fold.
+  for (std::size_t index = 0; index < lhs.size(); ++index) {
+    auto left = static_cast<unsigned char>(lhs[index]);
+    auto right = static_cast<unsigned char>(rhs[index]);
+    if (left == right) continue;
+    if (left >= 'A' && left <= 'Z') left = static_cast<unsigned char>(left + ('a' - 'A'));
+    if (right >= 'A' && right <= 'Z') right = static_cast<unsigned char>(right + ('a' - 'A'));
+    if (left != right) return false;
+  }
+  return true;
 }
 
 bool istarts_with(std::string_view value, std::string_view prefix) noexcept {
-  return prefix.size() <= value.size() &&
-         std::ranges::equal(prefix, value.substr(0, prefix.size()),
-                            [](char left, char right) {
-                              const auto fold = [](unsigned char ch) {
-                                return ch >= 'A' && ch <= 'Z' ? ch + ('a' - 'A') : ch;
-                              };
-                              return fold(static_cast<unsigned char>(left)) ==
-                                     fold(static_cast<unsigned char>(right));
-                            });
+  if (prefix.size() > value.size()) return false;
+  for (std::size_t index = 0; index < prefix.size(); ++index) {
+    auto left = static_cast<unsigned char>(prefix[index]);
+    auto right = static_cast<unsigned char>(value[index]);
+    if (left == right) continue;
+    if (left >= 'A' && left <= 'Z') left = static_cast<unsigned char>(left + ('a' - 'A'));
+    if (right >= 'A' && right <= 'Z') right = static_cast<unsigned char>(right + ('a' - 'A'));
+    if (left != right) return false;
+  }
+  return true;
 }
 
 const std::string *find_header(const Headers &headers,
@@ -1172,37 +1191,70 @@ Result<std::string> resolve_url(std::string_view base,
   return origin + normalized;
 }
 
+namespace {
+
+// Field-name and field-value validation run once per header in both directions,
+// so each byte is classified with a single indexed load instead of scanning the
+// separator set. The tables are built at compile time and shared by every
+// translation unit; no architecture-specific instruction is involved.
+constexpr std::array<bool, 256> make_token_character_table() {
+  std::array<bool, 256> table{};
+  constexpr std::string_view separators = "()<>@,;:\\\"/[]?={} \t";
+  for (std::size_t code = 0; code < table.size(); ++code) {
+    const auto ch = static_cast<char>(code);
+    table[code] = code > 0x20 && code < 0x7f &&
+                  separators.find(ch) == std::string_view::npos;
+  }
+  return table;
+}
+
+constexpr std::array<bool, 256> make_field_value_character_table() {
+  std::array<bool, 256> table{};
+  for (std::size_t code = 0; code < table.size(); ++code)
+    table[code] = code == '\t' || (code >= 0x20 && code != 0x7f);
+  return table;
+}
+
+inline constexpr auto token_characters = make_token_character_table();
+inline constexpr auto field_value_characters = make_field_value_character_table();
+
+} // namespace
+
 bool valid_header_name(std::string_view value) noexcept {
   if (value.empty()) return false;
-  constexpr std::string_view separators = "()<>@,;:\\\"/[]?={} \t";
-  return std::ranges::all_of(value, [&](unsigned char ch) {
-    return ch > 0x20 && ch < 0x7f && separators.find(static_cast<char>(ch)) ==
-                                           std::string_view::npos;
-  });
+  for (const char ch : value)
+    if (!token_characters[static_cast<unsigned char>(ch)]) return false;
+  return true;
 }
 
 bool valid_header_value(std::string_view value) noexcept {
-  return std::ranges::all_of(value, [](unsigned char ch) {
-    return ch == '\t' || (ch >= 0x20 && ch != 0x7f);
-  });
+  for (const char ch : value)
+    if (!field_value_characters[static_cast<unsigned char>(ch)]) return false;
+  return true;
+}
+
+bool header_value_has_token(std::string_view value,
+                            std::string_view token) noexcept {
+  for (;;) {
+    const auto comma = value.find(',');
+    auto candidate = value.substr(0, comma);
+    while (!candidate.empty() &&
+           (candidate.front() == ' ' || candidate.front() == '\t'))
+      candidate.remove_prefix(1);
+    while (!candidate.empty() &&
+           (candidate.back() == ' ' || candidate.back() == '\t'))
+      candidate.remove_suffix(1);
+    if (!candidate.empty() && iequals(candidate, token)) return true;
+    if (comma == std::string_view::npos) break;
+    value.remove_prefix(comma + 1);
+  }
+  return false;
 }
 
 bool has_token(const Headers &headers, std::string_view name,
                std::string_view token) {
   for (const auto &[key, value] : headers) {
-    if (!iequals(key, name)) continue;
-    auto remaining = std::string_view(value);
-    for (;;) {
-      const auto comma = remaining.find(',');
-      auto candidate = remaining.substr(0, comma);
-      while (!candidate.empty() && (candidate.front() == ' ' || candidate.front() == '\t'))
-        candidate.remove_prefix(1);
-      while (!candidate.empty() && (candidate.back() == ' ' || candidate.back() == '\t'))
-        candidate.remove_suffix(1);
-      if (!candidate.empty() && iequals(candidate, token)) return true;
-      if (comma == std::string_view::npos) break;
-      remaining.remove_prefix(comma + 1);
-    }
+    if (iequals(key, name) && header_value_has_token(value, token)) return true;
   }
   return false;
 }
