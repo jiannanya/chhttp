@@ -8,6 +8,8 @@ else()
 endif()
 add_test(NAME chhttp.functional COMMAND chhttp_tests --functional)
 add_test(NAME chhttp.stress COMMAND chhttp_tests --stress)
+add_test(NAME chhttp.property COMMAND chhttp_tests --property)
+set_tests_properties(chhttp.property PROPERTIES LABELS "property" RUN_SERIAL TRUE TIMEOUT 180)
 set_tests_properties(chhttp.functional PROPERTIES
   LABELS "functional"
   RUN_SERIAL TRUE
@@ -19,3 +21,12 @@ set_tests_properties(chhttp.stress PROPERTIES
   RUN_SERIAL TRUE
   TIMEOUT 300
 )
+
+if(WIN32 AND CMAKE_CXX_COMPILER_ID STREQUAL "Clang" AND
+   CMAKE_CXX_FLAGS MATCHES "-shared-libasan")
+  execute_process(COMMAND "${CMAKE_CXX_COMPILER}" --print-runtime-dir
+    OUTPUT_VARIABLE CHHTTP_ASAN_RUNTIME_DIR OUTPUT_STRIP_TRAILING_WHITESPACE
+    COMMAND_ERROR_IS_FATAL ANY)
+  set_tests_properties(chhttp.functional chhttp.stress chhttp.property PROPERTIES
+    ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${CHHTTP_ASAN_RUNTIME_DIR}")
+endif()

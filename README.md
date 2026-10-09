@@ -27,6 +27,9 @@ no third-party HTTP, WebSocket or URL library is used.
   and header limits, keep-alive, TCP_NODELAY, cancellation and graceful stop
 - Per-origin HTTP/HTTPS/CONNECT connection pools with independent active and
   idle limits, asynchronous queueing, exclusive checkout and safe stale retry
+- Every resolved address of a host name is attempted in order, so a host whose
+  first address is unreachable (an unroutable IPv6 record, for example) still
+  connects over a later one within the caller's original timeout
 - HTTPS/WSS through OpenSSL 3, SNI, hostname verification, custom CAs, Windows
   root-store import, client certificates and optional server-side mTLS
 - Ordered duplicate headers, ordered duplicate query/form fields, URL encoding,
@@ -75,7 +78,17 @@ ctest --preset windows-msvc
 ```
 
 The matching `windows-clang` configure, build and test presets provide an
-independent Clang 17/MSVC-ABI verification on Windows.
+independent Clang 17/MSVC-ABI verification on Windows, and `asan` adds
+AddressSanitizer plus UndefinedBehaviorSanitizer on any host.
+
+`macos` and `linux` presets build against system packages (Homebrew or the
+distribution) with no vcpkg involvement:
+
+```sh
+cmake --preset macos     # or: cmake --preset linux
+cmake --build --preset macos
+ctest --preset macos
+```
 
 For another generator, point CMake at vcpkg or provide libuv 1.x, OpenSSL 3,
 zlib, Brotli and Zstd packages yourself:
@@ -87,24 +100,50 @@ cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
 
-The test executable separates protocol/feature checks from load and lifecycle
-checks. Run either group independently, or repeat the stress group until the
-first failure:
+Brotli is discovered through the vcpkg `unofficial-brotli` package when it is
+present, then through `pkg-config`, then through a plain header/library search.
+Distribution packages that ship Brotli without the vcpkg naming therefore build
+without extra configuration; `CHHTTP_ENABLE_COMPRESSION=OFF` removes the
+dependency entirely.
+
+`CHHTTP_ENABLE_LTO=ON` applies link-time optimization through CMake's portable
+`INTERPROCEDURAL_OPTIMIZATION`, which maps to `/GL` and `/LTCG` on MSVC and to
+`-flto` on GCC and Clang. The optimized build stays free of architecture-specific
+instruction set extensions; no CPU-specific flags are required or used.
+
+`CHHTTP_BUILD_BENCHMARKS=ON` builds `chhttp_benchmarks`, which reports wall-clock
+and per-operation user/system CPU cost for parsing, request round trips,
+connection scaling, static-file delivery, body transfer and route matching. Two
+memory cases measure the resident set of idle keep-alive connections and of
+streamed uploads held in flight, so connection and buffer costs are visible
+alongside throughput.
+
+The test executable separates protocol/feature checks, load/lifecycle checks,
+and deterministic randomized properties. Run a group independently, or repeat
+the stress group until the first failure:
 
 ```sh
 ctest --test-dir build -L functional --output-on-failure
 ctest --test-dir build -L stress --output-on-failure
+ctest --test-dir build -L property --output-on-failure
 ctest --test-dir build -L stress --repeat until-fail:30 --output-on-failure
 ```
 
-Running `chhttp_tests` without an argument executes all 157 registered groups:
-129 focused functional/boundary groups and 28 load/lifecycle groups. The stress
-group covers concurrent sync/async HTTP, thousands of keep-alive requests,
-large buffered and streamed uploads (including bounded-memory 100 MiB and
-concurrent 10 MiB cases), streamed callbacks, connection recycling, independent
-and global cancellation, client/server churn, parallel servers, graceful
-draining, SSE fan-out, WebSocket connection/message load, malformed-request
-floods and HTTPS/TLS handshake concurrency.
+Running `chhttp_tests` without an argument executes all enabled test groups.
+Tests cover HTTP, TLS, SSE, WebSocket, multipart, file transfers, cancellation,
+timeouts, connection reuse, concurrent requests and graceful shutdown. TLS and
+compression tests depend on the corresponding build options.
+
+Randomized tests cover URL/query and Base64 binary round trips, an ordered
+header reference model, receive-buffer moves, SSE and multipart fragmentation,
+HTTP chunk extensions/trailers/pipelining, compressed binary responses and
+WebSocket frame-length boundaries. Failures print the seed and case index.
+Pass an unsigned decimal seed as the second argument to reproduce a run:
+
+```powershell
+.\build-msvc\tests\chhttp_tests.exe --property 13
+.\build-msvc\tests\chhttp_tests.exe property_multipart 13
+```
 
 Consumers link the installed package as follows:
 
@@ -376,9 +415,8 @@ response must be reliable.
 Stream routes run on the server libuv thread. Do not perform long blocking file
 or database operations in callbacks. Await an asynchronous sink or a bounded
 queue instead. The `string_view` is valid only until its callback returns.
-`save_to_file()` and `save_to_temp()` use synchronous incremental file writes;
-they bound memory but an async file sink is preferable on latency-sensitive
-servers.
+`save_to_file()` and `save_to_temp()` perform file I/O asynchronously and resume
+on the originating I/O loop.
 
 ## Streaming multipart and model payloads
 
@@ -435,6 +473,10 @@ auto final_error = co_await stream.connect();
 The parser handles CRLF, split input chunks, multi-line `data`, comments, BOM,
 event IDs and server-provided retry delays. Reconnect is enabled by default for
 the GET convenience constructor.
+
+Events with no explicit event type use `"message"`, including dispatch through
+`on_event("message", ...)`. Repeated `id` and `event` fields replace their previous
+values when enforcing the aggregate event-size limit.
 
 POST-based model streams use the method-agnostic `Request` constructor and
 normally disable replay:
@@ -497,15 +539,75 @@ is intended only for controlled tests.
 
 ## Resource and safety defaults
 
-The defaults cap buffered request bodies at 64 MiB, response bodies at 128 MiB, headers
-at 64 KiB, each client origin at 64 total connections and keep-alive sessions
-at 1000 requests. A stream route can raise or lower its body limit independently
-without allocating that amount. Streaming callbacks avoid a second body allocation.
-Incremental compression output is bounded by the configured body limit, route
-matching is performed before file access, percent-decoded static paths are
-canonicalized, and credentials are removed on cross-origin redirects.
+The defaults cap buffered request bodies at 64 MiB, response bodies at 128 MiB,
+headers at 64 KiB, each client origin at 64 total connections and keep-alive
+sessions at 1000 requests. A stream route can set its body limit independently.
+Configure `ServerOptions` and `ClientOptions` for the expected payload sizes and
+connection counts.
 
-Tune `ServerOptions` and `ClientOptions` for model payload sizes and expected
-connection counts. The async server does not create a thread per connection;
-one libuv loop handles network I/O and `worker_threads` controls the pool used
-for synchronous route handlers.
+Requests waiting for a connection respect cancellation and deadlines.
+Async body consumers may resume on another executor; protocol processing returns
+to the owning I/O loop before continuing. Decoded responses respect the configured
+body limit and consumer backpressure. Concatenated gzip members and Zstd frames
+are supported.
+
+Events returned by `MultipartParser::feed()` own their data. Preamble and header
+limits apply across input fragments.
+`MultipartWriter::add_file()` sends at most the size recorded when the file was
+added; missing or truncated files fail the producer instead of silently ending it.
+
+`AsyncFileSink` preserves write order and resumes callers on their originating
+I/O loop. Its `open()` and file-slice metadata validation are synchronous;
+prepare them outside I/O callbacks. Pending filesystem calls finish before
+runtime shutdown completes, so slow filesystem calls can extend shutdown beyond
+the HTTP grace period.
+
+File responses apply Range only to otherwise successful GETs. HEAD with Range
+returns the full representation's length and status 200. Range units are
+case-insensitive; unknown units are ignored. When If-Range is present, a partial
+response requires a matching explicitly supplied strong ETag; stale, weak,
+unrecognized and date validators fall back to a full response.
+
+Static-file paths are canonicalized, credentials are removed on cross-origin
+redirects, and trailer fields that can alter framing, routing, authentication
+or response controls are rejected.
+
+`worker_threads` controls the pool shared by synchronous route handlers and
+automatic response compression. Network I/O runs on the server's libuv loop.
+
+## Performance notes
+
+The request path is allocation aware rather than micro-tuned to one CPU: the
+transport hands a resolved candidate list a fresh connection per address, the
+loop thread runs callbacks directly instead of crossing a queue, and the runtime
+avoids type-erased closures and coroutine frames on paths that never suspend.
+
+- Route dispatch is indexed by method at `start()`. Literal routes resolve
+  through a hash lookup and only the parameterised routes registered ahead of a
+  matched literal are evaluated, which preserves registration order without
+  scanning the whole table.
+- `{name}` and `:name` segments, plus a trailing `*`, are matched by a
+  hand-written greedy matcher with backtracking that reproduces the equivalent
+  regular expression. `regex:` and `^`-anchored patterns, and wildcards placed
+  anywhere other than the end, still use `std::regex`.
+- Buffered and synchronous body consumers are fed without a coroutine frame per
+  block, and a received block is delivered straight from the read chunk whenever
+  no pipelined bytes are pending, which removes one full copy from large bodies.
+- The transport allocates each receive block with the read result as its owner
+  instead of copying through a shared per-runtime slab, so a completed read never
+  copies its payload; blocks are capped at 32 KiB because larger allocations are
+  disproportionately expensive on some platforms. Idle sockets retain no receive
+  buffer.
+- Outgoing messages substitute framing fields while serializing the caller's
+  field set in place, so a request or response no longer copies every header
+  just to change `Connection`, `Content-Length` or `Transfer-Encoding`. A small
+  buffered response body is coalesced with the head into one write.
+- Static file responses are read from the filesystem pool in larger blocks and
+  only the candidate path is canonicalised per request, because mount roots are
+  canonicalised when they are registered.
+- `Headers::reserve()` lets callers size a header set up front; the parser uses
+  it internally so a request head is stored with a single allocation, and
+  internal lookups borrow the stored value (`find_header`) instead of
+  materialising a string for every inspected field.
+- `Runtime::post()` invokes directly when the caller already owns the loop, so
+  on-loop I/O never builds a `std::function` nor wakes the async handle.

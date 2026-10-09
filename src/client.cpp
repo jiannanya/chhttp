@@ -10,6 +10,7 @@
 #endif
 
 #include <fstream>
+#include <list>
 #include <mutex>
 #include <unordered_map>
 
@@ -226,8 +227,17 @@ ErrorInfo with_transfer(ErrorInfo error, TransferPhase phase,
   return error;
 }
 
-class RequestControl {
+class RequestControl
+    : public std::enable_shared_from_this<RequestControl> {
 public:
+  // Membership in AsyncClient::Impl's list of live requests. The links live
+  // inside the block that is already allocated for every request, so
+  // registration costs no second node allocation; they are only ever touched
+  // while Impl::mutex is held, and a request unlinks itself before it can be
+  // destroyed.
+  RequestControl *link_prev{nullptr};
+  RequestControl *link_next{nullptr};
+
   void bind(const std::shared_ptr<detail::Connection> &connection) {
     bool close = false;
     {
@@ -246,20 +256,38 @@ public:
   void cancel() {
     cancelled_.store(true, std::memory_order_release);
     std::shared_ptr<detail::Connection> connection;
+    std::function<void()> wakeup;
     {
       std::lock_guard lock(mutex_);
       connection = connection_.lock();
+      wakeup = wakeup_;
     }
     if (connection) connection->close();
+    if (wakeup) wakeup();
+  }
+
+  void set_wakeup(std::function<void()> callback) {
+    std::function<void()> wakeup;
+    {
+      std::lock_guard lock(mutex_);
+      wakeup_ = std::move(callback);
+      if (cancelled_.load(std::memory_order_acquire)) wakeup = wakeup_;
+    }
+    if (wakeup) wakeup();
   }
 
   [[nodiscard]] bool cancelled() const noexcept {
     return cancelled_.load(std::memory_order_acquire);
   }
 
+  // Only the I/O loop accesses this notification. It is cleared when a slot
+  // is acquired, or handed on when the request exits without acquiring one.
+  std::string notified_origin;
+
 private:
   mutable std::mutex mutex_;
   std::weak_ptr<detail::Connection> connection_;
+  std::function<void()> wakeup_;
   std::atomic_bool cancelled_{false};
 };
 
@@ -292,10 +320,123 @@ class AsyncClient::Impl {
 public:
   struct Lease {
     std::shared_ptr<detail::Connection> connection;
-    std::string buffer;
+    detail::ReadBuffer buffer;
     std::string key;
     bool reused{false};
   };
+
+  struct PoolWaiter;
+  using PoolQueue = std::list<std::shared_ptr<PoolWaiter>>;
+
+  struct PoolWaiter {
+    uv_timer_t timer{};
+    std::shared_ptr<PoolWaiter> self_keep;
+    std::coroutine_handle<> continuation;
+    bool completed{false};
+    bool notified{false};
+    bool queued{false};
+    bool slot_notified{false};
+    PoolQueue::iterator position;
+    ErrorInfo error;
+
+    void notify() {
+      if (completed || notified) return;
+      notified = true;
+      // Defer resumption so releasing many leases cannot recursively resume
+      // the entire connection queue on the current coroutine's stack.
+      uv_timer_start(&timer, &PoolWaiter::ready, 0, 0);
+    }
+
+    static void ready(uv_timer_t *timer) {
+      auto *waiter = static_cast<PoolWaiter *>(timer->data);
+      if (waiter->completed) return;
+      waiter->completed = true;
+      uv_timer_stop(timer);
+      uv_close(reinterpret_cast<uv_handle_t *>(timer), [](uv_handle_t *handle) {
+        static_cast<PoolWaiter *>(handle->data)->self_keep.reset();
+      });
+      waiter->continuation.resume();
+    }
+  };
+
+  struct PoolAwaiter {
+    Impl *owner;
+    const std::string &key;
+    std::shared_ptr<RequestControl> control;
+    const RequestOptions &options;
+    std::shared_ptr<PoolWaiter> waiter = std::make_shared<PoolWaiter>();
+
+    bool await_ready() const noexcept { return false; }
+    bool await_suspend(std::coroutine_handle<> continuation) {
+      waiter->continuation = continuation;
+      const auto status = uv_timer_init(owner->runtime->loop(), &waiter->timer);
+      if (status != 0) {
+        waiter->error = {Error::internal, "Unable to initialize connection wait", status};
+        return false;
+      }
+      waiter->timer.data = waiter.get();
+      waiter->self_keep = waiter;
+      auto &queue = owner->pool_waiters[key];
+      waiter->position = queue.insert(queue.end(), waiter);
+      waiter->queued = true;
+      control->notified_origin.clear();
+      if (options.deadline || options.cancellation) {
+        const auto delay = options.cancellation ? 1ms : std::max(1ms,
+            std::chrono::ceil<std::chrono::milliseconds>(
+                *options.deadline - std::chrono::steady_clock::now()));
+        uv_timer_start(&waiter->timer, &PoolWaiter::ready,
+                         static_cast<std::uint64_t>(delay.count()), 0);
+      }
+      control->set_wakeup([runtime = owner->runtime,
+                            weak = std::weak_ptr<PoolWaiter>(waiter)] {
+        runtime->post([weak] {
+          if (auto pending = weak.lock()) pending->notify();
+        });
+      });
+      return true;
+    }
+
+    ErrorInfo await_resume() {
+      control->set_wakeup({});
+      if (waiter->queued) {
+        const auto found = owner->pool_waiters.find(key);
+        found->second.erase(waiter->position);
+        waiter->queued = false;
+        if (found->second.empty()) owner->pool_waiters.erase(found);
+      }
+      if (waiter->slot_notified) control->notified_origin = key;
+      return std::move(waiter->error);
+    }
+  };
+
+  void wake_pool_waiter(const std::string &key) {
+    const auto found = pool_waiters.find(key);
+    if (found == pool_waiters.end()) return;
+    while (!found->second.empty()) {
+      auto waiter = std::move(found->second.front());
+      found->second.pop_front();
+      waiter->queued = false;
+      if (!waiter->completed && !waiter->notified) {
+        waiter->slot_notified = true;
+        waiter->notify();
+        break;
+      }
+    }
+    if (found->second.empty()) pool_waiters.erase(found);
+  }
+
+  void release_slot(const std::string &key) {
+    {
+      std::lock_guard lock(mutex);
+      const auto found = connection_counts.find(key);
+      if (found != connection_counts.end() && found->second != 0 &&
+          --found->second == 0) {
+        connection_counts.erase(found);
+        pool.erase(key);
+      }
+    }
+    wake_pool_waiter(key);
+  }
 
   Impl(std::string url, ClientOptions client_options)
       : runtime(std::make_shared<detail::Runtime>()), base_url(std::move(url)),
@@ -333,6 +474,11 @@ public:
       return control->cancelled();
     };
     for (;;) {
+      if (cancelled())
+        co_return ErrorInfo{Error::cancelled, "Request cancelled while queued"};
+      if (request_options.deadline &&
+          std::chrono::steady_clock::now() >= *request_options.deadline)
+        co_return ErrorInfo{Error::timeout, "Request deadline exceeded in connection queue"};
       {
         std::lock_guard lock(mutex);
         auto &entries = pool[key];
@@ -341,6 +487,7 @@ public:
           entries.pop_back();
           if (lease.connection && lease.connection->open()) {
             lease.reused = true;
+            control->notified_origin.clear();
             active.push_back(lease.connection);
             control->bind(lease.connection);
             co_return lease;
@@ -352,24 +499,16 @@ public:
         if (options.max_connections_per_origin == 0 ||
             count < options.max_connections_per_origin) {
           ++count;
+          control->notified_origin.clear();
           break;
         }
       }
-      if (cancelled())
-        co_return ErrorInfo{Error::cancelled, "Request cancelled while queued"};
-      if (request_options.deadline &&
-          std::chrono::steady_clock::now() >= *request_options.deadline)
-        co_return ErrorInfo{Error::timeout, "Request deadline exceeded in connection queue"};
-      co_await sleep_for(1ms);
+      if (auto error = co_await PoolAwaiter{this, key, control, request_options}; error)
+        co_return error;
     }
 
-    const auto release_slot = [&] {
-      std::lock_guard lock(mutex);
-      auto &count = connection_counts[key];
-      if (count != 0) --count;
-    };
     const auto fail = [&](ErrorInfo error) -> Result<Lease> {
-      release_slot();
+      release_slot(key);
       return error;
     };
 
@@ -396,7 +535,7 @@ public:
     const auto fail_connection = [&](ErrorInfo error) -> Result<Lease> {
       control->unbind(connection);
       connection->close();
-      release_slot();
+      release_slot(key);
       return error;
     };
     if (cancelled())
@@ -425,7 +564,7 @@ public:
       if (write_error) {
         co_return fail_connection(std::move(write_error));
       }
-      std::string tunnel_buffer;
+      detail::ReadBuffer tunnel_buffer;
       auto response = co_await detail::read_response(
           connection, tunnel_buffer, "CONNECT",
           {.max_body_size = 1024 * 1024,
@@ -484,30 +623,32 @@ public:
   void discard(Lease lease) {
     remove_active(lease.connection);
     lease.connection->close();
-    std::lock_guard lock(mutex);
-    auto &count = connection_counts[lease.key];
-    if (count != 0) --count;
+    release_slot(lease.key);
   }
 
   void release(Lease lease, bool reusable) {
     remove_active(lease.connection);
     if (!reusable || !options.keep_alive || !lease.connection->open()) {
       lease.connection->close();
+      release_slot(lease.key);
+      return;
+    }
+    const auto key = lease.key;
+    bool pooled = false;
+    {
       std::lock_guard lock(mutex);
-      auto &count = connection_counts[lease.key];
-      if (count != 0) --count;
-      return;
+      auto &entries = pool[key];
+      if (entries.size() < options.connection_pool_size) {
+        lease.reused = false;
+        entries.push_back(std::move(lease));
+        pooled = true;
+      }
     }
-    std::lock_guard lock(mutex);
-    auto &entries = pool[lease.key];
-    if (entries.size() >= options.connection_pool_size) {
+    if (pooled) wake_pool_waiter(key);
+    else {
       lease.connection->close();
-      auto &count = connection_counts[lease.key];
-      if (count != 0) --count;
-      return;
+      release_slot(key);
     }
-    lease.reused = false;
-    entries.push_back(std::move(lease));
   }
 
   Task<ResponseResult> exchange(detail::ParsedUrl url, Request request,
@@ -529,9 +670,13 @@ public:
           ErrorInfo{Error::timeout, "Request deadline exceeded"},
           TransferPhase::none);
 
-    for (const auto &[name, value] : options.default_headers)
-      if (!request.headers.contains(name))
-        request.headers.add(name, value);
+    for (const auto &[name, value] : options.default_headers) {
+      if (!allow_automatic_auth &&
+          (detail::iequals(name, "Authorization") ||
+           detail::iequals(name, "Cookie")))
+        continue;
+      if (!request.headers.contains(name)) request.headers.add(name, value);
+    }
     request.headers.set("Host", url.authority());
     request.keep_alive = options.keep_alive;
     const bool auto_decompress =
@@ -561,7 +706,6 @@ public:
           "Proxy-Authorization",
           basic_auth(options.proxy.username, options.proxy.password));
 
-    const Request original_request = request;
     for (int attempt = 0; attempt != 2; ++attempt) {
       std::uint64_t uploaded = 0;
       std::uint64_t downloaded = 0;
@@ -605,9 +749,9 @@ public:
         co_return with_transfer(write_timeout.error(),
                                 TransferPhase::request_head);
       }
-      auto write_error =
-          co_await detail::write_request(lease.connection, request, wire_target,
-                                         *write_timeout, upload_progress);
+      auto write_error = co_await detail::write_request(
+          lease.connection, request, wire_target, *write_timeout, upload_progress);
+      if (!runtime->on_loop_thread()) co_await detail::resume_on(runtime);
       if (write_error) {
         const bool retry = lease.reused && attempt == 0 &&
                            idempotent_method(request.method) &&
@@ -651,6 +795,7 @@ public:
           .on_progress = download_progress};
       auto response = co_await detail::read_response(
           lease.connection, lease.buffer, request.method, read_options);
+      if (!runtime->on_loop_thread()) co_await detail::resume_on(runtime);
       if (!response) {
         const bool retry = !response_started && lease.reused && attempt == 0 &&
                            idempotent_method(request.method) &&
@@ -693,9 +838,7 @@ public:
           auto authorization = digest_auth(
               request.method, url.target, options.authentication.username,
               options.authentication.password, *challenge);
-          if (!authorization)
-            co_return authorization.error();
-          request = original_request;
+          if (!authorization) co_return authorization.error();
           request.headers.set("Authorization", std::move(*authorization));
           co_return co_await exchange(url, std::move(request),
                                       std::move(request_options), control,
@@ -716,16 +859,21 @@ public:
         if (!next_url)
           co_return next_url.error();
         const bool same_origin = next_url->origin() == url.origin();
-        if (!same_origin)
+        if (!same_origin) {
           request.headers.erase("Authorization");
-        if (response->status == 303 ||
+          request.headers.erase("Cookie");
+        }
+        if ((response->status == 303 && !detail::iequals(request.method, "HEAD")) ||
             ((response->status == 301 || response->status == 302) &&
              detail::iequals(request.method, "POST"))) {
           request.method = "GET";
-          request.body.clear();
+          std::string{}.swap(request.body);
           request.body_stream = {};
           request.body_stream_length.reset();
           request.headers.erase("Content-Type");
+          request.headers.erase("Content-Length");
+          request.headers.erase("Transfer-Encoding");
+          request.headers.erase("Expect");
         }
         request.target = next_url->target;
         co_return co_await exchange(
@@ -759,11 +907,27 @@ public:
                           "A streamed body length requires a body producer"};
     request_options.deadline = effective_deadline(request_options);
     auto control = std::make_shared<RequestControl>();
+    struct Registration {
+      Impl *owner;
+      RequestControl *control;
+      ~Registration() {
+        {
+          std::lock_guard lock(owner->mutex);
+          owner->unlink(control);
+        }
+        // Cancellation/deadline can race any check between wakeup and slot
+        // acquisition. Keep notification ownership until acquisition or exit.
+        if (!control->notified_origin.empty())
+          owner->wake_pool_waiter(control->notified_origin);
+      }
+    };
     {
       std::lock_guard lock(mutex);
-      std::erase_if(controls, [](const auto &item) { return item.expired(); });
-      controls.push_back(control);
+      link(control.get());
     }
+    // Remove exactly this request on success, cancellation, validation error,
+    // or exception; registering a burst no longer scans every live request.
+    Registration registration{this, control.get()};
     std::stop_callback stop_callback(
         request_options.stop_token, [control] { control->cancel(); });
     if (request_options.cancellation && *request_options.cancellation)
@@ -771,9 +935,72 @@ public:
     auto url = detail::parse_url(request.target, base->origin() + base->target);
     if (!url) co_return url.error();
     request.target = url->target;
+    if (control->cancelled())
+      co_return with_transfer({Error::cancelled, "Request cancelled"}, TransferPhase::none);
+    if (request_options.deadline &&
+        std::chrono::steady_clock::now() >= *request_options.deadline)
+      co_return with_transfer({Error::timeout, "Request deadline exceeded"}, TransferPhase::none);
+    // Do not allocate a full exchange frame for every queued request. A
+    // saturated origin waits in this smaller frame, using the existing pool
+    // wakeups; acquire() still owns slot reservation and rechecks availability.
+    if (options.max_connections_per_origin != 0) {
+      const std::string key = url->origin() + "|" + options.proxy.url;
+      for (;;) {
+        bool full = false;
+        {
+          std::lock_guard lock(mutex);
+          const auto count = connection_counts.find(key);
+          const auto idle = pool.find(key);
+          full = count != connection_counts.end() &&
+                 count->second >= options.max_connections_per_origin &&
+                 (idle == pool.end() || idle->second.empty());
+        }
+        if (!full) break;
+        if (!runtime->on_loop_thread()) {
+          co_await detail::resume_on(runtime);
+          continue; // Recheck on the loop to avoid a lost wakeup.
+        }
+        if (request_options.cancellation && *request_options.cancellation)
+          control->cancel();
+        if (control->cancelled())
+          co_return with_transfer(
+              {Error::cancelled, "Request cancelled while queued"}, TransferPhase::connect);
+        if (request_options.deadline &&
+            std::chrono::steady_clock::now() >= *request_options.deadline)
+          co_return with_transfer(
+              {Error::timeout, "Request deadline exceeded in connection queue"}, TransferPhase::connect);
+        if (auto error = co_await PoolAwaiter{this, key, control, request_options}; error)
+          co_return with_transfer(std::move(error), TransferPhase::connect);
+      }
+    }
     co_return co_await exchange(*url, std::move(request),
                                 std::move(request_options), control, 0, false,
                                 true);
+  }
+
+  // Intrusive list of live requests, guarded by `mutex`. Registration and
+  // removal stay O(1) without a per-request node, which matters because every
+  // client request registers and unregisters exactly once.
+  void link(RequestControl *control) noexcept {
+    control->link_prev = controls_tail;
+    control->link_next = nullptr;
+    if (controls_tail)
+      controls_tail->link_next = control;
+    else
+      controls_head = control;
+    controls_tail = control;
+  }
+  void unlink(RequestControl *control) noexcept {
+    if (control->link_prev)
+      control->link_prev->link_next = control->link_next;
+    else
+      controls_head = control->link_next;
+    if (control->link_next)
+      control->link_next->link_prev = control->link_prev;
+    else
+      controls_tail = control->link_prev;
+    control->link_prev = nullptr;
+    control->link_next = nullptr;
   }
 
   void cancel() {
@@ -782,8 +1009,12 @@ public:
     {
       std::lock_guard lock(mutex);
       connections = active;
-      for (const auto &item : controls)
-        if (auto control = item.lock()) request_controls.push_back(control);
+      // Pinned under the lock: the raw links are only valid while their entry
+      // is registered, and holding a reference is what keeps a concurrent
+      // Registration destructor from freeing the control mid-iteration.
+      for (auto *control = controls_head; control;
+           control = control->link_next)
+        request_controls.push_back(control->shared_from_this());
     }
     for (auto &control : request_controls) control->cancel();
     for (auto &connection : connections)
@@ -797,8 +1028,12 @@ public:
   std::mutex mutex;
   std::unordered_map<std::string, std::vector<Lease>> pool;
   std::unordered_map<std::string, std::size_t> connection_counts;
+  // Accessed exclusively from the libuv loop.
+  std::unordered_map<std::string, PoolQueue> pool_waiters;
   std::vector<std::shared_ptr<detail::Connection>> active;
-  std::vector<std::weak_ptr<RequestControl>> controls;
+  // Guarded by `mutex`.
+  RequestControl *controls_head{nullptr};
+  RequestControl *controls_tail{nullptr};
 #ifdef CHHTTP_HAS_TLS
   SSL_CTX *tls_context{nullptr};
 #endif

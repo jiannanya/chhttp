@@ -7,6 +7,7 @@
 #include <charconv>
 #include <condition_variable>
 #include <fstream>
+#include <map>
 #include <queue>
 #include <regex>
 #include <shared_mutex>
@@ -14,10 +15,28 @@
 namespace chhttp {
 namespace {
 
-struct CompiledPattern {
-  std::regex expression;
-  std::vector<std::string> names;
+// A compiled route pattern is matched by a small hand-written matcher whenever
+// the pattern stays within the documented mini-language. Only patterns that ask
+// for a real regular expression (or place a wildcard somewhere other than the
+// end) fall back to std::regex, which keeps matching independent of the standard
+// library's regex implementation and avoids its per-match overhead.
+struct PatternSegment {
+  std::string literal;
+  std::string name;
+  bool parameter{false};
+  bool wildcard{false};
 };
+
+struct CompiledPattern {
+  std::optional<std::regex> expression;
+  std::vector<std::string> names;
+  std::string literal;
+  std::vector<PatternSegment> segments;
+  bool literal_only{false};
+  bool linear{false};
+};
+
+using PatternCaptures = std::vector<std::pair<std::string_view, std::string_view>>;
 
 bool regex_special(char ch) {
   constexpr std::string_view special = R"(.^$|()[]{}+?\)";
@@ -25,48 +44,146 @@ bool regex_special(char ch) {
 }
 
 CompiledPattern compile_pattern(std::string_view pattern) {
-  if (pattern.starts_with("regex:"))
-    return {std::regex(std::string(pattern.substr(6))), {}};
-  if (pattern.starts_with('^'))
-    return {std::regex(std::string(pattern)), {}};
+  CompiledPattern compiled;
+  if (pattern.starts_with("regex:")) {
+    compiled.expression.emplace(std::string(pattern.substr(6)));
+    return compiled;
+  }
+  if (pattern.starts_with('^')) {
+    compiled.expression.emplace(std::string(pattern));
+    return compiled;
+  }
+  if (pattern.find_first_of("{*:") == std::string_view::npos) {
+    compiled.literal_only = true;
+    compiled.literal = std::string(pattern);
+    return compiled;
+  }
   std::string expression = "^";
   std::vector<std::string> names;
+  std::vector<PatternSegment> segments;
+  std::string pending_literal;
+  std::size_t wildcards = 0;
+  const auto flush_literal = [&] {
+    if (pending_literal.empty()) return;
+    PatternSegment segment;
+    segment.literal = std::move(pending_literal);
+    pending_literal.clear();
+    segments.push_back(std::move(segment));
+  };
+  const auto add_parameter = [&](std::string_view name) {
+    if (name.empty())
+      throw std::invalid_argument("Route parameter name cannot be empty");
+    names.emplace_back(name);
+    flush_literal();
+    PatternSegment segment;
+    segment.parameter = true;
+    segment.name = std::string(name);
+    segments.push_back(std::move(segment));
+  };
   for (std::size_t index = 0; index < pattern.size();) {
     if (pattern[index] == '{') {
       const auto end = pattern.find('}', index + 1);
       if (end == std::string_view::npos)
         throw std::invalid_argument("Unclosed route parameter");
-      names.emplace_back(pattern.substr(index + 1, end - index - 1));
-      if (names.back().empty())
-        throw std::invalid_argument("Route parameter name cannot be empty");
+      add_parameter(pattern.substr(index + 1, end - index - 1));
       expression += "([^/]+)";
       index = end + 1;
     } else if (pattern[index] == ':' &&
                (index == 0 || pattern[index - 1] == '/')) {
       auto end = index + 1;
       while (end < pattern.size() && pattern[end] != '/') ++end;
-      names.emplace_back(pattern.substr(index + 1, end - index - 1));
-      if (names.back().empty())
-        throw std::invalid_argument("Route parameter name cannot be empty");
+      add_parameter(pattern.substr(index + 1, end - index - 1));
       expression += "([^/]+)";
       index = end;
     } else if (pattern[index] == '*') {
       names.emplace_back("wildcard");
+      flush_literal();
+      PatternSegment segment;
+      segment.wildcard = true;
+      segment.name = "wildcard";
+      segments.push_back(std::move(segment));
       expression += "(.*)";
+      ++wildcards;
       ++index;
     } else {
       if (regex_special(pattern[index])) expression.push_back('\\');
-      expression.push_back(pattern[index++]);
+      expression.push_back(pattern[index]);
+      pending_literal.push_back(pattern[index++]);
     }
   }
+  flush_literal();
   expression += '$';
-  return {std::regex(expression), std::move(names)};
+  compiled.names = std::move(names);
+  // A trailing wildcard is the only form the linear matcher can resolve without
+  // backtracking across the whole remaining path.
+  if (wildcards == 0 || (wildcards == 1 && !segments.empty() &&
+                         segments.back().wildcard)) {
+    compiled.linear = true;
+    compiled.segments = std::move(segments);
+  } else {
+    compiled.expression.emplace(std::move(expression));
+  }
+  return compiled;
+}
+
+// Greedy leftmost match with backtracking, mirroring the ECMAScript semantics of
+// the equivalent generated regular expression. Restores `captures` on failure so
+// a rejected candidate cannot leak partial bindings.
+bool match_segments(const std::vector<PatternSegment> &segments,
+                    std::size_t index, std::string_view path,
+                    PatternCaptures &captures) {
+  const std::size_t entry = captures.size();
+  if (index == segments.size()) {
+    if (path.empty()) return true;
+    captures.resize(entry);
+    return false;
+  }
+  const PatternSegment &segment = segments[index];
+  if (segment.wildcard) {
+    if (index + 1 != segments.size()) {
+      captures.resize(entry);
+      return false;
+    }
+    captures.emplace_back(segment.name, path);
+    return true;
+  }
+  if (!segment.parameter) {
+    if (path.starts_with(segment.literal) &&
+        match_segments(segments, index + 1,
+                       path.substr(segment.literal.size()), captures))
+      return true;
+    captures.resize(entry);
+    return false;
+  }
+  // "[^/]+" is greedy but cannot cross a separator, so candidate lengths are
+  // bounded by the next slash.
+  const auto slash = path.find('/');
+  const std::size_t limit = slash == std::string_view::npos ? path.size() : slash;
+  for (std::size_t length = limit; length >= 1; --length) {
+    captures.emplace_back(segment.name, path.substr(0, length));
+    if (match_segments(segments, index + 1, path.substr(length), captures))
+      return true;
+    captures.resize(entry);
+  }
+  captures.resize(entry);
+  return false;
 }
 
 bool match_pattern(const CompiledPattern &pattern, std::string_view path,
-                   PathParams &parameters) {
+                   PathParams &parameters, PatternCaptures &captures) {
+  if (pattern.literal_only) return path == pattern.literal;
+  if (pattern.linear) {
+    captures.clear();
+    if (!match_segments(pattern.segments, 0, path, captures)) return false;
+    for (const auto &[name, value] : captures) {
+      auto decoded = url_decode(value);
+      parameters[std::string(name)] =
+          decoded ? std::move(*decoded) : std::string(value);
+    }
+    return true;
+  }
   std::match_results<std::string_view::const_iterator> matches;
-  if (!std::regex_match(path.begin(), path.end(), matches, pattern.expression))
+  if (!std::regex_match(path.begin(), path.end(), matches, *pattern.expression))
     return false;
   for (std::size_t index = 0;
        index < pattern.names.size() && index + 1 < matches.size(); ++index) {
@@ -85,7 +202,7 @@ struct ByteRange {
 
 std::optional<ByteRange> parse_range(std::string_view value,
                                      std::uint64_t size) {
-  if (!value.starts_with("bytes=") || value.find(',') != std::string_view::npos ||
+  if (!detail::iequals(value.substr(0, 6), "bytes=") || value.find(',') != std::string_view::npos ||
       size == 0)
     return std::nullopt;
   value.remove_prefix(6);
@@ -139,54 +256,89 @@ public:
       if (thread.joinable()) thread.join();
   }
 
-  Task<void> execute(std::function<void()> function) {
+  // The handler callable is stored inside the shared completion state so the
+  // queued closures stay within std::function's small-buffer limit. Dispatching a
+  // handler therefore costs one allocation (the state) instead of two. The
+  // awaiter is returned directly rather than wrapped in a Task, so a dispatch
+  // does not also allocate a coroutine frame and a TaskState.
+  template <class Function> class DispatchAwaiter {
+  public:
     struct State {
-      std::coroutine_handle<> continuation;
+      WorkerPool *pool{nullptr};
+      std::coroutine_handle<> continuation{};
       std::exception_ptr exception;
+      Function function;
+      State(WorkerPool *pool, Function value)
+          : pool(pool), function(std::move(value)) {}
     };
-    struct Awaiter {
-      WorkerPool *pool;
-      std::function<void()> function;
-      std::shared_ptr<State> state{std::make_shared<State>()};
-      bool await_ready() const noexcept { return false; }
-      void await_suspend(std::coroutine_handle<> continuation) {
-        state->continuation = continuation;
-        auto state_copy = state;
-        pool->enqueue([pool = pool, state_copy,
-                       function = std::move(function)]() mutable {
-          try {
-            function();
-          } catch (...) {
-            state_copy->exception = std::current_exception();
-          }
-          pool->runtime_->post(
-              [state_copy] { state_copy->continuation.resume(); });
-        });
-      }
-      void await_resume() {
-        if (state->exception) std::rethrow_exception(state->exception);
-      }
-    };
-    co_await Awaiter{this, std::move(function)};
+
+    DispatchAwaiter(WorkerPool *pool, Function function)
+        : state_(std::make_shared<State>(pool, std::move(function))) {}
+    DispatchAwaiter(DispatchAwaiter &&) noexcept = default;
+    DispatchAwaiter &operator=(DispatchAwaiter &&) noexcept = default;
+    DispatchAwaiter(const DispatchAwaiter &) = delete;
+    DispatchAwaiter &operator=(const DispatchAwaiter &) = delete;
+
+    bool await_ready() const noexcept { return false; }
+    void await_suspend(std::coroutine_handle<> continuation) {
+      state_->continuation = continuation;
+      auto state_copy = state_;
+      // Capturing only the state keeps the queued closure inside std::function's
+      // small-buffer limit, so dispatching does not pay a second allocation. The
+      // pool pointer travels inside the state instead of the closure.
+      state_copy->pool->enqueue([state_copy] {
+        try {
+          state_copy->function();
+        } catch (...) {
+          state_copy->exception = std::current_exception();
+        }
+        state_copy->pool->runtime_->post(
+            [state_copy] { state_copy->continuation.resume(); });
+      });
+    }
+    void await_resume() {
+      if (state_->exception) std::rethrow_exception(state_->exception);
+    }
+
+  private:
+    std::shared_ptr<State> state_;
+  };
+
+  template <class Function> DispatchAwaiter<Function> execute(Function function) {
+    return DispatchAwaiter<Function>{this, std::move(function)};
   }
 
 private:
   void enqueue(std::function<void()> function) {
+    bool wake = false;
     {
       std::lock_guard lock(mutex_);
+      // `sleeping_` is only modified while the mutex is held, and a worker
+      // increments it before atomically releasing the lock inside wait(). So a
+      // zero count guarantees every worker is either running a job or on its way
+      // back to the queue, and no signal is needed. Busy intervals that push many
+      // jobs therefore cost one wake-up instead of one per request.
+      wake = sleeping_ != 0;
       queue_.push(std::move(function));
     }
-    ready_.notify_one();
+    if (wake) ready_.notify_one();
   }
   void worker() {
     for (;;) {
       std::function<void()> function;
       {
         std::unique_lock lock(mutex_);
-        ready_.wait(lock, [&] { return stopping_ || !queue_.empty(); });
-        if (stopping_ && queue_.empty()) return;
-        function = std::move(queue_.front());
-        queue_.pop();
+        for (;;) {
+          if (!queue_.empty()) {
+            function = std::move(queue_.front());
+            queue_.pop();
+            break;
+          }
+          if (stopping_) return;
+          ++sleeping_;
+          ready_.wait(lock);
+          --sleeping_;
+        }
       }
       function();
     }
@@ -197,6 +349,7 @@ private:
   std::condition_variable ready_;
   std::queue<std::function<void()>> queue_;
   std::vector<std::thread> threads_;
+  std::size_t sleeping_{0};
   bool stopping_{false};
 };
 
@@ -234,7 +387,7 @@ private:
 class ServerRequestBodySource final : public RequestBodyStream::Source {
 public:
   ServerRequestBodySource(std::shared_ptr<detail::Connection> connection,
-                          std::shared_ptr<std::string> buffer,
+                          std::shared_ptr<detail::ReadBuffer> buffer,
                           detail::RequestBodyState state,
                           detail::HttpReadOptions options, Request *request)
       : connection_(std::move(connection)), buffer_(std::move(buffer)),
@@ -301,7 +454,7 @@ public:
 
 private:
   std::shared_ptr<detail::Connection> connection_;
-  std::shared_ptr<std::string> buffer_;
+  std::shared_ptr<detail::ReadBuffer> buffer_;
   detail::RequestBodyState state_;
   detail::HttpReadOptions options_;
   Request *request_{nullptr};
@@ -422,6 +575,7 @@ public:
     }
     listener = *created;
     bound_port = listener->port();
+    build_dispatch_index();
     stopping = false;
     started = true;
     return true;
@@ -480,7 +634,7 @@ public:
       }
     }
 #endif
-    auto buffer = std::make_shared<std::string>();
+    auto buffer = std::make_shared<detail::ReadBuffer>();
     std::size_t request_count = 0;
     while (connection->open() &&
            request_count < options.keep_alive_max_requests) {
@@ -488,11 +642,14 @@ public:
       if (stopping) break;
       const auto timeout = request_count == 0 ? options.request_timeout
                                               : options.keep_alive_timeout;
+      // The session takes ownership of the parsed fields below, so the head is
+      // read without duplicating them onto Request::headers.
       auto parsed = co_await detail::read_request_head(
           connection, *buffer,
           {.max_header_size = options.max_header_size,
            .max_body_size = options.max_body_size,
-           .read_timeout = timeout});
+           .read_timeout = timeout},
+          false);
       if (!parsed) {
         if (parsed.error().code == Error::body_too_large ||
             parsed.error().code == Error::protocol) {
@@ -508,11 +665,17 @@ public:
         break;
       }
       session->in_request = true;
-      Request request = std::move(parsed->request);
+      // The parsed request is reused in place rather than moved into a second
+      // object: it is only ever touched while `parsed` is alive, and a duplicate
+      // would be reserved in this frame (which stays resident while the session
+      // waits for its next request) for no benefit.
+      Request &request = parsed->request;
       request.remote_address = connection->remote_address();
       request.remote_port = connection->remote_port();
       if (const auto route = find_stream_route(request)) {
         auto &entry = stream_routes[*route];
+        // Stream handlers observe the fields before the body is consumed.
+        request.headers = parsed->body.headers;
         const auto body_limit = entry.options.max_body_size == 0
                                     ? options.max_body_size
                                     : entry.options.max_body_size;
@@ -545,7 +708,9 @@ public:
         response.version = request.version;
         response.keep_alive = request.keep_alive;
         co_await dispatch_stream(entry, request, body, response);
+        if (!runtime->on_loop_thread()) co_await detail::resume_on(runtime);
         source->detach_request();
+        if (!connection->open()) break;
         request.headers = source->headers();
         if (source->error() && response.status == 200 && response.body.empty() &&
             !response.is_streaming()) {
@@ -573,29 +738,41 @@ public:
         continue;
       }
 
-      auto request_body = co_await detail::read_request_body(
-          connection, *buffer, parsed->body,
-          {.max_header_size = options.max_header_size,
-           .max_body_size = options.max_body_size,
-           .read_timeout = options.request_timeout,
-           .auto_decompress = options.auto_decompress_request});
-      if (!request_body) {
-        Response response;
-        response.status = request_body.error().code == Error::body_too_large
-                              ? 413
-                              : request_body.error().code == Error::timeout ? 408
-                                                                             : 400;
-        response.keep_alive = false;
-        response.set_content(request_body.error().message);
-        co_await detail::write_response(connection, request, response,
-                                         options.request_timeout);
-        break;
+      // A request that declares no body needs no body reader at all. Skipping
+      // the call avoids a coroutine frame, its shared state and the header
+      // round-trip through the body reader for the most common request shape.
+      const bool has_body = parsed->body.chunked ||
+                            parsed->body.content_length.value_or(0) != 0 ||
+                            parsed->body.expect_continue;
+      if (has_body) {
+        auto request_body = co_await detail::read_request_body(
+            connection, *buffer, parsed->body,
+            {.max_header_size = options.max_header_size,
+             .max_body_size = options.max_body_size,
+             .read_timeout = options.request_timeout,
+             .auto_decompress = options.auto_decompress_request});
+        if (!request_body) {
+          Response response;
+          response.status = request_body.error().code == Error::body_too_large
+                                ? 413
+                                : request_body.error().code == Error::timeout ? 408
+                                                                              : 400;
+          response.keep_alive = false;
+          response.set_content(request_body.error().message);
+          co_await detail::write_response(connection, request, response,
+                                           options.request_timeout);
+          break;
+        }
+        request.body = std::move(*request_body);
       }
-      request.body = std::move(*request_body);
       request.headers = std::move(parsed->body.headers);
-      const auto content_type = request.headers.get("Content-Type");
-      if (detail::lower(content_type).starts_with("multipart/form-data")) {
-        auto files = parse_multipart(request.body, content_type);
+      // Borrowed lookup: the common non-multipart body path must not allocate a
+      // Content-Type copy just to compare a prefix.
+      const auto *content_type =
+          detail::find_header(request.headers, "Content-Type");
+      if (content_type &&
+          detail::istarts_with(*content_type, "multipart/form-data")) {
+        auto files = parse_multipart(request.body, *content_type);
         if (files) request.files = std::move(*files);
       }
 
@@ -647,6 +824,8 @@ public:
       response.version = request.version;
       response.keep_alive = request.keep_alive;
       co_await dispatch(request, response);
+      if (!runtime->on_loop_thread()) co_await detail::resume_on(runtime);
+      if (!connection->open()) break;
       if (request_count + 1 >= options.keep_alive_max_requests || stopping)
         response.keep_alive = false;
       const bool reusable = response.keep_alive && request.keep_alive;
@@ -674,43 +853,153 @@ public:
     sessions_cv.notify_all();
   }
 
-  std::optional<std::size_t> find_route(Request &request) const {
-    for (std::size_t index = 0; index < routes.size(); ++index) {
-      if (!detail::iequals(routes[index].method, request.method) &&
-          !(detail::iequals(request.method, "HEAD") &&
-            detail::iequals(routes[index].method, "GET")))
-        continue;
-      PathParams parameters;
-      if (match_pattern(routes[index].pattern, request.path, parameters)) {
-        request.path_params = std::move(parameters);
-        return index;
+  // Dispatch index. Route patterns cannot change once the server is running, so
+  // the bucket layout is built once and then only read. Literal routes resolve
+  // through a hash lookup, and only the patterned routes that precede the
+  // matched literal are actually evaluated, which preserves registration order.
+  // Ordered with a transparent comparator so a std::string_view can be looked up
+  // without constructing a temporary key on the request path.
+  struct MethodRoutes {
+    std::vector<std::size_t> patterned;
+    std::map<std::string, std::size_t, std::less<>> literal_first;
+  };
+  using MethodRoutesMap = std::map<std::string, MethodRoutes, std::less<>>;
+
+  // Lower-cases the request method without allocating for the usual short verbs.
+  class MethodKey {
+  public:
+    explicit MethodKey(std::string_view method) : length_(method.size()) {
+      if (length_ <= buffer_.size()) {
+        for (std::size_t index = 0; index < length_; ++index) {
+          const auto ch = static_cast<unsigned char>(method[index]);
+          buffer_[index] = ch >= 'A' && ch <= 'Z' ? static_cast<char>(ch + 32)
+                                                  : static_cast<char>(ch);
+        }
+      } else {
+        fallback_ = detail::lower(method);
       }
     }
+    [[nodiscard]] std::string_view view() const noexcept {
+      return fallback_.empty() ? std::string_view(buffer_.data(), length_)
+                               : std::string_view(fallback_);
+    }
+
+  private:
+    std::array<char, 32> buffer_{};
+    std::string fallback_;
+    std::size_t length_{0};
+  };
+
+  void build_dispatch_index() {
+    routes_by_method.clear();
+    stream_routes_by_method.clear();
+    for (std::size_t index = 0; index < routes.size(); ++index) {
+      const auto &route = routes[index];
+      auto &bucket = routes_by_method[route.method];
+      if (route.pattern.literal_only)
+        bucket.literal_first.try_emplace(route.pattern.literal, index);
+      else
+        bucket.patterned.push_back(index);
+    }
+    for (std::size_t index = 0; index < stream_routes.size(); ++index) {
+      const auto &route = stream_routes[index];
+      auto &bucket = stream_routes_by_method[route.method];
+      if (route.pattern.literal_only)
+        bucket.literal_first.try_emplace(route.pattern.literal, index);
+      else
+        bucket.patterned.push_back(index);
+    }
+  }
+
+  // Walks at most two method buckets (HEAD also consults GET) in registration
+  // order, stopping as soon as the matched literal route would be reached.
+  template <class Table>
+  std::optional<std::size_t>
+  locate_route(const MethodRoutes *primary, const MethodRoutes *secondary,
+               std::string_view path, PathParams &parameters,
+               PatternCaptures &captures, const Table &table) const {
+    const MethodRoutes *buckets[2]{primary, secondary};
+    constexpr std::size_t none = (std::numeric_limits<std::size_t>::max)();
+    std::size_t literal_index = none;
+    for (const auto *bucket : buckets) {
+      if (bucket == nullptr) continue;
+      const auto found = bucket->literal_first.find(path);
+      if (found != bucket->literal_first.end() && found->second < literal_index)
+        literal_index = found->second;
+    }
+    std::size_t positions[2]{0, 0};
+    for (;;) {
+      std::size_t next = none;
+      for (std::size_t slot = 0; slot < 2; ++slot) {
+        const auto *bucket = buckets[slot];
+        if (bucket == nullptr || positions[slot] >= bucket->patterned.size())
+          continue;
+        next = std::min(next, bucket->patterned[positions[slot]]);
+      }
+      if (next == none || next >= literal_index) break;
+      if (match_pattern(table[next].pattern, path, parameters, captures))
+        return next;
+      for (std::size_t slot = 0; slot < 2; ++slot) {
+        const auto *bucket = buckets[slot];
+        if (bucket == nullptr) continue;
+        while (positions[slot] < bucket->patterned.size() &&
+               bucket->patterned[positions[slot]] == next)
+          ++positions[slot];
+      }
+    }
+    if (literal_index != none) return literal_index;
     return std::nullopt;
+  }
+
+  const MethodRoutes *bucket_for(const MethodRoutesMap &map,
+                                 std::string_view method) const {
+    if (method.empty()) return nullptr;
+    const auto found = map.find(method);
+    return found == map.end() ? nullptr : &found->second;
+  }
+
+  std::optional<std::size_t> find_route(Request &request) const {
+    const MethodKey key(request.method);
+    const MethodRoutes *secondary = nullptr;
+    if (key.view() == "head") {
+      const auto found = routes_by_method.find("get");
+      if (found != routes_by_method.end()) secondary = &found->second;
+    }
+    PathParams parameters;
+    PatternCaptures captures;
+    const auto matched = locate_route(bucket_for(routes_by_method, key.view()),
+                                      secondary, request.path, parameters,
+                                      captures, routes);
+    if (!matched) return std::nullopt;
+    request.path_params = std::move(parameters);
+    return matched;
   }
 
   std::optional<std::size_t> find_stream_route(Request &request) const {
-    for (std::size_t index = 0; index < stream_routes.size(); ++index) {
-      if (!detail::iequals(stream_routes[index].method, request.method))
-        continue;
-      PathParams parameters;
-      if (match_pattern(stream_routes[index].pattern, request.path,
-                        parameters)) {
-        request.path_params = std::move(parameters);
-        return index;
-      }
-    }
-    return std::nullopt;
+    // Almost every server declares no stream routes; skip the method key and the
+    // two lookup buffers entirely when the table is empty.
+    if (stream_routes_by_method.empty()) return std::nullopt;
+    const MethodKey key(request.method);
+    PathParams parameters;
+    PatternCaptures captures;
+    const auto matched =
+        locate_route(bucket_for(stream_routes_by_method, key.view()), nullptr,
+                     request.path, parameters, captures, stream_routes);
+    if (!matched) return std::nullopt;
+    request.path_params = std::move(parameters);
+    return matched;
   }
 
   std::optional<std::size_t> find_ws_route(Request &request) const {
+    PathParams parameters;
+    PatternCaptures captures;
     for (std::size_t index = 0; index < websocket_routes.size(); ++index) {
-      PathParams parameters;
       if (match_pattern(websocket_routes[index].pattern, request.path,
-                        parameters)) {
+                        parameters, captures)) {
         request.path_params = std::move(parameters);
         return index;
       }
+      parameters.clear();
     }
     return std::nullopt;
   }
@@ -721,13 +1010,16 @@ public:
       return false;
     for (const auto &mount : mounts) {
       if (!request.path.starts_with(mount.prefix)) continue;
-      auto relative = request.path.substr(mount.prefix.size());
-      while (!relative.empty() && relative.front() == '/') relative.erase(0, 1);
-      auto path = mount.root / std::filesystem::path(relative);
+      std::size_t begin = mount.prefix.size();
+      while (begin < request.path.size() && request.path[begin] == '/') ++begin;
+      auto path = mount.root /
+                  std::filesystem::path(std::string_view(request.path).substr(begin));
       std::error_code ignored;
       if (std::filesystem::is_directory(path, ignored)) path /= "index.html";
+      // The mount root was canonicalised at registration time, so only the
+      // candidate needs resolving here.
       if (!std::filesystem::is_regular_file(path, ignored) ||
-          !detail::path_is_within(mount.root, path))
+          !detail::path_is_within_canonical(mount.root, path))
         return false;
       response.set_file(path);
       for (const auto &[name, value] : mount.headers)
@@ -748,9 +1040,14 @@ public:
         else
           co_await workers->execute(
               [&entry, &request, &response] { entry.sync(request, response); });
-      } else if (!serve_static(request, response)) {
-        response.status = 404;
-        (error_handler ? error_handler : default_error_handler)(request, response);
+      } else {
+        bool served = false;
+        if (!mounts.empty())
+          co_await detail::run_file_io([&] { served = serve_static(request, response); });
+        if (!served) {
+          response.status = 404;
+          (error_handler ? error_handler : default_error_handler)(request, response);
+        }
       }
       if (post_routing) post_routing(request, response);
     } catch (...) {
@@ -774,52 +1071,104 @@ public:
   Task<ErrorInfo> send_file(const std::shared_ptr<detail::Connection> &connection,
                             const Request &request, Response &response) {
     const auto &path = *ServerAccess::file(response);
-    std::error_code filesystem_error;
-    const auto size = std::filesystem::file_size(path, filesystem_error);
-    if (filesystem_error)
-      co_return ErrorInfo{Error::read, "Unable to stat static file"};
-    std::uint64_t first = 0;
-    std::uint64_t last = size == 0 ? 0 : size - 1;
-    if (request.headers.contains("Range")) {
-      auto range = parse_range(request.headers.get("Range"), size);
-      if (!range) {
-        response.status = 416;
-        response.headers.set("Content-Range", "bytes */" + std::to_string(size));
-        response.body.clear();
-        co_return co_await detail::write_response(connection, request, response,
-                                                   options.request_timeout);
+    std::ifstream input;
+    std::uint64_t size = 0;
+    bool opened = false;
+    co_await detail::run_file_io([&] {
+      input.open(path, std::ios::binary | std::ios::ate);
+      if (!input) return;
+      const auto end = input.tellg();
+      if (end < 0) { input.close(); return; }
+      size = static_cast<std::uint64_t>(end);
+      opened = true;
+    });
+    if (!opened) {
+      response.status = 500;
+      response.keep_alive = false;
+      response.set_content("Unable to open response file");
+      co_return co_await detail::write_response(connection, request, response,
+                                                options.request_timeout);
+    }
+    // Keep cleanup outside the transfer coroutine so every read/write failure
+    // closes the descriptor on the file pool before returning to the session.
+    auto transfer = [&]() -> Task<ErrorInfo> {
+      std::uint64_t first = 0;
+      std::uint64_t last = size == 0 ? 0 : size - 1;
+      // Borrow the request and response fields: a conditional file request must
+      // not materialise three string copies just to compare them.
+      const auto *requested_range = detail::find_header(request.headers, "Range");
+      const auto *validator = detail::find_header(request.headers, "If-Range");
+      const auto *etag = detail::find_header(response.headers, "ETag");
+      // A missing/stale/weak validator must not splice bytes into an older
+      // representation. Date validators conservatively use the full response.
+      const bool validator_matches =
+          validator == nullptr ||
+          (validator->size() >= 2 && validator->front() == '"' &&
+           validator->back() == '"' && etag != nullptr && *validator == *etag);
+      if (response.status == 200 && detail::iequals(request.method, "GET") &&
+          requested_range != nullptr &&
+          detail::istarts_with(*requested_range, "bytes=") && validator_matches) {
+        auto range = parse_range(*requested_range, size);
+        if (!range) {
+          response.status = 416;
+          response.headers.set("Content-Range", "bytes */" + std::to_string(size));
+          response.body.clear();
+          co_return co_await detail::write_response(connection, request, response,
+                                                     options.request_timeout);
+        }
+        first = range->first;
+        last = range->last;
+        response.status = 206;
+        response.headers.set("Content-Range",
+                             "bytes " + std::to_string(first) + "-" +
+                                 std::to_string(last) + "/" + std::to_string(size));
       }
-      first = range->first;
-      last = range->last;
-      response.status = 206;
-      response.headers.set("Content-Range",
-                           "bytes " + std::to_string(first) + "-" +
-                               std::to_string(last) + "/" + std::to_string(size));
+      const auto length = size == 0 ? 0 : last - first + 1;
+      auto error = co_await detail::write_response_head(
+          connection, request, response, false, length, options.request_timeout);
+      if (error || detail::iequals(request.method, "HEAD") || length == 0 ||
+          (response.status >= 100 && response.status < 200) ||
+          response.status == 204 || response.status == 205 || response.status == 304)
+        co_return error;
+      std::uint64_t remaining = length;
+      bool seek = true;
+      // Each iteration costs a filesystem-pool hop plus a socket write, so larger
+      // transfers are read in blocks that amortise both.
+      constexpr std::uint64_t block_size = 256 * 1024;
+      while (remaining > 0) {
+        if (!connection->open())
+          co_return ErrorInfo{Error::write, "File transfer connection closed"};
+        std::string chunk;
+        bool read_failed = false;
+        co_await detail::run_file_io([&] {
+          if (seek) {
+            input.seekg(static_cast<std::streamoff>(first));
+            seek = false;
+          }
+          chunk.resize(static_cast<std::size_t>(
+              std::min<std::uint64_t>(remaining, block_size)));
+          input.read(chunk.data(), static_cast<std::streamsize>(chunk.size()));
+          read_failed = input.bad() ||
+              input.gcount() != static_cast<std::streamsize>(chunk.size());
+        });
+        if (read_failed)
+          co_return ErrorInfo{Error::read, "Static file read was truncated"};
+        remaining -= chunk.size();
+        error = co_await connection->write(std::move(chunk), options.request_timeout);
+        if (error) co_return error;
+      }
+      co_return ErrorInfo{};
+    };
+    ErrorInfo error;
+    std::exception_ptr exception;
+    try {
+      error = co_await transfer();
+    } catch (...) {
+      exception = std::current_exception();
     }
-    const auto length = size == 0 ? 0 : last - first + 1;
-    auto error = co_await detail::write_response_head(
-        connection, request, response, false, length, options.request_timeout);
-    if (error || detail::iequals(request.method, "HEAD") || length == 0)
-      co_return error;
-    std::ifstream input(path, std::ios::binary);
-    if (!input) co_return ErrorInfo{Error::read, "Unable to open static file"};
-    input.seekg(static_cast<std::streamoff>(first));
-    std::array<char, 64 * 1024> buffer{};
-    std::uint64_t remaining = length;
-    while (remaining > 0) {
-      const auto count = static_cast<std::streamsize>(
-          std::min<std::uint64_t>(remaining, buffer.size()));
-      input.read(buffer.data(), count);
-      const auto received = input.gcount();
-      if (received <= 0)
-        co_return ErrorInfo{Error::read, "Static file read was truncated"};
-      error = co_await connection->write(
-          std::string(buffer.data(), static_cast<std::size_t>(received)),
-          options.request_timeout);
-      if (error) co_return error;
-      remaining -= static_cast<std::uint64_t>(received);
-    }
-    co_return ErrorInfo{};
+    co_await detail::run_file_io([&] { input.close(); });
+    if (exception) std::rethrow_exception(exception);
+    co_return error;
   }
 
   Task<ErrorInfo> send_response(
@@ -859,15 +1208,25 @@ public:
     if (options.auto_compress_response &&
         response.body.size() >= options.compression_threshold &&
         !response.headers.contains("Content-Encoding") &&
-        !detail::iequals(request.method, "HEAD")) {
+        !detail::iequals(request.method, "HEAD") &&
+        !(response.status >= 100 && response.status < 200) &&
+        response.status != 204 && response.status != 205 && response.status != 304) {
+      const auto *accept_encoding =
+          detail::find_header(request.headers, "Accept-Encoding");
       const auto encoding =
-          detail::select_encoding(request.headers.get("Accept-Encoding"));
+          detail::select_encoding(accept_encoding ? *accept_encoding
+                                                  : std::string_view{});
       if (!encoding.empty()) {
-        auto compressed = detail::compress(response.body, encoding);
+        Result<std::string> compressed{ErrorInfo{Error::internal, "Compression pending"}};
+        co_await workers->execute([&] {
+          compressed = detail::compress(response.body, encoding);
+        });
         if (compressed) {
           response.body = std::move(*compressed);
           response.headers.set("Content-Encoding", encoding);
-          response.headers.set("Vary", "Accept-Encoding");
+          if (!detail::has_token(response.headers, "Vary", "Accept-Encoding") &&
+              !detail::has_token(response.headers, "Vary", "*"))
+            response.headers.add("Vary", "Accept-Encoding");
         }
       }
     }
@@ -885,6 +1244,8 @@ public:
   std::vector<Route> routes;
   std::vector<StreamRoute> stream_routes;
   std::vector<WsRoute> websocket_routes;
+  MethodRoutesMap routes_by_method;
+  MethodRoutesMap stream_routes_by_method;
   std::vector<Mount> mounts;
   Middleware pre_routing;
   Middleware post_routing;

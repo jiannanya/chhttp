@@ -40,6 +40,8 @@ bool Headers::erase(std::string_view name) {
   return values_.size() != old_size;
 }
 
+void Headers::reserve(std::size_t count) { values_.reserve(count); }
+
 bool Headers::contains(std::string_view name) const {
   return std::ranges::any_of(values_, [&](const value_type &item) {
     return detail::iequals(item.first, name);
@@ -89,7 +91,7 @@ std::string Request::get_param(std::string_view name,
 void Request::set_stream_body(
     StreamHandler handler,
     std::optional<std::uint64_t> content_length) {
-  body.clear();
+  std::string{}.swap(body);
   body_stream = std::move(handler);
   body_stream_length = content_length;
 }
@@ -153,14 +155,14 @@ void Response::set_redirect(std::string location, int redirect_status) {
 void Response::set_file(std::filesystem::path path,
                         std::string_view content_type) {
   file_path_ = std::move(path);
-  body.clear();
+  std::string{}.swap(body);
   stream_handler_ = {};
   headers.set("Content-Type", content_type.empty() ? mime_type(*file_path_)
                                                    : std::string(content_type));
 }
 
 void Response::set_stream(std::string content_type, StreamHandler handler) {
-  body.clear();
+  std::string{}.swap(body);
   file_path_.reset();
   stream_handler_ = std::move(handler);
   headers.set("Content-Type", std::move(content_type));
@@ -237,6 +239,11 @@ std::string url_encode(std::string_view value, bool space_as_plus) {
 }
 
 Result<std::string> url_decode(std::string_view value, bool plus_as_space) {
+  // Path segments and query values usually contain no escape at all, so the
+  // scanning loop is skipped and the result is a straight copy.
+  if (value.find('%') == std::string_view::npos &&
+      (!plus_as_space || value.find('+') == std::string_view::npos))
+    return std::string(value);
   std::string output;
   output.reserve(value.size());
   const auto hex_value = [](char ch) -> int {
@@ -268,6 +275,11 @@ Result<std::string> url_decode(std::string_view value, bool plus_as_space) {
 Params parse_query(std::string_view query) {
   Params result;
   if (!query.empty() && query.front() == '?') query.remove_prefix(1);
+  // One capacity reservation sized from the separator count avoids the repeated
+  // growth a multi-parameter query would otherwise pay for.
+  result.reserve(static_cast<std::size_t>(
+                     std::count(query.begin(), query.end(), '&')) +
+                 1);
   std::size_t start = 0;
   while (start <= query.size()) {
     const auto end = query.find('&', start);
@@ -276,11 +288,14 @@ Params parse_query(std::string_view query) {
                                              : end - start);
     if (!part.empty()) {
       const auto equal = part.find('=');
-      const auto key = url_decode(part.substr(0, equal), true);
-      const auto value = equal == std::string_view::npos
-                             ? Result<std::string>(std::string{})
-                             : url_decode(part.substr(equal + 1), true);
-      if (key && value) result.emplace_back(*key, *value);
+      auto key = url_decode(part.substr(0, equal), true);
+      auto value = equal == std::string_view::npos
+                       ? Result<std::string>(std::string{})
+                       : url_decode(part.substr(equal + 1), true);
+      // Moving the decoded strings into the pair avoids a second allocation and
+      // copy of every key and value.
+      if (key && value)
+        result.emplace_back(std::move(*key), std::move(*value));
     }
     if (end == std::string_view::npos) break;
     start = end + 1;
@@ -489,7 +504,9 @@ make_multipart(const MultipartForm &parts, std::string boundary) {
 }
 
 std::string mime_type(const std::filesystem::path &path) {
-  static const std::unordered_map<std::string, std::string> types{
+  // Lower-cased extension keys are short, so the lookup runs entirely on a stack
+  // buffer and never allocates for the common static-file response.
+  static const std::unordered_map<std::string_view, std::string_view> types{
       {".html", "text/html; charset=utf-8"}, {".htm", "text/html; charset=utf-8"},
       {".css", "text/css; charset=utf-8"},   {".js", "text/javascript; charset=utf-8"},
       {".json", "application/json"},        {".xml", "application/xml"},
@@ -502,12 +519,27 @@ std::string mime_type(const std::filesystem::path &path) {
       {".gz", "application/gzip"},          {".mp3", "audio/mpeg"},
       {".mp4", "video/mp4"},                {".woff", "font/woff"},
       {".woff2", "font/woff2"}};
-  auto extension = detail::lower(path.extension().string());
-  const auto found = types.find(extension);
-  return found == types.end() ? "application/octet-stream" : found->second;
+  constexpr std::string_view fallback = "application/octet-stream";
+  const auto extension = path.extension().native();
+  std::array<char, 16> key{};
+  std::size_t length = 0;
+  for (const auto value : extension) {
+    const auto wide = static_cast<unsigned long long>(value);
+    if (wide > 0x7f || length == key.size()) return std::string(fallback);
+    const auto ch = static_cast<char>(wide);
+    key[length++] = ch >= 'A' && ch <= 'Z' ? static_cast<char>(ch + ('a' - 'A')) : ch;
+  }
+  const auto found = types.find(std::string_view(key.data(), length));
+  return found == types.end() ? std::string(fallback) : std::string(found->second);
 }
 
 std::string status_reason(int status) {
+  return std::string(detail::status_reason_view(status));
+}
+
+namespace detail {
+
+std::string_view status_reason_view(int status) noexcept {
   switch (status) {
   case 100: return "Continue";
   case 101: return "Switching Protocols";
@@ -574,6 +606,8 @@ std::string status_reason(int status) {
   default: return "Unknown";
   }
 }
+
+} // namespace detail
 
 Result<ContentRange> parse_content_range(std::string_view value) {
   const auto trim_ows = [](std::string_view text) {
@@ -900,17 +934,46 @@ std::string format_sse(const SseEvent &event) {
 namespace chhttp::detail {
 
 bool iequals(std::string_view lhs, std::string_view rhs) noexcept {
-  return lhs.size() == rhs.size() &&
-         std::ranges::equal(lhs, rhs, [](char left, char right) {
-           return std::tolower(static_cast<unsigned char>(left)) ==
-                  std::tolower(static_cast<unsigned char>(right));
-         });
+  if (lhs.size() != rhs.size()) return false;
+  // Field names and values are overwhelmingly already lower-case on the wire, so
+  // the equal-byte case is taken without any folding work; only a mismatch pays
+  // for the ASCII case fold.
+  for (std::size_t index = 0; index < lhs.size(); ++index) {
+    auto left = static_cast<unsigned char>(lhs[index]);
+    auto right = static_cast<unsigned char>(rhs[index]);
+    if (left == right) continue;
+    if (left >= 'A' && left <= 'Z') left = static_cast<unsigned char>(left + ('a' - 'A'));
+    if (right >= 'A' && right <= 'Z') right = static_cast<unsigned char>(right + ('a' - 'A'));
+    if (left != right) return false;
+  }
+  return true;
+}
+
+bool istarts_with(std::string_view value, std::string_view prefix) noexcept {
+  if (prefix.size() > value.size()) return false;
+  for (std::size_t index = 0; index < prefix.size(); ++index) {
+    auto left = static_cast<unsigned char>(prefix[index]);
+    auto right = static_cast<unsigned char>(value[index]);
+    if (left == right) continue;
+    if (left >= 'A' && left <= 'Z') left = static_cast<unsigned char>(left + ('a' - 'A'));
+    if (right >= 'A' && right <= 'Z') right = static_cast<unsigned char>(right + ('a' - 'A'));
+    if (left != right) return false;
+  }
+  return true;
+}
+
+const std::string *find_header(const Headers &headers,
+                               std::string_view name) noexcept {
+  for (const auto &entry : headers) {
+    if (iequals(entry.first, name)) return &entry.second;
+  }
+  return nullptr;
 }
 
 std::string lower(std::string_view value) {
   std::string output(value);
   std::ranges::transform(output, output.begin(), [](unsigned char ch) {
-    return static_cast<char>(std::tolower(ch));
+    return static_cast<char>(ch >= 'A' && ch <= 'Z' ? ch + ('a' - 'A') : ch);
   });
   return output;
 }
@@ -945,9 +1008,49 @@ std::string random_boundary() {
   return stream.str();
 }
 
+namespace {
+bool has_url_scheme(std::string_view value) noexcept {
+  const auto colon = value.find(':');
+  if (colon == std::string_view::npos || colon == 0) return false;
+  const auto alpha = [](char ch) { return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z'); };
+  if (!alpha(value.front())) return false;
+  for (char ch : value.substr(1, colon - 1))
+    if (!alpha(ch) && !(ch >= '0' && ch <= '9') && ch != '+' && ch != '-' && ch != '.')
+      return false;
+  return true;
+}
+
+// RFC 3986 section 5.2.4. Empty path segments are significant; a token splitter
+// cannot perform this operation without changing repeated/trailing slashes.
+std::string remove_dot_segments(std::string_view path) {
+  std::string output;
+  output.reserve(path.size());
+  const auto pop = [&] {
+    const auto slash = output.rfind('/');
+    output.resize(slash == std::string::npos ? 0 : slash);
+  };
+  while (!path.empty()) {
+    if (path.starts_with("../")) path.remove_prefix(3);
+    else if (path.starts_with("./")) path.remove_prefix(2);
+    else if (path.starts_with("/./")) path.remove_prefix(2);
+    else if (path == "/.") path = "/";
+    else if (path.starts_with("/../")) { path.remove_prefix(3); pop(); }
+    else if (path == "/..") { path = "/"; pop(); }
+    else if (path == "." || path == "..") path = {};
+    else {
+      const auto next = path.find('/', path.front() == '/' ? 1 : 0);
+      const auto count = next == std::string_view::npos ? path.size() : next;
+      output.append(path.substr(0, count));
+      path.remove_prefix(count);
+    }
+  }
+  return output;
+}
+} // namespace
+
 Result<ParsedUrl> parse_url(std::string_view input, std::string_view base) {
   std::string complete(input);
-  if (input.find("://") == std::string_view::npos) {
+  if (!has_url_scheme(input)) {
     if (base.empty()) return ErrorInfo{Error::invalid_url, "URL has no scheme"};
     auto resolved = resolve_url(base, input);
     if (!resolved) return resolved.error();
@@ -1025,19 +1128,42 @@ Result<ParsedUrl> parse_url(std::string_view input, std::string_view base) {
 }
 
 std::string ParsedUrl::authority() const {
-  std::string value = host.find(':') == std::string::npos ? host : "[" + host + "]";
+  const bool bracketed = host.find(':') != std::string::npos;
   const bool default_port = (secure && port == 443) || (!secure && port == 80);
-  if (!default_port) value += ":" + std::to_string(port);
+  std::string value;
+  value.reserve(host.size() + (bracketed ? 2 : 0) + (default_port ? 0 : 6));
+  if (bracketed) value.push_back('[');
+  value += host;
+  if (bracketed) value.push_back(']');
+  if (!default_port) {
+    value.push_back(':');
+    value += std::to_string(port);
+  }
   return value;
 }
 
 std::string ParsedUrl::origin() const {
-  return scheme + "://" + authority();
+  const bool bracketed = host.find(':') != std::string::npos;
+  const bool default_port = (secure && port == 443) || (!secure && port == 80);
+  std::string value;
+  value.reserve(scheme.size() + host.size() + (bracketed ? 2 : 0) +
+                (default_port ? 3 : 9));
+  value += scheme;
+  value += "://";
+  if (bracketed) value.push_back('[');
+  value += host;
+  if (bracketed) value.push_back(']');
+  if (!default_port) {
+    value.push_back(':');
+    value += std::to_string(port);
+  }
+  return value;
 }
 
 Result<std::string> resolve_url(std::string_view base,
                                 std::string_view reference) {
-  if (reference.find("://") != std::string_view::npos)
+  reference = reference.substr(0, reference.find('#'));
+  if (has_url_scheme(reference))
     return std::string(reference);
   auto parsed_base = parse_url(base);
   if (!parsed_base) return parsed_base.error();
@@ -1060,47 +1186,75 @@ Result<std::string> resolve_url(std::string_view base,
                std::string(reference);
   }
   const auto query_at = combined.find('?');
-  const auto query = query_at == std::string::npos ? std::string{} : combined.substr(query_at);
-  auto path = combined.substr(0, query_at);
-  std::vector<std::string> segments;
-  for (const auto &segment : split_tokens(path, '/')) {
-    if (segment == ".") continue;
-    if (segment == "..") {
-      if (!segments.empty()) segments.pop_back();
-    } else {
-      segments.push_back(segment);
-    }
-  }
-  path = "/";
-  for (std::size_t index = 0; index < segments.size(); ++index) {
-    if (index) path += '/';
-    path += segments[index];
-  }
-  if (combined.ends_with('/') && !path.ends_with('/')) path += '/';
-  return origin + path + query;
+  auto normalized = remove_dot_segments(std::string_view(combined).substr(0, query_at));
+  if (query_at != std::string::npos) normalized.append(combined, query_at, std::string::npos);
+  return origin + normalized;
 }
+
+namespace {
+
+// Field-name and field-value validation run once per header in both directions,
+// so each byte is classified with a single indexed load instead of scanning the
+// separator set. The tables are built at compile time and shared by every
+// translation unit; no architecture-specific instruction is involved.
+constexpr std::array<bool, 256> make_token_character_table() {
+  std::array<bool, 256> table{};
+  constexpr std::string_view separators = "()<>@,;:\\\"/[]?={} \t";
+  for (std::size_t code = 0; code < table.size(); ++code) {
+    const auto ch = static_cast<char>(code);
+    table[code] = code > 0x20 && code < 0x7f &&
+                  separators.find(ch) == std::string_view::npos;
+  }
+  return table;
+}
+
+constexpr std::array<bool, 256> make_field_value_character_table() {
+  std::array<bool, 256> table{};
+  for (std::size_t code = 0; code < table.size(); ++code)
+    table[code] = code == '\t' || (code >= 0x20 && code != 0x7f);
+  return table;
+}
+
+inline constexpr auto token_characters = make_token_character_table();
+inline constexpr auto field_value_characters = make_field_value_character_table();
+
+} // namespace
 
 bool valid_header_name(std::string_view value) noexcept {
   if (value.empty()) return false;
-  constexpr std::string_view separators = "()<>@,;:\\\"/[]?={} \t";
-  return std::ranges::all_of(value, [&](unsigned char ch) {
-    return ch > 0x20 && ch < 0x7f && separators.find(static_cast<char>(ch)) ==
-                                           std::string_view::npos;
-  });
+  for (const char ch : value)
+    if (!token_characters[static_cast<unsigned char>(ch)]) return false;
+  return true;
 }
 
 bool valid_header_value(std::string_view value) noexcept {
-  return std::ranges::all_of(value, [](unsigned char ch) {
-    return ch == '\t' || (ch >= 0x20 && ch != 0x7f);
-  });
+  for (const char ch : value)
+    if (!field_value_characters[static_cast<unsigned char>(ch)]) return false;
+  return true;
+}
+
+bool header_value_has_token(std::string_view value,
+                            std::string_view token) noexcept {
+  for (;;) {
+    const auto comma = value.find(',');
+    auto candidate = value.substr(0, comma);
+    while (!candidate.empty() &&
+           (candidate.front() == ' ' || candidate.front() == '\t'))
+      candidate.remove_prefix(1);
+    while (!candidate.empty() &&
+           (candidate.back() == ' ' || candidate.back() == '\t'))
+      candidate.remove_suffix(1);
+    if (!candidate.empty() && iequals(candidate, token)) return true;
+    if (comma == std::string_view::npos) break;
+    value.remove_prefix(comma + 1);
+  }
+  return false;
 }
 
 bool has_token(const Headers &headers, std::string_view name,
                std::string_view token) {
-  for (const auto &value : headers.get_all(name)) {
-    for (const auto &candidate : split_tokens(value, ',')) {
-      if (iequals(candidate, token)) return true;
-    }
+  for (const auto &[key, value] : headers) {
+    if (iequals(key, name) && header_value_has_token(value, token)) return true;
   }
   return false;
 }
@@ -1183,11 +1337,16 @@ ErrorInfo make_error(Error code, std::string message, int system_code,
 
 bool path_is_within(const std::filesystem::path &root,
                     const std::filesystem::path &candidate) {
-  const auto normalized_root = std::filesystem::weakly_canonical(root);
+  return path_is_within_canonical(std::filesystem::weakly_canonical(root),
+                                 candidate);
+}
+
+bool path_is_within_canonical(const std::filesystem::path &canonical_root,
+                              const std::filesystem::path &candidate) {
   const auto normalized_candidate = std::filesystem::weakly_canonical(candidate);
-  auto root_it = normalized_root.begin();
+  auto root_it = canonical_root.begin();
   auto candidate_it = normalized_candidate.begin();
-  for (; root_it != normalized_root.end(); ++root_it, ++candidate_it) {
+  for (; root_it != canonical_root.end(); ++root_it, ++candidate_it) {
     if (candidate_it == normalized_candidate.end() || *root_it != *candidate_it)
       return false;
   }
@@ -1321,44 +1480,60 @@ Result<std::string> decompress(std::string_view input, std::string_view encoding
 std::string select_encoding(std::string_view accept_encoding) {
   constexpr std::array<std::string_view, 4> supported{
       "br", "zstd", "gzip", "deflate"};
-  std::array<double, supported.size()> explicit_quality{};
-  explicit_quality.fill(-1.0);
-  double wildcard_quality = -1.0;
-  for (const auto &item : split_tokens(accept_encoding, ',')) {
+  std::array<int, supported.size()> explicit_quality{};
+  explicit_quality.fill(-1);
+  int wildcard_quality = -1;
+  const auto trim_view = [](std::string_view value) {
+    while (!value.empty() && (value.front() == ' ' || value.front() == '\t')) value.remove_prefix(1);
+    while (!value.empty() && (value.back() == ' ' || value.back() == '\t')) value.remove_suffix(1);
+    return value;
+  };
+  const auto parse_quality = [](std::string_view number) {
+    if (number.empty() || (number.front() != '0' && number.front() != '1')) return 0;
+    int result = (number.front() - '0') * 1000;
+    if (number.size() == 1) return result;
+    if (number[1] != '.' || number.size() > 5) return 0;
+    int scale = 100;
+    for (char ch : number.substr(2)) {
+      if (ch < '0' || ch > '9' || (number.front() == '1' && ch != '0')) return 0;
+      result += (ch - '0') * scale;
+      scale /= 10;
+    }
+    return result;
+  };
+  while (!accept_encoding.empty()) {
+    const auto comma = accept_encoding.find(',');
+    const auto item = trim_view(accept_encoding.substr(0, comma));
+    accept_encoding.remove_prefix(comma == std::string_view::npos ? accept_encoding.size() : comma + 1);
     const auto semicolon = item.find(';');
-    const auto coding = lower(trim(std::string_view(item).substr(0, semicolon)));
-    double quality = 1.0;
+    const auto coding = trim_view(item.substr(0, semicolon));
+    int quality = 1000;
+    bool seen_quality = false;
     std::size_t parameter = semicolon;
     while (parameter != std::string::npos) {
       const auto next = item.find(';', parameter + 1);
-      const auto value = trim(std::string_view(item).substr(
+      const auto value = trim_view(item.substr(
           parameter + 1, next == std::string::npos
                              ? std::string_view::npos
                              : next - parameter - 1));
       const auto equal = value.find('=');
-      if (equal != std::string::npos &&
-          iequals(trim(std::string_view(value).substr(0, equal)), "q")) {
-        const auto number = trim(std::string_view(value).substr(equal + 1));
-        const auto parsed = std::from_chars(number.data(),
-                                            number.data() + number.size(),
-                                            quality);
-        if (parsed.ec != std::errc{} ||
-            parsed.ptr != number.data() + number.size() || quality < 0.0 ||
-            quality > 1.0)
-          quality = 0.0;
+      if (iequals(trim_view(value.substr(0, equal)), "q")) {
+        if (seen_quality || equal == std::string_view::npos) { quality = 0; break; }
+        seen_quality = true;
+        quality = parse_quality(trim_view(value.substr(equal + 1)));
       }
       parameter = next;
     }
     if (coding == "*") wildcard_quality = std::max(wildcard_quality, quality);
     for (std::size_t index = 0; index < supported.size(); ++index)
-      if (coding == supported[index])
+      if (iequals(coding, supported[index]))
         explicit_quality[index] =
             std::max(explicit_quality[index], quality);
   }
-  double selected_quality = 0.0;
+  int selected_quality = 0;
   std::string selected;
   for (std::size_t index = 0; index < supported.size(); ++index) {
-    const double quality = explicit_quality[index] >= 0.0
+    const int quality = explicit_quality[index] >= 0
                                ? explicit_quality[index]
                                : wildcard_quality;
     if (quality > selected_quality) {

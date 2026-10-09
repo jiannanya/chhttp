@@ -1,7 +1,13 @@
 /build/
 /build-asan/
+/build-lto/
+/build-nocompress/
+/build-release/
+/build-bench/
 /out/
 /.vs/
 *.user
 *.log
 build-msvc/
+docs/
+.workbuddy/
