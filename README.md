@@ -118,6 +118,13 @@ memory cases measure the resident set of idle keep-alive connections and of
 streamed uploads held in flight, so connection and buffer costs are visible
 alongside throughput.
 
+The harness also covers small chunked bodies, streamed TCP writes, masked
+WebSocket frames, SSE events and incremental Base64 encoding/decoding. See
+[performance benchmarks](benchmarks/README.md) for repeatable before/after
+comparisons and measured results. The comparison runner alternates both builds
+and reports medians; parser throughput is measured separately from network
+round trips.
+
 The test executable separates protocol/feature checks, load/lifecycle checks,
 and deterministic randomized properties. Run a group independently, or repeat
 the stress group until the first failure:

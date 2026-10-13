@@ -148,6 +148,8 @@ std::string select_encoding(std::string_view accept_encoding);
 std::string_view status_reason_view(int status) noexcept;
 
 std::string base64_encode(std::string_view value);
+// Input contains complete triples; output has room for input.size() / 3 * 4.
+void base64_encode_blocks(std::string_view input, char *output) noexcept;
 Result<std::string> base64_decode(std::string_view value);
 std::string sha1_base64(std::string_view value);
 std::string websocket_accept(std::string_view key);
@@ -358,6 +360,9 @@ public: // Internal transport implementation; not exposed by the public API.
   bool closing_{false};
   std::atomic_bool open_{false};
   bool read_started_{false};
+  // Bound consecutive immediate writes so streaming producers still yield to
+  // timers, cancellation and other connections even when the socket stays ready.
+  unsigned immediate_writes_{0};
   int closing_handles_{0};
   std::shared_ptr<PendingConnect> pending_connect_;
   std::shared_ptr<PendingRead> pending_read_;

@@ -135,6 +135,7 @@ struct Connection::PendingWrite {
   std::shared_ptr<PendingWrite> self_keep;
   std::coroutine_handle<> continuation;
   std::string data;
+  std::size_t offset{0};
   ErrorInfo result{Error::internal, "Write not completed"};
   bool completed{false};
   Connection *connection{nullptr};
@@ -484,11 +485,50 @@ struct ReadAwaiter {
 };
 
 struct WriteAwaiter {
+  WriteAwaiter(std::shared_ptr<Connection> value_connection,
+               std::string value_data, std::chrono::milliseconds value_timeout)
+      : connection(std::move(value_connection)), data(std::move(value_data)),
+        timeout(value_timeout) {}
+
   std::shared_ptr<Connection> connection;
-  std::shared_ptr<Connection::PendingWrite> pending;
+  std::string data;
   std::chrono::milliseconds timeout;
-  bool await_ready() const noexcept { return false; }
+  std::shared_ptr<Connection::PendingWrite> pending;
+  ErrorInfo result;
+  std::size_t offset{0};
+
+  bool await_ready() {
+    if (!connection->runtime()->on_loop_thread()) return false;
+    if (!connection->open()) {
+      result = {Error::write, "Connection is closed"};
+      return true;
+    }
+    if (connection->pending_write_) {
+      result = {Error::write, "Concurrent writes are not supported"};
+      return true;
+    }
+    // Large body blocks already amortize uv_write's bookkeeping. Probing them
+    // first can add a second syscall when the send buffer is under pressure.
+    if (data.size() > 16 * 1024 || connection->immediate_writes_ >= 64) return false;
+    // A successful immediate write needs no request allocation, timer or loop
+    // callback. libuv provides this path on every supported TCP platform.
+    uv_buf_t buffer = uv_buf_init(data.data(),
+                                  static_cast<unsigned int>(data.size()));
+    const int status = uv_try_write(
+        reinterpret_cast<uv_stream_t *>(&connection->tcp_), &buffer, 1);
+    if (status >= 0) {
+      offset = static_cast<std::size_t>(status);
+      ++connection->immediate_writes_;
+      return offset == data.size();
+    }
+    if (status == UV_EAGAIN || status == UV_ENOSYS) return false;
+    result = {Error::write, "Socket write failed: " + uv_message(status), status};
+    return true;
+  }
   void await_suspend(std::coroutine_handle<> continuation) {
+    pending = std::make_shared<Connection::PendingWrite>();
+    pending->data = std::move(data);
+    pending->offset = offset;
     pending->continuation = continuation;
     auto connection_copy = connection;
     auto pending_copy = pending;
@@ -509,11 +549,15 @@ struct WriteAwaiter {
         return;
       }
       connection->pending_write_ = pending_copy;
+      connection->immediate_writes_ = 0;
       pending_copy->connection = connection;
       pending_copy->self_keep = pending_copy;
       pending_copy->request.data = pending_copy.get();
-      uv_buf_t buffer = uv_buf_init(pending_copy->data.data(),
-                                    static_cast<unsigned int>(pending_copy->data.size()));
+      // Keep the original allocation alive until uv_write completes; a partial
+      // try_write only advances the borrowed range, without copying its tail.
+      uv_buf_t buffer = uv_buf_init(
+          pending_copy->data.data() + pending_copy->offset,
+          static_cast<unsigned int>(pending_copy->data.size() - pending_copy->offset));
       uv_timer_start(&connection->write_timer_, &Connection::write_timeout,
                      timeout_ms(timeout), 0);
       const int status = uv_write(
@@ -527,7 +571,9 @@ struct WriteAwaiter {
       }
     });
   }
-  ErrorInfo await_resume() { return std::move(pending->result); }
+  ErrorInfo await_resume() {
+    return pending ? std::move(pending->result) : std::move(result);
+  }
 };
 
 } // namespace
@@ -541,9 +587,7 @@ Connection::raw_read(std::chrono::milliseconds timeout) {
 Task<ErrorInfo> Connection::raw_write(std::string data,
                                       std::chrono::milliseconds timeout) {
   if (data.empty()) co_return ErrorInfo{};
-  auto pending = std::make_shared<PendingWrite>();
-  pending->data = std::move(data);
-  co_return co_await WriteAwaiter{shared_from_this(), pending, timeout};
+  co_return co_await WriteAwaiter{shared_from_this(), std::move(data), timeout};
 }
 
 void Connection::allocate(uv_handle_t *handle, std::size_t suggested, uv_buf_t *buf) {
@@ -725,9 +769,7 @@ Task<ErrorInfo> Connection::write(std::string data,
   }
 #endif
   if (data.empty()) co_return ErrorInfo{};
-  auto pending = std::make_shared<PendingWrite>();
-  pending->data = std::move(data);
-  co_return co_await WriteAwaiter{shared_from_this(), pending, timeout};
+  co_return co_await WriteAwaiter{shared_from_this(), std::move(data), timeout};
 }
 
 ErrorInfo Connection::set_no_delay(bool enabled) {

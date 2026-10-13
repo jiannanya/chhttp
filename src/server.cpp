@@ -849,7 +849,13 @@ public:
       std::lock_guard lock(sessions_mutex);
       std::erase(sessions, session);
     }
-    --active_sessions;
+    // stop() checks this predicate while holding state_mutex. Publish under
+    // the same mutex so completion cannot notify between its check and wait,
+    // otherwise an already-drained server may sleep for the full grace period.
+    {
+      std::lock_guard lock(state_mutex);
+      --active_sessions;
+    }
     sessions_cv.notify_all();
   }
 

@@ -1144,31 +1144,28 @@ void MultipartWriter::apply(Request &request) const {
 
 std::string Base64Encoder::update(std::span<const std::byte> data) {
   if (finished_) throw std::logic_error("Base64 encoder is already finished");
-  constexpr char alphabet[] =
-      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
   std::string output;
-  output.reserve(((pending_size_ + data.size()) / 3) * 4);
-  auto emit = [&](const std::array<std::byte, 3> &bytes) {
-    const auto value = (std::to_integer<unsigned>(bytes[0]) << 16) |
-                       (std::to_integer<unsigned>(bytes[1]) << 8) |
-                       std::to_integer<unsigned>(bytes[2]);
-    output.push_back(alphabet[(value >> 18) & 63]);
-    output.push_back(alphabet[(value >> 12) & 63]);
-    output.push_back(alphabet[(value >> 6) & 63]);
-    output.push_back(alphabet[value & 63]);
-  };
+  const auto groups = data.size() / 3 + (data.size() % 3 + pending_size_) / 3;
+  if (groups > output.max_size() / 4)
+    throw std::length_error("Base64 output exceeds the string size limit");
+  output.resize(groups * 4);
+  char *destination = output.data();
   std::size_t cursor = 0;
   while (pending_size_ < 3 && cursor < data.size())
     pending_[pending_size_++] = data[cursor++];
   if (pending_size_ == 3) {
-    emit(pending_);
+    detail::base64_encode_blocks(
+        std::string_view(reinterpret_cast<const char *>(pending_.data()), 3),
+        destination);
+    destination += 4;
     pending_size_ = 0;
   }
-  while (cursor + 3 <= data.size()) {
-    std::array<std::byte, 3> bytes{data[cursor], data[cursor + 1],
-                                   data[cursor + 2]};
-    emit(bytes);
-    cursor += 3;
+  const auto complete = (data.size() - cursor) / 3 * 3;
+  if (complete != 0) {
+    detail::base64_encode_blocks(
+        std::string_view(reinterpret_cast<const char *>(data.data() + cursor), complete),
+        destination);
+    cursor += complete;
   }
   while (cursor < data.size()) pending_[pending_size_++] = data[cursor++];
   return output;

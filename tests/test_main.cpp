@@ -5417,7 +5417,9 @@ TEST(large_tls_buffered_and_streamed_bodies_preserve_integrity) {
   request.method = "POST";
   request.target = "/";
   request.set_stream_body([&](chhttp::StreamWriter &writer) -> chhttp::Task<void> {
-    CHECK(co_await writer.write(payload));
+    // Exercise both the single-frame path and the segmented path through TLS.
+    CHECK(co_await writer.write(std::string_view(payload).substr(0, 32)));
+    CHECK(co_await writer.write(std::string_view(payload).substr(32)));
   });
   auto streamed = client.request(std::move(request));
   CHECK(streamed && streamed->body == payload);
@@ -5992,6 +5994,7 @@ TEST(stress_task_handoff_completes_exactly_once_under_contention) {
 #include "extended_tests.inc"
 #include "randomized_tests.inc"
 #include "resource_tests.inc"
+#include "performance_tests.inc"
 
 } // namespace
 

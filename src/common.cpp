@@ -1259,37 +1259,68 @@ bool has_token(const Headers &headers, std::string_view name,
   return false;
 }
 
-std::string base64_encode(std::string_view value) {
+void base64_encode_blocks(std::string_view value, char *output) noexcept {
   static constexpr std::string_view alphabet =
       "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-  std::string output;
-  output.reserve((value.size() + 2) / 3 * 4);
   for (std::size_t offset = 0; offset < value.size(); offset += 3) {
     const auto first = static_cast<unsigned char>(value[offset]);
-    const auto second = offset + 1 < value.size()
-                            ? static_cast<unsigned char>(value[offset + 1])
-                            : 0;
-    const auto third = offset + 2 < value.size()
-                           ? static_cast<unsigned char>(value[offset + 2])
-                           : 0;
+    const auto second = static_cast<unsigned char>(value[offset + 1]);
+    const auto third = static_cast<unsigned char>(value[offset + 2]);
     const std::uint32_t bits = (static_cast<std::uint32_t>(first) << 16) |
                                (static_cast<std::uint32_t>(second) << 8) | third;
-    output.push_back(alphabet[(bits >> 18) & 0x3f]);
-    output.push_back(alphabet[(bits >> 12) & 0x3f]);
-    output.push_back(offset + 1 < value.size() ? alphabet[(bits >> 6) & 0x3f] : '=');
-    output.push_back(offset + 2 < value.size() ? alphabet[bits & 0x3f] : '=');
+    *output++ = alphabet[(bits >> 18) & 0x3f];
+    *output++ = alphabet[(bits >> 12) & 0x3f];
+    *output++ = alphabet[(bits >> 6) & 0x3f];
+    *output++ = alphabet[bits & 0x3f];
+  }
+}
+
+std::string base64_encode(std::string_view value) {
+  std::string output;
+  const auto groups = value.size() / 3 + (value.size() % 3 != 0);
+  if (groups > output.max_size() / 4)
+    throw std::length_error("Base64 output exceeds the string size limit");
+  output.resize(groups * 4);
+  const auto complete = value.size() - value.size() % 3;
+  base64_encode_blocks(value.substr(0, complete), output.data());
+  if (complete != value.size()) {
+    std::array<char, 3> tail{};
+    std::memcpy(tail.data(), value.data() + complete, value.size() - complete);
+    base64_encode_blocks(std::string_view(tail.data(), tail.size()),
+                          output.data() + complete / 3 * 4);
+    output.back() = '=';
+    if (value.size() - complete == 1) output[output.size() - 2] = '=';
   }
   return output;
 }
 
 Result<std::string> base64_decode(std::string_view value) {
-  static constexpr std::string_view alphabet =
-      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  static constexpr auto decode = [] {
+    std::array<unsigned char, 256> table{};
+    table.fill(0xff);
+    constexpr std::string_view alphabet =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    for (std::size_t i = 0; i < alphabet.size(); ++i)
+      table[static_cast<unsigned char>(alphabet[i])] = static_cast<unsigned char>(i);
+    return table;
+  }();
   if (value.size() % 4 != 0)
     return ErrorInfo{Error::protocol, "Invalid Base64 length"};
-  std::string output;
-  output.reserve(value.size() / 4 * 3);
+  std::string output(value.size() / 4 * 3, '\0');
+  std::size_t written = 0;
   for (std::size_t offset = 0; offset < value.size(); offset += 4) {
+    const auto a = decode[static_cast<unsigned char>(value[offset])];
+    const auto b = decode[static_cast<unsigned char>(value[offset + 1])];
+    const auto c = decode[static_cast<unsigned char>(value[offset + 2])];
+    const auto d = decode[static_cast<unsigned char>(value[offset + 3])];
+    if ((a | b | c | d) < 64) {
+      output[written++] = static_cast<char>((a << 2) | (b >> 4));
+      output[written++] = static_cast<char>((b << 4) | (c >> 2));
+      output[written++] = static_cast<char>((c << 6) | d);
+      continue;
+    }
+    // Padding is only legal in the final quartet. Preserve the decoder's
+    // existing validation and acceptance of non-canonical unused pad bits.
     std::uint32_t bits = 0;
     int padding = 0;
     for (int index = 0; index < 4; ++index) {
@@ -1300,16 +1331,17 @@ Result<std::string> base64_decode(std::string_view value) {
         ++padding;
         bits <<= 6;
       } else {
-        const auto position = alphabet.find(ch);
-        if (position == std::string_view::npos || padding)
+        const auto position = decode[static_cast<unsigned char>(ch)];
+        if (position == 0xff || padding)
           return ErrorInfo{Error::protocol, "Invalid Base64 character"};
         bits = (bits << 6) | static_cast<std::uint32_t>(position);
       }
     }
-    output.push_back(static_cast<char>((bits >> 16) & 0xff));
-    if (padding < 2) output.push_back(static_cast<char>((bits >> 8) & 0xff));
-    if (padding == 0) output.push_back(static_cast<char>(bits & 0xff));
+    output[written++] = static_cast<char>((bits >> 16) & 0xff);
+    if (padding < 2) output[written++] = static_cast<char>((bits >> 8) & 0xff);
+    if (padding == 0) output[written++] = static_cast<char>(bits & 0xff);
   }
+  output.resize(written);
   return output;
 }
 

@@ -24,8 +24,8 @@
 #include <vector>
 
 #ifdef _WIN32
-#include <psapi.h>
 #include <windows.h>
+#include <psapi.h>
 #elif defined(__APPLE__)
 #include <mach/mach.h>
 #include <malloc/malloc.h>
@@ -143,9 +143,9 @@ HeapUsage heap_usage() {
 void report_heap(const char *label, HeapUsage value, HeapUsage baseline) {
   const auto per =
       static_cast<double>(value.in_use) - static_cast<double>(baseline.in_use);
-  std::printf("    %-24s %8.2f MiB live  (%+.2f MiB, %+zd blocks)\n", label,
+    std::printf("    %-24s %8.2f MiB live  (%+.2f MiB, %+lld blocks)\n", label,
               static_cast<double>(value.in_use) / 1048576.0, per / 1048576.0,
-              static_cast<long>(value.blocks) - static_cast<long>(baseline.blocks));
+              static_cast<long long>(value.blocks) - static_cast<long long>(baseline.blocks));
 }
 
 void report_memory(const char *label, std::size_t bytes, std::size_t baseline) {
@@ -167,7 +167,7 @@ public:
     const auto per = [&](double value) {
       return operations > 0 ? value / operations * 1e6 : 0;
     };
-    std::printf("%-42s %9.0f ops/s  wall %6.1f us  user %6.1f us  sys %6.1f us\n",
+    std::printf("%-42s %9.0f ops/s  wall %7.3f us  user %7.3f us  sys %7.3f us\n",
                 name.c_str(), wall > 0 ? operations / wall : 0,
                 operations > 0 ? wall / operations * 1e6 : 0, per(user),
                 per(system));
@@ -199,6 +199,10 @@ std::string working_directory(const char *name) {
 // the read buffer, so this isolates the parser, the framing validation and the
 // cost of taking ownership of the parsed fields.
 // ---------------------------------------------------------------------------
+void require(bool condition) {
+  if (!condition) throw std::runtime_error("Benchmark correctness check failed");
+}
+
 void benchmark_parse(std::size_t iterations) {
   std::string head = "POST /v1/items/42?expand=all&limit=10 HTTP/1.1\r\n";
   head += "Host: api.example.com\r\n";
@@ -219,7 +223,8 @@ void benchmark_parse(std::size_t iterations) {
       chhttp::detail::ReadBuffer buffer;
       buffer.append(head);
       auto result = chhttp::detail::read_request_head({}, buffer, {}).get();
-      if (result) parsed_fields += result->body.headers.size();
+      require(result && result->body.headers.size() == 9);
+      parsed_fields += result->body.headers.size();
     }
     measurement.report("parse request head (9 fields)",
                        static_cast<double>(iterations));
@@ -231,9 +236,121 @@ void benchmark_parse(std::size_t iterations) {
 }
 
 // ---------------------------------------------------------------------------
-// Keep-alive round trips on a single connection, with two route shapes so both
-// the literal and the parameterised lookup run.
+// Encoding and streaming protocol paths, checked against their expected output.
 // ---------------------------------------------------------------------------
+void benchmark_encoding(std::size_t iterations) {
+  std::string payload(64 * 1024, '\0');
+  for (std::size_t i = 0; i < payload.size(); ++i)
+    payload[i] = static_cast<char>(i);
+  const auto encoded = chhttp::detail::base64_encode(payload);
+  const auto bytes = std::as_bytes(std::span(payload));
+  {
+    Measurement measurement;
+    for (std::size_t i = 0; i < iterations; ++i) {
+      chhttp::Base64Encoder encoder;
+      auto result = encoder.update(bytes);
+      result += encoder.finish();
+      require(result == encoded);
+    }
+    measurement.report("stream Base64 encode 64 KiB", static_cast<double>(iterations));
+    measurement.report_throughput(static_cast<double>(iterations) * payload.size());
+  }
+  {
+    Measurement measurement;
+    for (std::size_t i = 0; i < iterations; ++i) {
+      auto result = chhttp::detail::base64_decode(encoded);
+      require(result && *result == payload);
+    }
+    measurement.report("Base64 decode 64 KiB", static_cast<double>(iterations));
+    measurement.report_throughput(static_cast<double>(iterations) * payload.size());
+  }
+}
+
+void benchmark_sse(std::size_t iterations) {
+  const std::string payload(256, 's');
+  const auto event = chhttp::format_sse({.data = payload, .id = "42"});
+  std::string batch;
+  for (int i = 0; i < 256; ++i) batch += event;
+  chhttp::SseParser parser;
+  std::size_t count = 0;
+  parser.on_message([&](const chhttp::SseEvent &value) {
+    require(value.data == payload && value.id == "42");
+    ++count;
+  });
+  Measurement measurement;
+  for (std::size_t i = 0; i < iterations; ++i) require(!parser.feed(batch));
+  require(count == iterations * 256 && !parser.finish());
+  measurement.report("SSE parse 256-byte events", static_cast<double>(count));
+}
+
+void benchmark_chunked(std::size_t iterations) {
+  std::string wire = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+  for (int i = 0; i < 4096; ++i) wire += "8\r\n12345678\r\n";
+  wire += "0\r\nX-End: yes\r\n\r\n";
+  auto runtime = std::make_shared<chhttp::detail::Runtime>();
+  auto connection = std::make_shared<chhttp::detail::Connection>(runtime);
+  auto run = [&]() -> chhttp::Task<void> {
+    co_await chhttp::detail::resume_on(runtime);
+    Measurement measurement;
+    for (std::size_t i = 0; i < iterations; ++i) {
+      chhttp::detail::ReadBuffer buffer;
+      buffer.append_view(wire);
+      auto response = co_await chhttp::detail::read_response(connection, buffer, "GET", {});
+      require(response && response->body.size() == 4096 * 8 &&
+              response->headers.get("X-End") == "yes" && buffer.empty());
+    }
+    measurement.report("HTTP parse 8-byte chunks", static_cast<double>(iterations) * 4096);
+  };
+  run().get();
+}
+
+void benchmark_websocket_frames(std::size_t iterations) {
+  const std::string payload(256, 'w');
+  std::string frame{"\x82\xfe\x01\x00\x01\x02\x03\x04", 8};
+  for (std::size_t i = 0; i < payload.size(); ++i)
+    frame.push_back(static_cast<char>(payload[i] ^ ((i % 4) + 1)));
+  std::string batch;
+  for (int i = 0; i < 1024; ++i) batch += frame;
+  Measurement measurement;
+  for (std::size_t i = 0; i < iterations; ++i) {
+    chhttp::detail::ReadBuffer buffer;
+    buffer.append_view(batch);
+    auto channel = chhttp::detail::make_websocket_channel(
+        {}, std::move(buffer), false, {}, std::chrono::seconds(5));
+    for (int j = 0; j < 1024; ++j) {
+      auto message = channel->read().get();
+      require(message && message->data == payload &&
+              message->type == chhttp::WebSocket::MessageType::binary);
+    }
+  }
+  measurement.report("WebSocket parse masked 256-byte frames",
+                     static_cast<double>(iterations) * 1024);
+}
+
+void benchmark_streaming(std::size_t iterations) {
+  chhttp::ServerOptions options;
+  options.auto_compress_response = false;
+  chhttp::Server server(options);
+  server.get("/stream", [](const auto &, auto &response) {
+    response.set_stream("application/octet-stream",
+        [](chhttp::StreamWriter &writer) -> chhttp::Task<void> {
+          for (int i = 0; i < 4096; ++i)
+            require(co_await writer.write("0123456789abcdef0123456789abcdef"));
+        });
+  });
+  require(server.start("127.0.0.1", 0));
+  chhttp::Client client("http://127.0.0.1:" + std::to_string(server.port()));
+  Measurement measurement;
+  for (std::size_t i = 0; i < iterations; ++i) {
+    auto response = client.get("/stream");
+    require(response && response->body.size() == 4096 * 32);
+    for (std::size_t j = 0; j < response->body.size(); j += 32)
+      require(std::string_view(response->body).substr(j, 32) == "0123456789abcdef0123456789abcdef");
+  }
+  measurement.report("stream 32-byte chunks over TCP", static_cast<double>(iterations) * 4096);
+  server.stop();
+}
+
 void benchmark_keep_alive_requests(std::size_t iterations) {
   chhttp::ServerOptions options;
   options.auto_compress_response = false;
@@ -245,15 +362,15 @@ void benchmark_keep_alive_requests(std::size_t iterations) {
                                        chhttp::Response &response) {
     response.set_content("user:" + request.path_params.at("id"));
   });
-  if (!server.start("127.0.0.1", 0)) {
-    std::printf("keep-alive benchmark: server did not start\n");
-    return;
-  }
+  require(server.start("127.0.0.1", 0));
   chhttp::Client client("http://127.0.0.1:" + std::to_string(server.port()));
-  for (int index = 0; index < 64; ++index) client.get("/ping");
+  for (int index = 0; index < 64; ++index) require(static_cast<bool>(client.get("/ping")));
   Measurement measurement;
-  for (std::size_t index = 0; index < iterations; ++index)
-    client.get((index & 1U) != 0 ? "/ping" : "/users/7");
+  for (std::size_t index = 0; index < iterations; ++index) {
+    const bool ping = (index & 1U) != 0;
+    auto response = client.get(ping ? "/ping" : "/users/7");
+    require(response && response->body == (ping ? "pong" : "user:7"));
+  }
   measurement.report("keep-alive requests (1 connection)",
                      static_cast<double>(iterations));
   server.stop();
@@ -271,10 +388,7 @@ void benchmark_connection_scaling(std::size_t iterations, unsigned connections) 
   server.get("/ping", [](const chhttp::Request &, chhttp::Response &response) {
     response.set_content("pong");
   });
-  if (!server.start("127.0.0.1", 0)) {
-    std::printf("scaling benchmark: server did not start\n");
-    return;
-  }
+  require(server.start("127.0.0.1", 0));
   const auto url = "http://127.0.0.1:" + std::to_string(server.port());
   std::atomic_size_t completed{0};
   const std::size_t per_connection = iterations / connections;
@@ -284,11 +398,15 @@ void benchmark_connection_scaling(std::size_t iterations, unsigned connections) 
   for (unsigned index = 0; index < connections; ++index) {
     threads.emplace_back([&] {
       chhttp::Client client(url);
-      for (std::size_t request = 0; request < per_connection; ++request)
-        if (client.get("/ping")) completed.fetch_add(1, std::memory_order_relaxed);
+      for (std::size_t request = 0; request < per_connection; ++request) {
+        auto response = client.get("/ping");
+        if (response && response->body == "pong")
+          completed.fetch_add(1, std::memory_order_relaxed);
+      }
     });
   }
   for (auto &thread : threads) thread.join();
+  require(completed.load() == per_connection * connections);
   measurement.report("requests over " + std::to_string(connections) + " connections",
                      static_cast<double>(completed.load()));
   server.stop();
@@ -310,17 +428,15 @@ void benchmark_static_file(std::size_t size, std::size_t iterations) {
   options.auto_compress_response = false;
   chhttp::Server server(options);
   server.mount("/static", directory);
-  if (!server.start("127.0.0.1", 0)) {
-    std::printf("static benchmark: server did not start\n");
-    return;
-  }
+  require(server.start("127.0.0.1", 0));
   chhttp::Client client("http://127.0.0.1:" + std::to_string(server.port()));
   std::size_t transferred = 0;
   {
     Measurement measurement;
     for (std::size_t index = 0; index < iterations; ++index) {
       auto response = client.get("/static/payload.bin");
-      if (response) transferred += response->body.size();
+      require(response && response->body.size() == size);
+      transferred += response->body.size();
     }
     measurement.report("static file " + std::to_string(size / 1024) + " KiB",
                        static_cast<double>(iterations));
@@ -340,10 +456,7 @@ void benchmark_body_transfer(std::size_t size, std::size_t iterations) {
                           chhttp::Response &response) {
     response.body = request.body;
   });
-  if (!server.start("127.0.0.1", 0)) {
-    std::printf("body benchmark: server did not start\n");
-    return;
-  }
+  require(server.start("127.0.0.1", 0));
   chhttp::Client client("http://127.0.0.1:" + std::to_string(server.port()));
   const std::string payload(size, 'b');
   std::size_t transferred = 0;
@@ -351,7 +464,8 @@ void benchmark_body_transfer(std::size_t size, std::size_t iterations) {
     Measurement measurement;
     for (std::size_t index = 0; index < iterations; ++index) {
       auto response = client.post("/echo", payload, "application/octet-stream");
-      if (response) transferred += response->body.size();
+      require(response && response->body == payload);
+      transferred += response->body.size();
     }
     measurement.report("buffered echo " + std::to_string(size / 1024) + " KiB",
                        static_cast<double>(iterations));
@@ -386,21 +500,16 @@ void benchmark_route_table(std::size_t routes, std::size_t iterations) {
                              chhttp::Response &response) {
     response.set_content(request.path_params.at("wildcard"));
   });
-  if (!server.start("127.0.0.1", 0)) {
-    std::printf("route benchmark: server did not start\n");
-    return;
-  }
+  require(server.start("127.0.0.1", 0));
   chhttp::Client client("http://127.0.0.1:" + std::to_string(server.port()));
   const auto target = "/literal/" + std::to_string(routes / 2);
   const auto parameterised = "/item/" + std::to_string(routes / 2) + "/42";
-  for (int index = 0; index < 32; ++index) client.get(target);
+  for (int index = 0; index < 32; ++index) require(static_cast<bool>(client.get(target)));
   Measurement measurement;
   for (std::size_t index = 0; index < iterations; ++index) {
-    switch (index % 3) {
-    case 0: client.get(target); break;
-    case 1: client.get(parameterised); break;
-    default: client.get("/assets/a/b/c"); break;
-    }
+    const auto choice = index % 3;
+    auto response = client.get(choice == 0 ? target : choice == 1 ? parameterised : "/assets/a/b/c");
+    require(response && response->body == (choice == 0 ? "literal" : choice == 1 ? "42" : "a/b/c"));
   }
   measurement.report("routing across " + std::to_string(routes * 3 + 1) + " routes",
                      static_cast<double>(iterations));
@@ -625,6 +734,11 @@ int main(int argc, char **argv) {
                 "  case-substring   run only cases whose name contains this text\n\n"
                 "cases:\n"
                 "  parse        request-head parsing\n"
+                "  chunked      buffered chunked-body parsing\n"
+                "  encoding     streaming Base64 encode and decode\n"
+                "  sse          SSE event parsing\n"
+                "  websocket    buffered masked WebSocket frame parsing\n"
+                "  streaming    small streamed chunks over TCP\n"
                 "  keep-alive   single-connection round trips\n"
                 "  1-conn       60k requests over 1 connection\n"
                 "  8-conn       60k requests over 8 connections\n"
@@ -649,6 +763,11 @@ int main(int argc, char **argv) {
   std::printf("chhttp benchmarks (scale %zu), peak resident %.1f MiB\n\n", scale,
               static_cast<double>(peak_resident_bytes()) / 1048576.0);
   if (selected("parse")) benchmark_parse(200000 * scale);
+  if (selected("chunked")) benchmark_chunked(256 * scale);
+  if (selected("encoding")) benchmark_encoding(2048 * scale);
+  if (selected("sse")) benchmark_sse(4096 * scale);
+  if (selected("websocket")) benchmark_websocket_frames(512 * scale);
+  if (selected("streaming")) benchmark_streaming(32 * scale);
   if (selected("keep-alive")) benchmark_keep_alive_requests(20000 * scale);
   if (selected("1-conn")) benchmark_connection_scaling(60000 * scale, 1);
   if (selected("8-conn")) benchmark_connection_scaling(60000 * scale, 8);
